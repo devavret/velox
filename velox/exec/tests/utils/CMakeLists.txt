@@ -45,3 +45,5 @@ target_link_libraries(
   velox_presto_serializer
   velox_functions_prestosql
   velox_aggregates)
+
+install(TARGETS velox_exec_test_lib)

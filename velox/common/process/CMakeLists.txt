@@ -20,3 +20,5 @@ target_link_libraries(velox_process velox_flag_definitions
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
+
+install(TARGETS velox_process)

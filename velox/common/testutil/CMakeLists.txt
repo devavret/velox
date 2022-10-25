@@ -18,3 +18,5 @@ target_link_libraries(velox_test_util velox_common_base)
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
+
+install(TARGETS velox_test_util)

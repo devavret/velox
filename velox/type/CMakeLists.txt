@@ -41,3 +41,6 @@ target_link_libraries(
   velox_external_date
   ${Boost_REGEX_LIBRARIES}
   ${FOLLY_WITH_DEPENDENCIES})
+
+install(TARGETS velox_type)
+install(TARGETS velox_type_tz)

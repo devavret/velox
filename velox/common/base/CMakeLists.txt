@@ -35,3 +35,6 @@ endif()
 if(${VELOX_ENABLE_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
+
+install(TARGETS velox_common_base)
+install(TARGETS velox_exception)

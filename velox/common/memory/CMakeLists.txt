@@ -35,3 +35,5 @@ target_link_libraries(
 if(NOT VELOX_DISABLE_GOOGLETEST)
   target_link_libraries(velox_memory gtest)
 endif()
+
+install(TARGETS velox_memory)

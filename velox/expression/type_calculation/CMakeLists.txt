@@ -28,3 +28,5 @@ include_directories(${FLEX_INCLUDE_DIRS})
 add_library(velox_type_calculation ${BISON_TypeCalculationParser_OUTPUTS}
                                    ${FLEX_TypeCalculationScanner_OUTPUTS})
 target_link_libraries(velox_type_calculation velox_common_base)
+
+install(TARGETS velox_type_calculation)

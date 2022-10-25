@@ -45,3 +45,6 @@ add_subdirectory(type_calculation)
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
+
+install(TARGETS velox_expression)
+install(TARGETS velox_expression_functions)

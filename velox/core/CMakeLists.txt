@@ -28,3 +28,5 @@ target_link_libraries(
   velox_serialization
   velox_vector
   ${FOLLY_WITH_DEPENDENCIES})
+
+install(TARGETS velox_core velox_config)

@@ -14,3 +14,5 @@
 
 add_library(velox_encode Base64.cpp)
 target_link_libraries(velox_encode ${FOLLY_WITH_DEPENDENCIES})
+
+install(TARGETS velox_encode)

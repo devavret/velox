@@ -20,3 +20,5 @@ target_link_libraries(velox_buffer velox_memory velox_common_base
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
+
+install(TARGETS velox_buffer)

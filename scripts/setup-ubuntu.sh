@@ -22,30 +22,6 @@ NPROC=$(getconf _NPROCESSORS_ONLN)
 DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)}
 
 # Install all velox and folly dependencies.
-sudo --preserve-env apt install -y \
-  g++ \
-  cmake \
-  ccache \
-  ninja-build \
-  checkinstall \
-  git \
-  libssl-dev \
-  libboost-all-dev \
-  libdouble-conversion-dev \
-  libgoogle-glog-dev \
-  libbz2-dev \
-  libgflags-dev \
-  libgmock-dev \
-  libevent-dev \
-  liblz4-dev \
-  libzstd-dev \
-  libre2-dev \
-  libsnappy-dev \
-  liblzo2-dev \
-  bison \
-  flex \
-  tzdata \
-  wget
 
 function run_and_time {
   time "$@"
@@ -76,7 +52,7 @@ function install_protobuf {
   wget https://github.com/protocolbuffers/protobuf/releases/download/v21.4/protobuf-all-21.4.tar.gz
   tar -xzf protobuf-all-21.4.tar.gz
   cd protobuf-21.4
-  ./configure --prefix=/usr
+  ./configure --prefix=${INSTALL_PREFIX}
   make "-j$(nproc)"
   make install
   ldconfig
