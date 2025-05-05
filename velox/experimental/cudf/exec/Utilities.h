@@ -26,6 +26,13 @@
 #include <memory>
 #include <string_view>
 
+namespace rmm {
+namespace mr {
+template <typename Upstream>
+class statistics_resource_adaptor;
+}
+} // namespace rmm
+
 namespace facebook::velox::cudf_velox {
 
 /**
@@ -33,6 +40,52 @@ namespace facebook::velox::cudf_velox {
  */
 [[nodiscard]] std::shared_ptr<rmm::mr::device_memory_resource>
 createMemoryResource(std::string_view mode);
+
+/**
+ * @brief Create a statistics resource adapter that wraps around an existing
+ * memory resource
+ *
+ * @tparam Upstream Type of the upstream resource
+ * @param upstream The upstream memory resource to wrap with statistics tracking
+ * @return std::shared_ptr<rmm::mr::device_memory_resource> A statistics
+ * resource adapter
+ */
+template <typename Upstream>
+std::shared_ptr<rmm::mr::device_memory_resource> createStatisticsMemoryResource(
+    std::shared_ptr<Upstream> upstream);
+
+/**
+ * @brief Extract the statistics_resource_adaptor from a device_memory_resource
+ * pointer
+ *
+ * This works whether the statistics_resource_adaptor is directly the resource
+ * or is wrapped in an owning_wrapper.
+ *
+ * @tparam Upstream The upstream resource type of the
+ * statistics_resource_adaptor
+ * @param resource Pointer to a device_memory_resource that might be or contain
+ * a statistics_resource_adaptor
+ * @return rmm::mr::statistics_resource_adaptor<Upstream>* Pointer to the
+ * statistics_resource_adaptor if found, nullptr otherwise
+ */
+template <typename Upstream>
+rmm::mr::statistics_resource_adaptor<Upstream>* getStatisticsResourceAdaptor(
+    rmm::mr::device_memory_resource* resource);
+
+/**
+ * @brief Try to extract the statistics_resource_adaptor from a
+ * device_memory_resource pointer without knowing the upstream type
+ *
+ * This attempts to extract a statistics resource adaptor with common upstream
+ * types.
+ *
+ * @param resource Pointer to a device_memory_resource that might be or contain
+ * a statistics_resource_adaptor
+ * @return void* Pointer to the statistics_resource_adaptor if found (must be
+ * cast to appropriate type), nullptr otherwise
+ */
+void* tryGetStatisticsResourceAdaptor(
+    rmm::mr::device_memory_resource* resource);
 
 /**
  * @brief Returns the global CUDA stream pool used by cudf.

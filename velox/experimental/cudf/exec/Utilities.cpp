@@ -29,6 +29,7 @@
 #include <rmm/mr/device/managed_memory_resource.hpp>
 #include <rmm/mr/device/owning_wrapper.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
+#include <rmm/mr/device/statistics_resource_adaptor.hpp>
 
 #include <common/base/Exceptions.h>
 
@@ -65,6 +66,13 @@ namespace {
   return rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(
       makeManagedMr(), rmm::percent_of_free_device_memory(50));
 }
+
+template <typename Upstream>
+[[nodiscard]] auto makeStatisticsMr(std::shared_ptr<Upstream> upstream) {
+  return rmm::mr::make_owning_wrapper<rmm::mr::statistics_resource_adaptor>(
+      std::move(upstream));
+}
+
 } // namespace
 
 std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
@@ -81,9 +89,131 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
     return makeManagedMr();
   if (mode == "managed_pool")
     return makeManagedPoolMr();
+  if (mode == "stats_cuda")
+    return makeStatisticsMr(makeCudaMr());
+  if (mode == "stats_pool")
+    return makeStatisticsMr(makePoolMr());
+  if (mode == "stats_async")
+    return makeStatisticsMr(makeAsyncMr());
+  if (mode == "stats_arena")
+    return makeStatisticsMr(makeArenaMr());
+  if (mode == "stats_managed")
+    return makeStatisticsMr(makeManagedMr());
+  if (mode == "stats_managed_pool")
+    return makeStatisticsMr(makeManagedPoolMr());
   VELOX_FAIL(
       "Unknown memory resource mode: " + std::string(mode) +
-      "\nExpecting: cuda, pool, async, arena, managed, or managed_pool");
+      "\nExpecting: cuda, pool, async, arena, managed, managed_pool, " +
+      "stats_cuda, stats_pool, stats_async, stats_arena, stats_managed, or stats_managed_pool");
+}
+
+template <typename Upstream>
+std::shared_ptr<rmm::mr::device_memory_resource> createStatisticsMemoryResource(
+    std::shared_ptr<Upstream> upstream) {
+  return makeStatisticsMr(upstream);
+}
+
+// Explicit template instantiations for common resource types
+template std::shared_ptr<rmm::mr::device_memory_resource>
+    createStatisticsMemoryResource<rmm::mr::cuda_memory_resource>(
+        std::shared_ptr<rmm::mr::cuda_memory_resource>);
+template std::shared_ptr<rmm::mr::device_memory_resource>
+    createStatisticsMemoryResource<
+        rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
+        std::shared_ptr<
+            rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>);
+template std::shared_ptr<rmm::mr::device_memory_resource>
+    createStatisticsMemoryResource<rmm::mr::cuda_async_memory_resource>(
+        std::shared_ptr<rmm::mr::cuda_async_memory_resource>);
+template std::shared_ptr<rmm::mr::device_memory_resource>
+    createStatisticsMemoryResource<
+        rmm::mr::arena_memory_resource<rmm::mr::cuda_memory_resource>>(
+        std::shared_ptr<
+            rmm::mr::arena_memory_resource<rmm::mr::cuda_memory_resource>>);
+template std::shared_ptr<rmm::mr::device_memory_resource>
+    createStatisticsMemoryResource<rmm::mr::managed_memory_resource>(
+        std::shared_ptr<rmm::mr::managed_memory_resource>);
+
+template <typename Upstream>
+rmm::mr::statistics_resource_adaptor<Upstream>* getStatisticsResourceAdaptor(
+    rmm::mr::device_memory_resource* resource) {
+  if (resource == nullptr) {
+    return nullptr;
+  }
+
+  // First try direct cast
+  auto directStats =
+      dynamic_cast<rmm::mr::statistics_resource_adaptor<Upstream>*>(resource);
+  if (directStats != nullptr) {
+    return directStats;
+  }
+
+  // Then try to get it from owning_wrapper
+  using WrappedStats = rmm::mr::
+      owning_wrapper<rmm::mr::statistics_resource_adaptor<Upstream>, Upstream>;
+  auto wrappedStats = dynamic_cast<WrappedStats*>(resource);
+  if (wrappedStats != nullptr) {
+    return &wrappedStats->wrapped();
+  }
+
+  return nullptr;
+}
+
+// Explicit template instantiations for common resource types
+template rmm::mr::statistics_resource_adaptor<rmm::mr::cuda_memory_resource>*
+getStatisticsResourceAdaptor<rmm::mr::cuda_memory_resource>(
+    rmm::mr::device_memory_resource*);
+template rmm::mr::statistics_resource_adaptor<
+    rmm::mr::cuda_async_memory_resource>*
+getStatisticsResourceAdaptor<rmm::mr::cuda_async_memory_resource>(
+    rmm::mr::device_memory_resource*);
+template rmm::mr::statistics_resource_adaptor<rmm::mr::managed_memory_resource>*
+getStatisticsResourceAdaptor<rmm::mr::managed_memory_resource>(
+    rmm::mr::device_memory_resource*);
+template rmm::mr::statistics_resource_adaptor<
+    rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>*
+getStatisticsResourceAdaptor<
+    rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
+    rmm::mr::device_memory_resource*);
+template rmm::mr::statistics_resource_adaptor<
+    rmm::mr::arena_memory_resource<rmm::mr::cuda_memory_resource>>*
+getStatisticsResourceAdaptor<
+    rmm::mr::arena_memory_resource<rmm::mr::cuda_memory_resource>>(
+    rmm::mr::device_memory_resource*);
+
+void* tryGetStatisticsResourceAdaptor(
+    rmm::mr::device_memory_resource* resource) {
+  if (resource == nullptr) {
+    return nullptr;
+  }
+
+  // Try each common upstream type
+  if (auto stats = getStatisticsResourceAdaptor<rmm::mr::cuda_memory_resource>(
+          resource)) {
+    return stats;
+  }
+  if (auto stats =
+          getStatisticsResourceAdaptor<rmm::mr::cuda_async_memory_resource>(
+              resource)) {
+    return stats;
+  }
+  if (auto stats =
+          getStatisticsResourceAdaptor<rmm::mr::managed_memory_resource>(
+              resource)) {
+    return stats;
+  }
+  if (auto stats = getStatisticsResourceAdaptor<
+          rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
+          resource)) {
+    return stats;
+  }
+  if (auto stats = getStatisticsResourceAdaptor<
+          rmm::mr::arena_memory_resource<rmm::mr::cuda_memory_resource>>(
+          resource)) {
+    return stats;
+  }
+
+  return nullptr;
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {

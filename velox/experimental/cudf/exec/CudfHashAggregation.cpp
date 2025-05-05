@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
+#include "rmm/mr/device/cuda_async_memory_resource.hpp"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/Task.h"
@@ -29,6 +30,8 @@
 #include <cudf/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
+
+#include <rmm/mr/device/statistics_resource_adaptor.hpp>
 
 namespace {
 
@@ -763,6 +766,20 @@ CudfVectorPtr CudfHashAggregation::getDistinctKeys(
       stream);
 
   auto numRows = result->num_rows();
+
+  static std::mutex printMutex;
+  {
+    std::lock_guard<std::mutex> lock(printMutex);
+    auto statsMr =
+        getStatisticsResourceAdaptor<rmm::mr::cuda_async_memory_resource>(
+            rmm::mr::get_current_device_resource());
+    std::cout << "Plan node id: " << operatorCtx_->planNodeId()
+              << " operator type: " << operatorCtx_->operatorType()
+              << " Driver " << operatorCtx_->driverCtx()->driverId
+              << " num rows after distinct: " << numRows
+              << " memory usage: " << statsMr->get_bytes_counter().value
+              << " bytes" << std::endl;
+  }
 
   return std::make_shared<cudf_velox::CudfVector>(
       pool(), outputType_, numRows, std::move(result), stream);
