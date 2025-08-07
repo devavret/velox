@@ -28,7 +28,9 @@ add_executable(
   ArrayUnionTest.cpp
   ArgTypesGeneratorTest.cpp
   AtLeastNNonNullsTest.cpp
+  Base64Test.cpp
   BitwiseTest.cpp
+  CharTypeWriteSideCheckTest.cpp
   ComparisonsTest.cpp
   ConcatWsTest.cpp
   DateTimeFunctionsTest.cpp
@@ -42,6 +44,7 @@ add_executable(
   GetJsonObjectTest.cpp
   GetStructFieldTest.cpp
   HashTest.cpp
+  InitcapTest.cpp
   InTest.cpp
   JsonArrayLengthTest.cpp
   JsonObjectKeysTest.cpp
@@ -65,8 +68,11 @@ add_executable(
   SplitTest.cpp
   StringTest.cpp
   StringToMapTest.cpp
+  UnBase64Test.cpp
   UnscaledValueFunctionTest.cpp
+  UpperLowerTest.cpp
   UuidTest.cpp
+  VarcharTypeWriteSideCheckTest.cpp
   XxHash64Test.cpp)
 
 add_test(velox_functions_spark_test velox_functions_spark_test)

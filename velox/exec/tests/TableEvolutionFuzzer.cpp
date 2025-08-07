@@ -19,10 +19,29 @@
 #include "velox/dwio/common/tests/utils/FilterGenerator.h"
 #include "velox/exec/Cursor.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/exec/tests/utils/QueryAssertions.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
 #include <filesystem>
+
+DEFINE_bool(
+    enable_oom_injection_write_path,
+    false,
+    "When enabled OOMs will randomly be triggered while executing the write path "
+    "The goal of this mode is to ensure unexpected exceptions "
+    "aren't thrown and the process isn't killed in the process of cleaning "
+    "up after failures. Therefore, results are not compared when this is "
+    "enabled. Note that this option only works in debug builds.");
+
+DEFINE_bool(
+    enable_oom_injection_read_path,
+    false,
+    "When enabled OOMs will randomly be triggered while executing scan "
+    "plans. The goal of this mode is to ensure unexpected exceptions "
+    "aren't thrown and the process isn't killed in the process of cleaning "
+    "up after failures. Therefore, results are not compared when this is "
+    "enabled. Note that this option only works in debug builds.");
 
 namespace facebook::velox::exec::test {
 
@@ -93,22 +112,44 @@ TableEvolutionFuzzer::parseFileFormats(std::string input) {
 namespace {
 
 std::vector<std::vector<RowVectorPtr>> runTaskCursors(
-    const std::vector<std::unique_ptr<TaskCursor>>& cursors,
+    const std::vector<std::shared_ptr<TaskCursor>>& cursors,
     folly::Executor& executor) {
   std::vector<folly::SemiFuture<std::vector<RowVectorPtr>>> futures;
   for (int i = 0; i < cursors.size(); ++i) {
     auto [promise, future] =
         folly::makePromiseContract<std::vector<RowVectorPtr>>();
     futures.push_back(std::move(future));
-    executor.add([&, i, promise = std::move(promise)]() mutable {
+    auto cursorPtr = cursors[i];
+    auto task = cursorPtr->task();
+    executor.add([cursorPtr, task, promise = std::move(promise)]() mutable {
       std::vector<RowVectorPtr> results;
       try {
-        while (cursors[i]->moveNext()) {
-          auto& result = cursors[i]->current();
+        while (cursorPtr->moveNext()) {
+          auto& result = cursorPtr->current();
           result->loadedVector();
           results.push_back(std::move(result));
         }
         promise.setValue(std::move(results));
+      } catch (VeloxRuntimeError& e) {
+        if (FLAGS_enable_oom_injection_write_path &&
+            e.errorCode() == facebook::velox::error_code::kMemCapExceeded &&
+            e.message() == ScopedOOMInjector::kErrorMessage) {
+          // If we enabled OOM injection we expect the exception thrown by the
+          // ScopedOOMInjector.
+          LOG(INFO) << "OOM injection triggered in write path: " << e.what();
+          promise.setValue(std::move(results));
+        } else if (
+            FLAGS_enable_oom_injection_read_path &&
+            e.errorCode() == facebook::velox::error_code::kMemCapExceeded &&
+            e.message() == ScopedOOMInjector::kErrorMessage) {
+          // If we enabled OOM injection we expect the exception thrown by the
+          // ScopedOOMInjector.
+          LOG(INFO) << "OOM injection triggered in read path: " << e.what();
+          promise.setValue(std::move(results));
+        } else {
+          LOG(ERROR) << e.what();
+          promise.setException(e);
+        }
       } catch (const std::exception& e) {
         LOG(ERROR) << e.what();
         promise.setException(e);
@@ -122,7 +163,6 @@ std::vector<std::vector<RowVectorPtr>> runTaskCursors(
   }
   return results;
 }
-
 // `tableBucketCount' is the bucket count of current table setup when reading.
 // `partitionBucketCount' is the bucket count when the partition was written.
 // `tableBucketCount' must be a multiple of `partitionBucketCount'.
@@ -135,6 +175,9 @@ void buildScanSplitFromTableWriteResult(
     dwio::common::FileFormat fileFormat,
     const std::vector<RowVectorPtr>& writeResult,
     std::vector<Split>& splits) {
+  if (FLAGS_enable_oom_injection_write_path) {
+    return;
+  }
   VELOX_CHECK_EQ(writeResult.size(), 1);
   auto* fragments =
       writeResult[0]->childAt(1)->asChecked<SimpleVector<StringView>>();
@@ -334,46 +377,34 @@ VectorPtr TableEvolutionFuzzer::liftToType(
 }
 
 void TableEvolutionFuzzer::run() {
-  std::vector<column_index_t> bucketColumnIndices;
-  for (int i = 0; i < config_.columnCount; ++i) {
-    if (folly::Random::oneIn(2 * config_.columnCount, rng_)) {
-      bucketColumnIndices.push_back(i);
-    }
+  ScopedOOMInjector oomInjectorWritePath(
+      []() -> bool { return folly::Random::oneIn(10); },
+      10); // Check the condition every 10 ms.
+  if (FLAGS_enable_oom_injection_write_path) {
+    oomInjectorWritePath.enable();
   }
-  VLOG(1) << "bucketColumnIndices: [" << folly::join(", ", bucketColumnIndices)
-          << "]";
+
+  // Step 1: Test setup and bucketColumnIndices generation
+  auto bucketColumnIndices = generateBucketColumnIndices();
   auto testSetups = makeSetups(bucketColumnIndices);
+
+  // Step 2: Create and execute write tasks
   auto tableOutputRootDir = TempDirectoryPath::create();
-  std::vector<std::unique_ptr<TaskCursor>> writeTasks(
+  std::vector<std::shared_ptr<TaskCursor>> writeTasks(
       2 * config_.evolutionCount - 1);
   RowVectorPtr finalExpectedData;
-  for (int i = 0; i < config_.evolutionCount; ++i) {
-    auto data = vectorFuzzer_.fuzzRow(testSetups[i].schema, kVectorSize, false);
-    for (auto& child : data->children()) {
-      BaseVector::flattenVector(child);
-    }
-    auto actualDir =
-        fmt::format("{}/actual_{}", tableOutputRootDir->getPath(), i);
-    VELOX_CHECK(std::filesystem::create_directory(actualDir));
-    writeTasks[2 * i] =
-        makeWriteTask(testSetups[i], data, actualDir, bucketColumnIndices);
 
-    if (i == config_.evolutionCount - 1) {
-      finalExpectedData = std::move(data);
-      continue;
-    }
-    auto expectedDir =
-        fmt::format("{}/expected_{}", tableOutputRootDir->getPath(), i);
-    VELOX_CHECK(std::filesystem::create_directory(expectedDir));
-    auto expectedData = std::static_pointer_cast<RowVector>(
-        liftToType(data, testSetups.back().schema));
+  createWriteTasks(
+      testSetups,
+      bucketColumnIndices,
+      tableOutputRootDir->getPath(),
+      writeTasks,
+      finalExpectedData);
 
-    writeTasks[2 * i + 1] = makeWriteTask(
-        testSetups.back(), expectedData, expectedDir, bucketColumnIndices);
-  }
   auto executor = folly::getGlobalCPUExecutor();
   auto writeResults = runTaskCursors(writeTasks, *executor);
 
+  // Step 3: Create scan splits from write results
   std::optional<int32_t> selectedBucket;
   if (!bucketColumnIndices.empty()) {
     selectedBucket =
@@ -381,51 +412,40 @@ void TableEvolutionFuzzer::run() {
     VLOG(1) << "selectedBucket=" << *selectedBucket;
   }
 
-  std::vector<Split> actualSplits, expectedSplits;
+  auto [actualSplits, expectedSplits] = createScanSplitsFromWriteResults(
+      writeResults,
+      testSetups,
+      bucketColumnIndices,
+      selectedBucket,
+      finalExpectedData);
 
-  for (int i = 0; i < config_.evolutionCount; ++i) {
-    auto* result = &writeResults[2 * i];
-    buildScanSplitFromTableWriteResult(
-        testSetups.back().schema,
-        bucketColumnIndices,
-        selectedBucket,
-        testSetups.back().bucketCount(),
-        testSetups[i].bucketCount(),
-        testSetups[i].fileFormat,
-        *result,
-        actualSplits);
-
-    if (i < config_.evolutionCount - 1) {
-      result = &writeResults[2 * i + 1];
-    }
-    buildScanSplitFromTableWriteResult(
-        testSetups.back().schema,
-        bucketColumnIndices,
-        selectedBucket,
-        testSetups.back().bucketCount(),
-        testSetups.back().bucketCount(),
-        testSetups.back().fileFormat,
-        *result,
-        expectedSplits);
-  }
-
+  // Step 4: Setup scan tasks with filters
   auto rowType = testSetups.back().schema;
-
   PushdownConfig subfieldFilterConfig;
-
   subfieldFilterConfig.subfieldFiltersMap =
       generateSubfieldFilters(rowType, finalExpectedData);
 
-  std::vector<std::unique_ptr<TaskCursor>> scanTasks(2);
-
+  std::vector<std::shared_ptr<TaskCursor>> scanTasks(2);
   scanTasks[0] = makeScanTask(
       rowType, std::move(actualSplits), subfieldFilterConfig, false);
   scanTasks[1] = makeScanTask(
       rowType, std::move(expectedSplits), subfieldFilterConfig, true);
 
+  ScopedOOMInjector oomInjectorReadPath(
+      []() -> bool { return folly::Random::oneIn(10); },
+      10); // Check the condition every 10 ms.
+  if (FLAGS_enable_oom_injection_read_path) {
+    oomInjectorReadPath.enable();
+  }
+
+  // Step 5: Execute scan tasks and verify results
   auto scanResults = runTaskCursors(scanTasks, *executor);
 
-  checkResultsEqual(scanResults[0], scanResults[1]);
+  // Skip result verification when OOM injection is enabled
+  if (!FLAGS_enable_oom_injection_write_path &&
+      !FLAGS_enable_oom_injection_read_path) {
+    checkResultsEqual(scanResults[0], scanResults[1]);
+  }
 }
 
 int TableEvolutionFuzzer::Setup::bucketCount() const {
@@ -604,7 +624,6 @@ std::unique_ptr<TaskCursor> TableEvolutionFuzzer::makeScanTask(
                         .tableScanWithPushDown(
                             tableSchema,
                             /*pushdownConfig=*/pushdownConfig,
-                            /*remainingFilter=*/"",
                             tableSchema,
                             {})
                         .planNode();
@@ -614,6 +633,87 @@ std::unique_ptr<TaskCursor> TableEvolutionFuzzer::makeScanTask(
   }
   cursor->task()->noMoreSplits("0");
   return cursor;
+}
+
+std::vector<column_index_t>
+TableEvolutionFuzzer::generateBucketColumnIndices() {
+  std::vector<column_index_t> bucketColumnIndices;
+  for (int i = 0; i < config_.columnCount; ++i) {
+    if (folly::Random::oneIn(2 * config_.columnCount, rng_)) {
+      bucketColumnIndices.push_back(i);
+    }
+  }
+  VLOG(1) << "bucketColumnIndices: [" << folly::join(", ", bucketColumnIndices)
+          << "]";
+  return bucketColumnIndices;
+}
+
+std::pair<std::vector<Split>, std::vector<Split>>
+TableEvolutionFuzzer::createScanSplitsFromWriteResults(
+    const std::vector<std::vector<RowVectorPtr>>& writeResults,
+    const std::vector<Setup>& testSetups,
+    const std::vector<column_index_t>& bucketColumnIndices,
+    std::optional<int32_t> selectedBucket,
+    const RowVectorPtr& finalExpectedData) {
+  std::vector<Split> actualSplits, expectedSplits;
+
+  for (int i = 0; i < config_.evolutionCount; ++i) {
+    auto* result = &writeResults[2 * i];
+    buildScanSplitFromTableWriteResult(
+        testSetups.back().schema,
+        bucketColumnIndices,
+        selectedBucket,
+        testSetups.back().bucketCount(),
+        testSetups[i].bucketCount(),
+        testSetups[i].fileFormat,
+        *result,
+        actualSplits);
+
+    if (i < config_.evolutionCount - 1) {
+      result = &writeResults[2 * i + 1];
+    }
+    buildScanSplitFromTableWriteResult(
+        testSetups.back().schema,
+        bucketColumnIndices,
+        selectedBucket,
+        testSetups.back().bucketCount(),
+        testSetups.back().bucketCount(),
+        testSetups.back().fileFormat,
+        *result,
+        expectedSplits);
+  }
+
+  return {std::move(actualSplits), std::move(expectedSplits)};
+}
+
+void TableEvolutionFuzzer::createWriteTasks(
+    const std::vector<Setup>& testSetups,
+    const std::vector<column_index_t>& bucketColumnIndices,
+    const std::string& tableOutputRootDirPath,
+    std::vector<std::shared_ptr<TaskCursor>>& writeTasks,
+    RowVectorPtr& finalExpectedData) {
+  for (int i = 0; i < config_.evolutionCount; ++i) {
+    auto data = vectorFuzzer_.fuzzRow(testSetups[i].schema, kVectorSize, false);
+    for (auto& child : data->children()) {
+      BaseVector::flattenVector(child);
+    }
+    auto actualDir = fmt::format("{}/actual_{}", tableOutputRootDirPath, i);
+    VELOX_CHECK(std::filesystem::create_directory(actualDir));
+    writeTasks[2 * i] =
+        makeWriteTask(testSetups[i], data, actualDir, bucketColumnIndices);
+
+    if (i == config_.evolutionCount - 1) {
+      finalExpectedData = std::move(data);
+      continue;
+    }
+    auto expectedDir = fmt::format("{}/expected_{}", tableOutputRootDirPath, i);
+    VELOX_CHECK(std::filesystem::create_directory(expectedDir));
+    auto expectedData = std::static_pointer_cast<RowVector>(
+        liftToType(data, testSetups.back().schema));
+
+    writeTasks[2 * i + 1] = makeWriteTask(
+        testSetups.back(), expectedData, expectedDir, bucketColumnIndices);
+  }
 }
 
 } // namespace facebook::velox::exec::test

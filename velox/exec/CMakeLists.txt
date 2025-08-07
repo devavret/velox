@@ -62,6 +62,7 @@ velox_add_library(
   OperatorTraceReader.cpp
   OperatorTraceScan.cpp
   OperatorTraceWriter.cpp
+  ParallelProject.cpp
   TaskTraceReader.cpp
   TaskTraceWriter.cpp
   Trace.cpp
@@ -122,8 +123,6 @@ velox_link_libraries(
   velox_dwio_dwrf_reader
   velox_dwio_dwrf_writer
   velox_type_fbhive
-  velox_hive_connector
-  velox_tpch_connector
   velox_presto_serializer
   velox_functions_prestosql
   velox_aggregates)

@@ -149,8 +149,9 @@ TEST_F(PlanFragmentTest, aggregationCanSpill) {
 
     std::string debugString() const {
       return fmt::format(
-          "aggregationStep:{} isSpillEnabled:{} isAggregationSpillEnabled:{} isDistinct:{} hasPreAggregation:{} expectedCanSpill:{}",
-          AggregationNode::stepName(aggregationStep),
+          "aggregationStep:{} isSpillEnabled:{} isAggregationSpillEnabled:{} "
+          "isDistinct:{} hasPreAggregation:{} expectedCanSpill:{}",
+          AggregationNode::toName(aggregationStep),
           isSpillEnabled,
           isAggregationSpillEnabled,
           isDistinct,
@@ -354,7 +355,7 @@ TEST_F(PlanFragmentTest, supportsBarrier) {
                               core::JoinType::kAnti)
                           .planNode();
     const PlanFragment planFragment{plan};
-    ASSERT_FALSE(planFragment.supportsBarrier());
+    ASSERT_TRUE(planFragment.firstNodeNotSupportingBarrier() != nullptr);
   }
   // Plan fragment with plan node supporting barrier.
   {
@@ -374,6 +375,6 @@ TEST_F(PlanFragmentTest, supportsBarrier) {
                         core::JoinType::kInner)
                     .planNode();
     const PlanFragment planFragment{plan};
-    ASSERT_TRUE(planFragment.supportsBarrier());
+    ASSERT_TRUE(planFragment.firstNodeNotSupportingBarrier() == nullptr);
   }
 }

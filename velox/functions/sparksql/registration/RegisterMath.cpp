@@ -25,7 +25,7 @@
 namespace facebook::velox::functions::sparksql {
 
 void registerMathFunctions(const std::string& prefix) {
-  registerUnaryNumeric<AbsFunction>({prefix + "abs"});
+  registerUnaryNumeric<sparksql::AbsFunction>({prefix + "abs"});
   registerFunction<
       DecimalAbsFunction,
       LongDecimal<P1, S1>,
@@ -86,6 +86,7 @@ void registerMathFunctions(const std::string& prefix) {
   registerFunction<sparksql::LogarithmFunction, double, double, double>(
       {prefix + "log"});
   registerFunction<SqrtFunction, double, double>({prefix + "sqrt"});
+  registerFunction<CbrtFunction, double, double>({prefix + "cbrt"});
   registerFunction<
       WidthBucketFunction,
       int64_t,

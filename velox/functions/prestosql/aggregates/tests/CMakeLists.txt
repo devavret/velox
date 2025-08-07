@@ -38,11 +38,15 @@ add_executable(
   MapAggTest.cpp
   MapUnionAggregationTest.cpp
   MapUnionSumTest.cpp
+  NumericHistogramTest.cpp
   MaxSizeForStatsTest.cpp
   MinMaxByAggregationTest.cpp
   MinMaxTest.cpp
   MultiMapAggTest.cpp
+  NoisyCountGaussianAggregationTest.cpp
   NoisyCountIfGaussianAggregationTest.cpp
+  NoisySumGaussianAggregationTest.cpp
+  NoisyApproxSfmAggregationTest.cpp
   PrestoHasherTest.cpp
   QDigestAggTest.cpp
   ReduceAggTest.cpp

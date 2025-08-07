@@ -24,6 +24,7 @@
 #include <sstream>
 #include <typeindex>
 
+#include "velox/type/DecimalUtil.h"
 #include "velox/type/TimestampConversion.h"
 
 namespace std {
@@ -35,62 +36,15 @@ struct hash<facebook::velox::TypeKind> {
 };
 } // namespace std
 
+namespace facebook::velox {
 namespace {
 bool isColumnNameRequiringEscaping(const std::string& name) {
   static const std::string re("^[a-zA-Z_][a-zA-Z0-9_]*$");
   return !RE2::FullMatch(name, re);
 }
-} // namespace
 
-namespace facebook::velox {
-
-// Static variable intialization is not thread safe for non
-// constant-initialization, but scoped static initialization is thread safe.
-const std::unordered_map<std::string, TypeKind>& getTypeStringMap() {
-  static const std::unordered_map<std::string, TypeKind> kTypeStringMap{
-      {"BOOLEAN", TypeKind::BOOLEAN},
-      {"TINYINT", TypeKind::TINYINT},
-      {"SMALLINT", TypeKind::SMALLINT},
-      {"INTEGER", TypeKind::INTEGER},
-      {"BIGINT", TypeKind::BIGINT},
-      {"HUGEINT", TypeKind::HUGEINT},
-      {"REAL", TypeKind::REAL},
-      {"DOUBLE", TypeKind::DOUBLE},
-      {"VARCHAR", TypeKind::VARCHAR},
-      {"VARBINARY", TypeKind::VARBINARY},
-      {"TIMESTAMP", TypeKind::TIMESTAMP},
-      {"ARRAY", TypeKind::ARRAY},
-      {"MAP", TypeKind::MAP},
-      {"ROW", TypeKind::ROW},
-      {"FUNCTION", TypeKind::FUNCTION},
-      {"UNKNOWN", TypeKind::UNKNOWN},
-      {"OPAQUE", TypeKind::OPAQUE},
-      {"INVALID", TypeKind::INVALID}};
-  return kTypeStringMap;
-}
-
-std::optional<TypeKind> tryMapNameToTypeKind(const std::string& name) {
-  auto found = getTypeStringMap().find(name);
-
-  if (found == getTypeStringMap().end()) {
-    return std::nullopt;
-  }
-
-  return found->second;
-}
-
-TypeKind mapNameToTypeKind(const std::string& name) {
-  auto found = getTypeStringMap().find(name);
-
-  if (found == getTypeStringMap().end()) {
-    VELOX_USER_FAIL("Specified element is not found : {}", name);
-  }
-
-  return found->second;
-}
-
-std::string mapTypeKindToName(const TypeKind& typeKind) {
-  static std::unordered_map<TypeKind, std::string> typeEnumMap{
+folly::F14FastMap<TypeKind, std::string> typeKindNames() {
+  static const folly::F14FastMap<TypeKind, std::string> kNames = {
       {TypeKind::BOOLEAN, "BOOLEAN"},
       {TypeKind::TINYINT, "TINYINT"},
       {TypeKind::SMALLINT, "SMALLINT"},
@@ -108,16 +62,14 @@ std::string mapTypeKindToName(const TypeKind& typeKind) {
       {TypeKind::FUNCTION, "FUNCTION"},
       {TypeKind::UNKNOWN, "UNKNOWN"},
       {TypeKind::OPAQUE, "OPAQUE"},
-      {TypeKind::INVALID, "INVALID"}};
+      {TypeKind::INVALID, "INVALID"},
+  };
 
-  auto found = typeEnumMap.find(typeKind);
-
-  if (found == typeEnumMap.end()) {
-    VELOX_USER_FAIL("Specified element is not found : {}", (int32_t)typeKind);
-  }
-
-  return found->second;
+  return kNames;
 }
+} // namespace
+
+VELOX_DEFINE_ENUM_NAME(TypeKind, typeKindNames);
 
 std::pair<uint8_t, uint8_t> getDecimalPrecisionScale(const Type& type) {
   if (type.isShortDecimal()) {
@@ -149,7 +101,7 @@ struct OpaqueSerdeRegistry {
 } // namespace
 
 std::ostream& operator<<(std::ostream& os, const TypeKind& kind) {
-  os << mapTypeKindToName(kind);
+  os << TypeKindName::toName(kind);
   return os;
 }
 
@@ -185,7 +137,7 @@ TypePtr Type::create(const folly::dynamic& obj) {
   }
 
   // 'typeName' must be a built-in type.
-  TypeKind typeKind = mapNameToTypeKind(typeName);
+  TypeKind typeKind = TypeKindName::toTypeKind(typeName);
   switch (typeKind) {
     case TypeKind::ROW: {
       VELOX_USER_CHECK(obj["names"].isArray());
@@ -194,8 +146,7 @@ TypePtr Type::create(const folly::dynamic& obj) {
         names.push_back(name.asString());
       }
 
-      return std::make_shared<const RowType>(
-          std::move(names), std::move(childTypes));
+      return ROW(std::move(names), std::move(childTypes));
     }
 
     case TypeKind::OPAQUE: {
@@ -514,18 +465,14 @@ void RowType::printChildren(std::stringstream& ss, std::string_view delimiter)
   }
 }
 
-std::shared_ptr<RowType> RowType::unionWith(
-    std::shared_ptr<const RowType> rowType) const {
+RowTypePtr RowType::unionWith(const RowTypePtr& other) const {
   std::vector<std::string> names;
   std::vector<TypePtr> types;
   copy(names_.begin(), names_.end(), back_inserter(names));
-  copy(rowType->names_.begin(), rowType->names_.end(), back_inserter(names));
+  copy(other->names_.begin(), other->names_.end(), back_inserter(names));
   copy(children_.begin(), children_.end(), back_inserter(types));
-  copy(
-      rowType->children_.begin(),
-      rowType->children_.end(),
-      back_inserter(types));
-  return std::make_shared<RowType>(std::move(names), std::move(types));
+  copy(other->children_.begin(), other->children_.end(), back_inserter(types));
+  return ROW(std::move(names), std::move(types));
 }
 
 std::string RowType::toString() const {
@@ -862,17 +809,15 @@ void OpaqueType::registerSerializationTypeErased(
   registry.reverse[persistentName] = type;
 }
 
-std::shared_ptr<const ArrayType> ARRAY(TypePtr elementType) {
-  return std::make_shared<const ArrayType>(std::move(elementType));
+ArrayTypePtr ARRAY(TypePtr elementType) {
+  return TypeFactory<TypeKind::ARRAY>::create(std::move(elementType));
 }
 
-std::shared_ptr<const RowType> ROW(
-    std::vector<std::string>&& names,
-    std::vector<TypePtr>&& types) {
+RowTypePtr ROW(std::vector<std::string> names, std::vector<TypePtr> types) {
   return TypeFactory<TypeKind::ROW>::create(std::move(names), std::move(types));
 }
 
-std::shared_ptr<const RowType> ROW(
+RowTypePtr ROW(
     std::initializer_list<std::pair<const std::string, TypePtr>>&& pairs) {
   std::vector<TypePtr> types;
   std::vector<std::string> names;
@@ -885,13 +830,13 @@ std::shared_ptr<const RowType> ROW(
   return TypeFactory<TypeKind::ROW>::create(std::move(names), std::move(types));
 }
 
-std::shared_ptr<const RowType> ROW(std::vector<TypePtr>&& types) {
+RowTypePtr ROW(std::vector<TypePtr>&& types) {
   std::vector<std::string> names(types.size(), "");
   return TypeFactory<TypeKind::ROW>::create(std::move(names), std::move(types));
 }
 
-std::shared_ptr<const MapType> MAP(TypePtr keyType, TypePtr valType) {
-  return std::make_shared<const MapType>(
+MapTypePtr MAP(TypePtr keyType, TypePtr valType) {
+  return TypeFactory<TypeKind::MAP>::create(
       std::move(keyType), std::move(valType));
 }
 
@@ -932,6 +877,11 @@ TypePtr DECIMAL(const uint8_t precision, const uint8_t scale) {
   return std::make_shared<LongDecimalType>(precision, scale);
 }
 
+// static
+std::string LongDecimalType::toString(int128_t value, const Type& type) {
+  return DecimalUtil::toString(value, type);
+}
+
 TypePtr createScalarType(TypeKind kind) {
   return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(createScalarType, kind);
 }
@@ -942,9 +892,9 @@ TypePtr createType(TypeKind kind, std::vector<TypePtr>&& children) {
         children.size(),
         1,
         "FUNCTION type should have at least one child type");
-    std::vector<TypePtr> argTypes(
-        children.begin(), children.begin() + children.size() - 1);
-    return std::make_shared<FunctionType>(std::move(argTypes), children.back());
+    auto returnType = std::move(children.back());
+    children.pop_back();
+    return FUNCTION(std::move(children), std::move(returnType));
   }
 
   if (kind == TypeKind::UNKNOWN) {
@@ -1020,10 +970,10 @@ std::string Type::toSummaryString(TypeSummaryOptions options) const {
 
 namespace {
 
-std::unordered_map<std::string, std::unique_ptr<const CustomTypeFactories>>&
+std::unordered_map<std::string, std::unique_ptr<const CustomTypeFactory>>&
 typeFactories() {
   static std::
-      unordered_map<std::string, std::unique_ptr<const CustomTypeFactories>>
+      unordered_map<std::string, std::unique_ptr<const CustomTypeFactory>>
           factories;
   return factories;
 }
@@ -1044,9 +994,9 @@ std::unordered_map<std::type_index, std::string>& getOpaqueAliasByTypeIndex() {
 
 bool registerCustomType(
     const std::string& name,
-    std::unique_ptr<const CustomTypeFactories> factories) {
+    std::unique_ptr<const CustomTypeFactory> factory) {
   auto uppercaseName = boost::algorithm::to_upper_copy(name);
-  return typeFactories().emplace(uppercaseName, std::move(factories)).second;
+  return typeFactories().emplace(uppercaseName, std::move(factory)).second;
 }
 
 bool customTypeExists(const std::string& name) {
@@ -1067,8 +1017,8 @@ bool unregisterCustomType(const std::string& name) {
   return typeFactories().erase(uppercaseName) == 1;
 }
 
-const CustomTypeFactories* FOLLY_NULLABLE
-getTypeFactories(const std::string& name) {
+const CustomTypeFactory* FOLLY_NULLABLE
+getTypeFactory(const std::string& name) {
   auto uppercaseName = boost::algorithm::to_upper_copy(name);
   auto it = typeFactories().find(uppercaseName);
 
@@ -1082,33 +1032,33 @@ getTypeFactories(const std::string& name) {
 TypePtr getCustomType(
     const std::string& name,
     const std::vector<TypeParameter>& parameters) {
-  auto factories = getTypeFactories(name);
-  if (factories) {
-    return factories->getType(parameters);
+  auto factory = getTypeFactory(name);
+  if (factory) {
+    return factory->getType(parameters);
   }
 
   return nullptr;
 }
 
 exec::CastOperatorPtr getCustomTypeCastOperator(const std::string& name) {
-  auto factories = getTypeFactories(name);
-  if (factories) {
-    return factories->getCastOperator();
+  auto factory = getTypeFactory(name);
+  if (factory) {
+    return factory->getCastOperator();
   }
 
   return nullptr;
 }
 
-CustomTypeFactories::~CustomTypeFactories() = default;
+CustomTypeFactory::~CustomTypeFactory() = default;
 
 AbstractInputGenerator::~AbstractInputGenerator() = default;
 
 AbstractInputGeneratorPtr getCustomTypeInputGenerator(
     const std::string& name,
     const InputGeneratorConfig& config) {
-  auto factories = getTypeFactories(name);
-  if (factories) {
-    return factories->getInputGenerator(config);
+  auto factory = getTypeFactory(name);
+  if (factory) {
+    return factory->getInputGenerator(config);
   }
 
   return nullptr;
@@ -1400,5 +1350,33 @@ std::string getOpaqueAliasForTypeId(std::type_index typeIndex) {
       "Could not find type index '{}'. Did you call registerOpaqueType?",
       typeIndex.name());
   return it->second;
+}
+
+std::string stringifyTruncatedElementList(
+    size_t size,
+    const std::function<void(std::stringstream&, size_t)>& stringifyElement,
+    size_t limit) {
+  if (size == 0) {
+    return "<empty>";
+  }
+
+  VELOX_CHECK_GT(limit, 0);
+
+  const size_t limitedSize = std::min(size, limit);
+
+  std::stringstream out;
+  out << "{";
+  for (size_t i = 0; i < limitedSize; ++i) {
+    if (i > 0) {
+      out << ", ";
+    }
+    stringifyElement(out, i);
+  }
+
+  if (size > limitedSize) {
+    out << ", ..." << (size - limitedSize) << " more";
+  }
+  out << "}";
+  return out.str();
 }
 } // namespace facebook::velox

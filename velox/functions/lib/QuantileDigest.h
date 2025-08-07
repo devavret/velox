@@ -19,6 +19,7 @@
 #include <folly/Bits.h>
 
 #include "velox/common/base/CheckedArithmetic.h"
+#include "velox/common/base/Doubles.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
 #include "velox/common/memory/HashStringAllocator.h"
@@ -67,23 +68,46 @@ class QuantileDigest {
 
   /// Estimate the values of the given quantiles and write the results in order
   /// directly into 'result'.
-  void estimateQuantiles(const std::vector<double>& quantiles, T* result);
+  void estimateQuantiles(const std::vector<double>& quantiles, T* result) const;
 
-  T estimateQuantile(double quantile);
+  T estimateQuantile(double quantile) const;
 
   int64_t serializedByteSize() const;
 
   int64_t serialize(char* out);
 
-  T getMin();
+  T getMin() const;
 
-  T getMax();
+  T getMax() const;
 
   // For testing only. Calling this method with 'other' being constructed from
   // QuantileDigest(const Allocator& allocator, const char* serialized) is
   // supposed to produce the same result as calling mergeSerialized() directly
   // on 'serialized'.
   void testingMerge(const QuantileDigest& other);
+
+  // Returns nullopt when the digest is empty or the value is out of the
+  // min/max range.
+  std::optional<double> quantileAtValue(T value) const;
+
+  struct CdfEntry {
+    T upperBound;
+    double cumulativeProbability;
+  };
+
+  /// Returns the cumulative distribution function as a vector of entries
+  /// mapping upper bounds to cumulative probabilities for values within
+  /// the specified range [rangeStart, rangeEnd]. The CDF provides
+  /// a lower bound estimate for the proportion of items <= x with error
+  /// bounded by the digest's maxError parameter. This is a
+  /// right-continous step function, i.e., values in between entries
+  /// have the same estimated cumulative probability as the
+  /// previous entry.
+  const std::vector<
+      CdfEntry,
+      typename std::allocator_traits<Allocator>::template rebind_alloc<
+          CdfEntry>>
+  getDistributionFunction(double rangeStart, double rangeEnd) const;
 
  private:
   using U = std::conditional_t<sizeof(T) == sizeof(int64_t), int64_t, int32_t>;
@@ -139,7 +163,7 @@ class QuantileDigest {
       int32_t node,
       Func callback,
       const std::vector<int32_t, RebindAlloc<int32_t>>& firstChildren,
-      const std::vector<int32_t, RebindAlloc<int32_t>>& secondChildren) {
+      const std::vector<int32_t, RebindAlloc<int32_t>>& secondChildren) const {
     if (node == -1) {
       return false;
     } else {
@@ -221,6 +245,8 @@ class QuantileDigest {
   U lowerBound(int32_t node) const;
 
   U upperBound(int32_t node) const;
+
+  bool validateDigest() const;
 
   double maxError_;
   double weightedCount_;
@@ -501,7 +527,7 @@ double QuantileDigest<T, Allocator>::getCount() const {
 
 template <typename T, typename Allocator>
 void QuantileDigest<T, Allocator>::scale(double scaleFactor) {
-  VELOX_USER_CHECK(scaleFactor > 0.0, "scale factor must be > 0");
+  VELOX_USER_CHECK(scaleFactor > 0.0, "Scale factor should be positive.");
   for (auto i = 0; i < counts_.size(); ++i) {
     counts_[i] *= scaleFactor;
   }
@@ -552,7 +578,7 @@ void QuantileDigest<T, Allocator>::add(T value, double weight) {
 
   VELOX_USER_CHECK_LT(
       weightedCount_,
-      std::numeric_limits<int64_t>::max(),
+      kMaxDoubleBelowInt64Max,
       "Weighted count in digest is too large: {}",
       weightedCount_);
   if (needsCompression ||
@@ -717,6 +743,42 @@ void QuantileDigest<T, Allocator>::setChild(
 }
 
 template <typename T, typename Allocator>
+bool QuantileDigest<T, Allocator>::validateDigest() const {
+  std::unordered_set<
+      int32_t,
+      std::hash<int32_t>,
+      std::equal_to<int32_t>,
+      RebindAlloc<int32_t>>
+      free(lefts_.get_allocator());
+  auto iterator = firstFree_;
+  while (iterator != -1) {
+    free.insert(iterator);
+    iterator = lefts_[iterator];
+  }
+  std::vector<bool, RebindAlloc<unsigned long>> visited(
+      lefts_.size(), false, RebindAlloc<unsigned long>(lefts_.get_allocator()));
+
+  // Check that visited nodes are not in the free list and are visited only
+  // once.
+  postOrderTraverse(
+      root_,
+      [&free, &visited](int32_t node) {
+        VELOX_CHECK_EQ(free.count(node), 0);
+        VELOX_CHECK_EQ(bool(visited[node]), false);
+        visited[node] = true;
+
+        return true;
+      },
+      lefts_,
+      rights_);
+  // Check that all nodes that are not in the free list are visited.
+  for (auto i = 0; i < visited.size(); ++i) {
+    VELOX_CHECK(visited[i] == true || free.count(i) == 1);
+  }
+  return true;
+}
+
+template <typename T, typename Allocator>
 void QuantileDigest<T, Allocator>::compress() {
   double bound = std::floor(
       weightedCount_ / static_cast<double>(calculateCompressionFactor()));
@@ -752,6 +814,7 @@ void QuantileDigest<T, Allocator>::compress() {
   if (root_ != -1 && counts_[root_] < qdigest::kZeroWeightThreshold) {
     root_ = tryRemove(root_);
   }
+  VELOX_DCHECK(validateDigest());
 }
 
 template <typename T, typename Allocator>
@@ -846,6 +909,8 @@ void QuantileDigest<T, Allocator>::mergeSerialized(const char* other) {
   std::tie(root_, pos) = mergeSerializedRecursive(root_, other, other + size);
   max_ = std::max(max_, max);
   min_ = std::min(min_, min);
+  VELOX_DCHECK(validateDigest());
+
   compress();
 }
 
@@ -902,6 +967,8 @@ QuantileDigest<T, Allocator>::mergeSerializedRecursive(
       if (branch == 0) {
         if (hasRight) {
           std::tie(right, position) = copySerializedRecursive(start, position);
+        } else {
+          right = -1;
         }
         if (hasLeft) {
           std::tie(left, position) =
@@ -914,6 +981,8 @@ QuantileDigest<T, Allocator>::mergeSerializedRecursive(
         }
         if (hasLeft) {
           std::tie(left, position) = copySerializedRecursive(start, position);
+        } else {
+          left = -1;
         }
       }
 
@@ -1075,7 +1144,7 @@ inline bool validateQuantiles(const std::vector<double>& quantiles) {
 template <typename T, typename Allocator>
 void QuantileDigest<T, Allocator>::estimateQuantiles(
     const std::vector<double>& quantiles,
-    T* result) {
+    T* result) const {
   VELOX_DCHECK(validateQuantiles(quantiles));
   int i = -1;
   double sum = 0.0;
@@ -1098,14 +1167,14 @@ void QuantileDigest<T, Allocator>::estimateQuantiles(
 }
 
 template <typename T, typename Allocator>
-T QuantileDigest<T, Allocator>::estimateQuantile(double quantile) {
+T QuantileDigest<T, Allocator>::estimateQuantile(double quantile) const {
   T result;
   estimateQuantiles({quantile}, &result);
   return result;
 }
 
 template <typename T, typename Allocator>
-T QuantileDigest<T, Allocator>::getMin() {
+T QuantileDigest<T, Allocator>::getMin() const {
   T result = std::numeric_limits<T>::min();
   postOrderTraverse(
       root_,
@@ -1123,7 +1192,7 @@ T QuantileDigest<T, Allocator>::getMin() {
 }
 
 template <typename T, typename Allocator>
-T QuantileDigest<T, Allocator>::getMax() {
+T QuantileDigest<T, Allocator>::getMax() const {
   T result = std::numeric_limits<T>::max();
   postOrderTraverse(
       root_,
@@ -1190,6 +1259,7 @@ int64_t QuantileDigest<T, Allocator>::serializedByteSize() const {
 
 template <typename T, typename Allocator>
 int64_t QuantileDigest<T, Allocator>::serialize(char* out) {
+  VELOX_DCHECK(validateDigest());
   compress();
   const char* outStart = out;
   SerDe::writeMetadata(
@@ -1217,6 +1287,88 @@ int64_t QuantileDigest<T, Allocator>::serialize(char* out) {
       rights_);
   VELOX_CHECK_EQ(out - outStart, serializedByteSize());
   return out - outStart;
+}
+
+template <typename T, typename Allocator>
+std::optional<double> QuantileDigest<T, Allocator>::quantileAtValue(
+    T value) const {
+  if (weightedCount_ == 0 || root_ == -1) {
+    return std::nullopt;
+  }
+
+  auto sortableValue = preprocessByType(value);
+  if (sortableValue > preprocessByType(getMax()) ||
+      sortableValue < preprocessByType(getMin())) {
+    return std::nullopt;
+  }
+
+  double bucketCount = 0.0;
+  postOrderTraverse(
+      root_,
+      [this, sortableValue, &bucketCount](int32_t node) {
+        if (upperBound(node) >= sortableValue) {
+          return false;
+        }
+        bucketCount += counts_[node];
+        return true;
+      },
+      lefts_,
+      rights_);
+  return bucketCount / weightedCount_;
+}
+
+template <typename T, typename Allocator>
+const std::vector<
+    typename QuantileDigest<T, Allocator>::CdfEntry,
+    typename QuantileDigest<T, Allocator>::template RebindAlloc<
+        typename QuantileDigest<T, Allocator>::CdfEntry>>
+QuantileDigest<T, Allocator>::getDistributionFunction(
+    double rangeStart,
+    double rangeEnd) const {
+  std::vector<CdfEntry, RebindAlloc<CdfEntry>> cdf(
+      RebindAlloc<CdfEntry>(counts_.get_allocator()));
+
+  if (weightedCount_ == 0 || root_ == -1) {
+    return cdf;
+  }
+
+  VELOX_USER_CHECK_LE(
+      rangeStart,
+      rangeEnd,
+      "rangeStart must be less than or equal to rangeEnd");
+
+  // Always start with (rangeStart, 0) as the starting point.
+  cdf.push_back({static_cast<T>(rangeStart), 0.0});
+
+  // Build CDF during post-order traversal.
+  double cumulativeProbability = 0.0;
+  postOrderTraverse(
+      root_,
+      [this, &cdf, &cumulativeProbability, rangeStart, rangeEnd](int32_t node) {
+        if (counts_[node] > 0) {
+          T nodeUpper = postprocessByType(this->upperBound(node));
+          cumulativeProbability += counts_[node] / weightedCount_;
+          // Only include values within the specified range.
+          if (nodeUpper >= rangeEnd) {
+            return false;
+          } else if (nodeUpper >= rangeStart) {
+            // Take the largest probability for the same upperBound.
+            if (nodeUpper == cdf.back().upperBound) {
+              cdf.back().cumulativeProbability = cumulativeProbability;
+            } else {
+              cdf.push_back({nodeUpper, cumulativeProbability});
+            }
+          }
+        }
+        return true;
+      },
+      lefts_,
+      rights_);
+
+  // Always end with (rangeEnd, 1) as the endpoint.
+  cdf.push_back({static_cast<T>(rangeEnd), 1.0});
+
+  return cdf;
 }
 
 } // namespace qdigest

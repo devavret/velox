@@ -56,6 +56,8 @@ endif
 
 ifdef CUDA_ARCHITECTURES
 CMAKE_FLAGS += -DCMAKE_CUDA_ARCHITECTURES="$(CUDA_ARCHITECTURES)"
+else
+EXTRA_CMAKE_CUDA_FLAGS = -DCMAKE_CUDA_ARCHITECTURES="native"
 endif
 
 ifdef CUDA_COMPILER
@@ -101,10 +103,10 @@ cmake:					#: Use CMake to create a Makefile build system
 		${EXTRA_CMAKE_FLAGS}
 
 cmake-wave:
-	$(MAKE) EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_WAVE=ON" cmake
+	$(MAKE) EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_WAVE=ON ${EXTRA_CMAKE_CUDA_FLAGS}" cmake
 
 cmake-cudf:
-	$(MAKE) EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_CUDF=ON" cmake
+	$(MAKE) EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_CUDF=ON ${EXTRA_CMAKE_CUDA_FLAGS}" cmake
 
 build:					#: Build the software based in BUILD_DIR and BUILD_TYPE variables
 	cmake --build $(BUILD_BASE_DIR)/$(BUILD_DIR) -j $(NUM_THREADS)
@@ -118,13 +120,17 @@ release:				#: Build the release version
 	$(MAKE) build BUILD_DIR=release
 
 minimal_debug:			#: Minimal build with debugging symbols
-	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_BUILD_MINIMAL=ON"
+	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug \
+		EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
+			-DVELOX_BUILD_MINIMAL=ON"
 	$(MAKE) build BUILD_DIR=debug
 
 min_debug: minimal_debug
 
 minimal:				 #: Minimal build
-	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_BUILD_MINIMAL=ON"
+	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release \
+		EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
+			-DVELOX_BUILD_MINIMAL=ON"
 	$(MAKE) build BUILD_DIR=release
 
 wave:			   	         #: Build with Wave GPU support
@@ -144,26 +150,30 @@ cudf-debug:			 #: Build with debugging symbols and cuDF GPU support
 	$(MAKE) build BUILD_DIR=debug
 
 dwio:						#: Minimal build with dwio enabled.
-	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
-																										    							  -DVELOX_BUILD_MINIMAL_WITH_DWIO=ON"
+	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release \
+		EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
+			-DVELOX_BUILD_MINIMAL_WITH_DWIO=ON"
 	$(MAKE) build BUILD_DIR=release
 
 dwio_debug:			#: Minimal build with dwio debugging symbols.
-	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
-																																	  -DVELOX_BUILD_MINIMAL_WITH_DWIO=ON"
+	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug \
+		EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
+			-DVELOX_BUILD_MINIMAL_WITH_DWIO=ON"
 	$(MAKE) build BUILD_DIR=debug
 
 benchmarks-basic-build:
-	$(MAKE) release EXTRA_CMAKE_FLAGS=" ${EXTRA_CMAKE_FLAGS} \
-                                            -DVELOX_BUILD_TESTING=OFF \
-                                            -DVELOX_ENABLE_BENCHMARKS_BASIC=ON \
-					    -DVELOX_BUILD_RUNNER=OFF"
+	$(MAKE) release \
+		EXTRA_CMAKE_FLAGS=" ${EXTRA_CMAKE_FLAGS} \
+			-DVELOX_BUILD_TESTING=OFF \
+			-DVELOX_ENABLE_BENCHMARKS_BASIC=ON \
+			-DVELOX_BUILD_RUNNER=OFF"
 
 benchmarks-build:
-	$(MAKE) release EXTRA_CMAKE_FLAGS=" ${EXTRA_CMAKE_FLAGS} \
-                                            -DVELOX_BUILD_TESTING=OFF \
-                                            -DVELOX_ENABLE_BENCHMARKS=ON \
-					    -DVELOX_BUILD_RUNNER=OFF"
+	$(MAKE) release \
+		EXTRA_CMAKE_FLAGS=" ${EXTRA_CMAKE_FLAGS} \
+			-DVELOX_BUILD_TESTING=OFF \
+			-DVELOX_ENABLE_BENCHMARKS=ON \
+			-DVELOX_BUILD_RUNNER=OFF"
 
 benchmarks-basic-run:
 	scripts/ci/benchmark-runner.py run \
@@ -184,48 +194,6 @@ fuzzertest: debug
 			--repro_persist_path $(FUZZER_REPRO_PERSIST_PATH) \
 			--logtostderr=1 \
 			--minloglevel=0
-
-format-fix: 			#: Fix formatting issues in the main branch
-ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
-	source ${PYTHON_VENV}/bin/activate; scripts/check.py format main --fix
-else
-	scripts/check.py format main --fix
-endif
-
-format-check: 			#: Check for formatting issues on the main branch
-	clang-format --version
-ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
-	source ${PYTHON_VENV}/bin/activate; scripts/check.py format main
-else
-	scripts/check.py format main
-endif
-
-header-fix:			#: Fix license header issues in the current branch
-ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
-	source ${PYTHON_VENV}/bin/activate; scripts/check.py header main --fix
-else
-	scripts/check.py header main --fix
-endif
-
-header-check:			#: Check for license header issues on the main branch
-ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
-	source ${PYTHON_VENV}/bin/activate; scripts/check.py header main
-else
-	scripts/check.py header main
-endif
-
-circleci-container:			#: Build the linux container for CircleCi
-	$(MAKE) linux-container CONTAINER_NAME=circleci
-
-check-container:
-	$(MAKE) linux-container CONTAINER_NAME=check
-
-linux-container:
-	rm -rf /tmp/docker && \
-	mkdir -p /tmp/docker && \
-	cp scripts/setup-helper-functions.sh scripts/setup-$(CONTAINER_NAME).sh scripts/$(CONTAINER_NAME)-container.dockfile /tmp/docker && \
-	cd /tmp/docker && \
-	docker build --build-arg cpu_target=$(CPU_TARGET) --tag "prestocpp/velox-$(CPU_TARGET)-$(CONTAINER_NAME):${USER}-$(shell date +%Y%m%d)" -f $(CONTAINER_NAME)-container.dockfile .
 
 help:					#: Show the help messages
 	@cat $(firstword $(MAKEFILE_LIST)) | \

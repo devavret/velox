@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# shellcheck source-path=SCRIPT_DIR
 
 # This script documents setting up a Centos9 host for Velox
 # development.  Running it should make you ready to compile.
@@ -28,15 +29,16 @@
 set -efx -o pipefail
 # Some of the packages must be build with the same compiler flags
 # so that some low level types are the same size. Also, disable warnings.
-SCRIPTDIR=$(dirname "${BASH_SOURCE[0]}")
-source $SCRIPTDIR/setup-common.sh
-export CXXFLAGS=$(get_cxx_flags) # Used by boost.
-export CFLAGS=${CXXFLAGS//"-std=c++17"/} # Used by LZO.
+SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
+source "$SCRIPT_DIR"/setup-common.sh
+CXXFLAGS=$(get_cxx_flags) # Used by boost.
+export CXXFLAGS
 export COMPILER_FLAGS=${CXXFLAGS}
 SUDO="${SUDO:-""}"
 USE_CLANG="${USE_CLANG:-false}"
 export INSTALL_PREFIX=${INSTALL_PREFIX:-"/usr/local"}
 DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)/deps-download}
+export UV_TOOL_BIN_DIR="${UV_TOOL_BIN_DIR:-"$INSTALL_PREFIX"/bin}"
 
 function dnf_install {
   dnf install -y -q --setopt=install_weak_deps=False "$@"
@@ -50,12 +52,15 @@ function install_clang15 {
 function install_build_prerequisites {
   dnf update -y
   dnf_install epel-release dnf-plugins-core # For ccache, ninja
-  dnf config-manager --set-enabled crb
-  dnf update -y
-  dnf_install ninja-build cmake ccache gcc-toolset-12 git wget which
-  dnf_install autoconf automake python3-devel pip libtool
+  if grep -q CentOS /etc/os-release; then
+    dnf config-manager --set-enabled crb
+    dnf update -y
+  fi
+  dnf_install autoconf automake ccache gcc-toolset-12 git libtool \
+    ninja-build python3-pip python3-devel wget which
 
-  pip install cmake==3.30.4
+  install_uv
+  uv_install cmake
 
   if [[ ${USE_CLANG} != "false" ]]; then
     install_clang15
@@ -69,8 +74,7 @@ function install_velox_deps_from_dnf {
     libdwarf-devel elfutils-libelf-devel curl-devel libicu-devel bison flex \
     libsodium-devel zlib-devel gtest-devel gmock-devel xxhash-devel
 
-  # install sphinx for doc gen
-  pip install sphinx sphinx-tabs breathe sphinx_rtd_theme
+  install_faiss_deps
 }
 
 function install_conda {
@@ -80,51 +84,12 @@ function install_conda {
 function install_gflags {
   # Remove an older version if present.
   dnf remove -y gflags
-  wget_and_untar https://github.com/gflags/gflags/archive/${GFLAGS_VERSION}.tar.gz gflags
+  wget_and_untar https://github.com/gflags/gflags/archive/"${GFLAGS_VERSION}".tar.gz gflags
   cmake_install_dir gflags -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON -DBUILD_gflags_LIB=ON -DLIB_SUFFIX=64
 }
 
-function install_cuda {
-  # See https://developer.nvidia.com/cuda-downloads
-  dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
-  local dashed="$(echo $1 | tr '.' '-')"
-  dnf install -y \
-    cuda-compat-$dashed \
-    cuda-driver-devel-$dashed \
-    cuda-minimal-build-$dashed \
-    cuda-nvrtc-devel-$dashed
-}
-
-function install_s3 {
-  install_aws_deps
-
-  local MINIO_OS="linux"
-  install_minio ${MINIO_OS}
-}
-
-function install_gcs {
-  # Dependencies of GCS, probably a workaround until the docker image is rebuilt
-  dnf -y install npm curl-devel c-ares-devel
-  install_gcs-sdk-cpp
-}
-
-function install_abfs {
-  # Dependencies of Azure Storage Blob cpp
-  dnf -y install perl-IPC-Cmd openssl libxml2-devel
-  install_azure-storage-sdk-cpp
-}
-
-function install_hdfs {
-  dnf -y install libxml2-devel libgsasl-devel libuuid-devel krb5-devel
-  install_hdfs_deps
-  yum install -y java-1.8.0-openjdk-devel
-}
-
-function install_adapters {
-  run_and_time install_s3
-  run_and_time install_gcs
-  run_and_time install_abfs
-  run_and_time install_hdfs
+function install_faiss_deps {
+  dnf_install openblas-devel libomp
 }
 
 function install_velox_deps {
@@ -132,7 +97,6 @@ function install_velox_deps {
   run_and_time install_conda
   run_and_time install_gflags
   run_and_time install_glog
-  run_and_time install_lzo
   run_and_time install_snappy
   run_and_time install_boost
   run_and_time install_protobuf
@@ -150,9 +114,10 @@ function install_velox_deps {
   run_and_time install_xsimd
   run_and_time install_simdjson
   run_and_time install_geos
+  run_and_time install_faiss
 }
 
-(return 2> /dev/null) && return # If script was sourced, don't run commands.
+(return 2>/dev/null) && return # If script was sourced, don't run commands.
 
 (
   if [[ $# -ne 0 ]]; then
@@ -194,4 +159,3 @@ function install_velox_deps {
     dnf clean all
   fi
 )
-

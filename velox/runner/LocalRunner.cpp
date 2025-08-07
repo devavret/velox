@@ -93,11 +93,13 @@ std::vector<ExecutableFragment> topologicalSort(
 LocalRunner::LocalRunner(
     const MultiFragmentPlanPtr& plan,
     std::shared_ptr<core::QueryCtx> queryCtx,
-    std::shared_ptr<SplitSourceFactory> splitSourceFactory)
+    std::shared_ptr<SplitSourceFactory> splitSourceFactory,
+    std::shared_ptr<memory::MemoryPool> outputPool)
     : fragments_(topologicalSort(plan->fragments())),
       options_(plan->options()),
       splitSourceFactory_(std::move(splitSourceFactory)) {
   params_.queryCtx = std::move(queryCtx);
+  params_.outputPool = outputPool;
 }
 
 RowVectorPtr LocalRunner::next() {
@@ -115,6 +117,7 @@ RowVectorPtr LocalRunner::next() {
 void LocalRunner::start() {
   VELOX_CHECK_EQ(state_, State::kInitialized);
   auto lastStage = makeStages();
+  params_.maxDrivers = options_.numDrivers;
   params_.planNode = fragments_.back().fragment.planNode;
   auto cursor = exec::TaskCursor::create(params_);
   stages_.push_back({cursor->task()});

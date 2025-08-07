@@ -38,10 +38,9 @@ using namespace facebook::velox::connector;
 class ParquetDataSource : public DataSource, public NvtxHelper {
  public:
   ParquetDataSource(
-      const std::shared_ptr<const RowType>& outputType,
-      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
-      const std::unordered_map<std::string, std::shared_ptr<ColumnHandle>>&
-          columnHandles,
+      const RowTypePtr& outputType,
+      const ConnectorTableHandlePtr& tableHandle,
+      const ColumnHandleMap& columnHandles,
       folly::Executor* executor,
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<ParquetConfig>& ParquetConfig);
@@ -67,10 +66,7 @@ class ParquetDataSource : public DataSource, public NvtxHelper {
     return completedBytes_;
   }
 
-  std::unordered_map<std::string, RuntimeCounter> runtimeStats() override {
-    // TODO: Which stats do we want to expose here?
-    return {};
-  }
+  std::unordered_map<std::string, RuntimeCounter> runtimeStats() override;
 
  private:
   // Create a cudf::io::chunked_parquet_reader with the given split.
@@ -90,7 +86,7 @@ class ParquetDataSource : public DataSource, public NvtxHelper {
   RowVectorPtr emptyOutput_;
 
   std::shared_ptr<ParquetConnectorSplit> split_;
-  std::shared_ptr<ParquetTableHandle> tableHandle_;
+  std::shared_ptr<const ParquetTableHandle> tableHandle_;
 
   const std::shared_ptr<ParquetConfig> parquetConfig_;
 
@@ -134,6 +130,16 @@ class ParquetDataSource : public DataSource, public NvtxHelper {
   std::unique_ptr<exec::ExprSet> subfieldFilterExprSet_;
 
   dwio::common::RuntimeStatistics runtimeStats_;
+  std::atomic<uint64_t> totalRemainingFilterTime_{0};
+
+  // Create callback data for total scan timing calculation
+  struct TotalScanTimeCallbackData {
+    uint64_t startTimeUs;
+    std::shared_ptr<io::IoStatistics> ioStats;
+  };
+
+  // Host callback function to calculate total scan time
+  static void totalScanTimeCalculator(void* userData);
 };
 
 } // namespace facebook::velox::cudf_velox::connector::parquet

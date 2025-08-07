@@ -65,6 +65,10 @@ class TestingLoader : public VectorLoader {
     return rowCounter_;
   }
 
+  bool supportsHook() const override {
+    return true;
+  }
+
  private:
   template <TypeKind Kind>
   void applyHook(RowSet rows, ValueHook* hook) {
@@ -1472,16 +1476,6 @@ TEST_F(VectorTest, wrapInConstant) {
     ASSERT_TRUE(constArrayVector->equalValueAt(arrayVector.get(), i, 3));
   }
 
-  // Wrap constant with valueVector and null value.
-  constBaseVector = std::make_shared<ConstantVector<ComplexType>>(
-      pool(), size, 7, arrayVector);
-  constArrayVector = std::dynamic_pointer_cast<ConstantVector<ComplexType>>(
-      BaseVector::wrapInConstant(size, 22, constBaseVector, true));
-  EXPECT_NE(constArrayVector->valueVector(), nullptr);
-  for (auto i = 0; i < size; i++) {
-    ASSERT_TRUE(constArrayVector->isNullAt(i));
-  }
-
   // Wrap a loaded lazy complex vector that will be retained as a valueVector.
   // Ensure the lazy layer is stripped away and the valueVector points to the
   // loaded Vector underneath it.
@@ -1495,78 +1489,6 @@ TEST_F(VectorTest, wrapInConstant) {
   constArrayVector = std::dynamic_pointer_cast<ConstantVector<ComplexType>>(
       BaseVector::wrapInConstant(size, 22, lazyOverArray));
   EXPECT_FALSE(constArrayVector->valueVector()->isLazy());
-}
-
-TEST_F(VectorTest, wrapInConstantWithCopy) {
-  // Wrap flat vector.
-  const vector_size_t size = 1'000;
-  auto flatVector =
-      makeFlatVector<int32_t>(size, [](auto row) { return row; }, nullEvery(7));
-
-  auto constVector = std::dynamic_pointer_cast<ConstantVector<int32_t>>(
-      BaseVector::wrapInConstant(size, 5, flatVector, true));
-  EXPECT_EQ(constVector->valueVector(), nullptr);
-  for (auto i = 0; i < size; i++) {
-    ASSERT_FALSE(constVector->isNullAt(i));
-    ASSERT_EQ(5, constVector->valueAt(i));
-  }
-
-  constVector = std::dynamic_pointer_cast<ConstantVector<int32_t>>(
-      BaseVector::wrapInConstant(size, 7, flatVector, true));
-  EXPECT_EQ(constVector->valueVector(), nullptr);
-  for (auto i = 0; i < size; i++) {
-    ASSERT_TRUE(constVector->isNullAt(i));
-  }
-
-  // Wrap dictionary vector.
-  BufferPtr indices = AlignedBuffer::allocate<vector_size_t>(size, pool());
-  auto rawIndices = indices->asMutable<vector_size_t>();
-  for (auto i = 0; i < size; i++) {
-    rawIndices[i] = 2 * i % size;
-  }
-
-  BufferPtr nulls = allocateNulls(size, pool());
-  auto rawNulls = nulls->asMutable<uint64_t>();
-  for (auto i = 0; i < size; i++) {
-    bits::setNull(rawNulls, i, i % 11 == 0);
-  }
-
-  auto dictVector =
-      BaseVector::wrapInDictionary(nulls, indices, size, flatVector);
-
-  constVector = std::dynamic_pointer_cast<ConstantVector<int32_t>>(
-      BaseVector::wrapInConstant(size, 5, dictVector, true));
-  EXPECT_EQ(constVector->valueVector(), nullptr);
-  for (auto i = 0; i < size; i++) {
-    ASSERT_FALSE(constVector->isNullAt(i));
-    ASSERT_EQ(10, constVector->valueAt(i));
-  }
-
-  // Wrap constant with valueVector.
-  auto arrayVector = makeArrayVector<int32_t>(
-      size, [](auto) { return 10; }, [](auto i) { return i; }, nullEvery(7));
-  auto constBaseVector = std::make_shared<ConstantVector<ComplexType>>(
-      pool(), size, 3, arrayVector);
-  auto constArrayVector =
-      std::dynamic_pointer_cast<ConstantVector<ComplexType>>(
-          BaseVector::wrapInConstant(size, 22, constBaseVector, true));
-  EXPECT_NE(constArrayVector->valueVector(), nullptr);
-  EXPECT_EQ(constArrayVector->valueVector().use_count(), 1);
-  for (auto i = 0; i < size; i++) {
-    ASSERT_FALSE(constArrayVector->isNullAt(i));
-    ASSERT_TRUE(constArrayVector->equalValueAt(arrayVector.get(), i, 3));
-  }
-
-  // Wrap constant with valueVector and null value.
-  constBaseVector = std::make_shared<ConstantVector<ComplexType>>(
-      pool(), size, 7, arrayVector);
-  constArrayVector = std::dynamic_pointer_cast<ConstantVector<ComplexType>>(
-      BaseVector::wrapInConstant(size, 22, constBaseVector, true));
-  EXPECT_NE(constArrayVector->valueVector(), nullptr);
-  EXPECT_EQ(constArrayVector->valueVector().use_count(), 1);
-  for (auto i = 0; i < size; i++) {
-    ASSERT_TRUE(constArrayVector->isNullAt(i));
-  }
 }
 
 TEST_F(VectorTest, rowResize) {
@@ -2053,6 +1975,7 @@ class TestingHook : public ValueHook {
       }
     }
   }
+
   int32_t errors() const {
     return errors_;
   }
@@ -3270,26 +3193,19 @@ TEST_F(VectorTest, mutableValues) {
   auto vector = makeFlatVector<int64_t>(1'000, [](auto row) { return row; });
 
   auto* rawValues = vector->rawValues();
-  vector->mutableValues(1'001);
+  vector->mutableValues();
   ASSERT_EQ(rawValues, vector->rawValues());
   for (auto i = 0; i < 1'000; ++i) {
     EXPECT_EQ(rawValues[i], i);
   }
 
-  vector->mutableValues(10'000);
-  ASSERT_NE(rawValues, vector->rawValues());
-  rawValues = vector->rawValues();
-  for (auto i = 0; i < 1'000; ++i) {
-    EXPECT_EQ(rawValues[i], i);
-  }
-
-  auto values = vector->mutableValues(2'000);
+  auto values = vector->mutableValues();
   ASSERT_EQ(rawValues, vector->rawValues());
   for (auto i = 0; i < 1'000; ++i) {
     EXPECT_EQ(rawValues[i], i);
   }
 
-  vector->mutableValues(500);
+  vector->mutableValues();
   ASSERT_NE(rawValues, vector->rawValues());
   rawValues = vector->rawValues();
   for (auto i = 0; i < 500; ++i) {
@@ -3643,6 +3559,44 @@ TEST_F(VectorTest, flatAllNulls) {
   }
 }
 
+TEST_F(VectorTest, hashValueAtArray) {
+  auto data = makeArrayVectorFromJson<int32_t>({
+      "[1, 2, 3]",
+      "[2, 1, 3]",
+      "[3, 2, 1]",
+      "[1, 2, 3, 4]",
+      "[1, null, 3]",
+      "[1, 2, 3]",
+  });
+
+  std::unordered_set<uint64_t> hashes;
+  for (auto i = 0; i < 5; ++i) {
+    EXPECT_TRUE(hashes.insert(data->hashValueAt(i)).second);
+  }
+  EXPECT_EQ(5, hashes.size());
+
+  EXPECT_EQ(data->hashValueAt(0), data->hashValueAt(5));
+}
+
+TEST_F(VectorTest, hashValueAtMap) {
+  auto data = makeMapVectorFromJson<int32_t, int32_t>({
+      "{1: 10, 2: 20}",
+      "{1: 20, 2: 10}",
+      "{10: 1, 20: 2}",
+      "{1: 2, 3: 4}",
+      "{1: 2, 3: 4, 5: 6}",
+      "{2: 20, 1: 10}",
+  });
+
+  std::unordered_set<uint64_t> hashes;
+  for (auto i = 0; i < 5; ++i) {
+    EXPECT_TRUE(hashes.insert(data->hashValueAt(i)).second);
+  }
+  EXPECT_EQ(5, hashes.size());
+
+  EXPECT_EQ(data->hashValueAt(0), data->hashValueAt(5));
+}
+
 TEST_F(VectorTest, hashAll) {
   auto data = makeFlatVector<int32_t>({1, 2, 3});
   ASSERT_TRUE(data->getNullCount().has_value());
@@ -3726,20 +3680,45 @@ TEST_F(VectorTest, getLargeStringBuffer) {
 }
 
 TEST_F(VectorTest, mapUpdate) {
-  auto base = makeNullableMapVector<int64_t, int64_t>({
+  auto verifyUpdate =
+      [](MapVectorPtr& base, MapVectorPtr& update, MapVectorPtr& expected) {
+        auto actual = base->update({update});
+        ASSERT_EQ(actual->size(), expected->size());
+        for (int i = 0; i < actual->size(); ++i) {
+          ASSERT_TRUE(actual->equalValueAt(expected.get(), i, i));
+        }
+      };
+
+  auto baseNoNulls = makeMapVector<int64_t, int64_t>({
+      {{{1, 1}, {2, 1}}},
+      common::testutil::Empty,
+      {{{3, 1}}},
+      {{{4, 1}}},
+      {{{4, 1}}},
+  });
+  auto updateNoNulls = makeMapVector<int64_t, int64_t>({
+      {{{2, 2}, {3, 2}}},
+      {{{4, 2}}},
+      common::testutil::Empty,
+      {{{5, 2}}},
+      {{{4, 1}}},
+  });
+  auto baseWithNulls = makeNullableMapVector<int64_t, int64_t>({
       {{{1, 1}, {2, 1}}},
       common::testutil::optionalEmpty,
       {{{3, 1}}},
       std::nullopt,
       {{{4, 1}}},
   });
-  auto update = makeNullableMapVector<int64_t, int64_t>({
+  auto updateWithNulls = makeNullableMapVector<int64_t, int64_t>({
       {{{2, 2}, {3, 2}}},
       {{{4, 2}}},
       common::testutil::optionalEmpty,
       {{{5, 2}}},
       std::nullopt,
   });
+
+  // Case 1: Both base and update have nulls
   auto expected = makeNullableMapVector<int64_t, int64_t>({
       {{{2, 2}, {3, 2}, {1, 1}}},
       {{{4, 2}}},
@@ -3747,11 +3726,35 @@ TEST_F(VectorTest, mapUpdate) {
       std::nullopt,
       std::nullopt,
   });
-  auto actual = base->update({update});
-  ASSERT_EQ(actual->size(), expected->size());
-  for (int i = 0; i < actual->size(); ++i) {
-    ASSERT_TRUE(actual->equalValueAt(expected.get(), i, i));
-  }
+  verifyUpdate(baseWithNulls, updateWithNulls, expected);
+
+  // Case 2: Only base has nulls
+  expected = makeNullableMapVector<int64_t, int64_t>({
+      {{{2, 2}, {3, 2}, {1, 1}}},
+      {{{4, 2}}},
+      {{{3, 1}}},
+      std::nullopt,
+      {{{4, 1}}},
+  });
+  verifyUpdate(baseWithNulls, updateNoNulls, expected);
+  // Case 3: Only update has nulls
+  expected = makeNullableMapVector<int64_t, int64_t>({
+      {{{2, 2}, {3, 2}, {1, 1}}},
+      {{{4, 2}}},
+      {{{3, 1}}},
+      {{{4, 1}, {5, 2}}},
+      std::nullopt,
+  });
+  verifyUpdate(baseNoNulls, updateWithNulls, expected);
+  // Case 4: Both base and update do not have nulls
+  expected = makeNullableMapVector<int64_t, int64_t>({
+      {{{2, 2}, {3, 2}, {1, 1}}},
+      {{{4, 2}}},
+      {{{3, 1}}},
+      {{{4, 1}, {5, 2}}},
+      {{{4, 1}}},
+  });
+  verifyUpdate(baseNoNulls, updateNoNulls, expected);
 }
 
 TEST_F(VectorTest, mapUpdateRowKeyType) {
@@ -3881,6 +3884,27 @@ TEST_F(VectorTest, mapUpdateDictionary) {
       {{{2, 2}, {4, 1}}},
   });
   test::assertEqualVectors(expected, actual);
+}
+
+TEST_F(VectorTest, ensureNullRowsEmpty) {
+  constexpr int kSize = 10;
+  ArrayVector vector(
+      pool(),
+      ARRAY(BIGINT()),
+      makeNulls(kSize, nullEvery(3)),
+      kSize,
+      makeIndices(kSize, [](auto i) { return i; }),
+      makeIndices(kSize, [](auto) { return 1; }),
+      makeFlatVector<int64_t>(kSize, [](auto i) { return i; }));
+  ASSERT_EQ(vector.sizeAt(3), 1);
+  ASSERT_EQ(vector.offsetAt(3), 3);
+  vector.ensureNullRowsEmpty();
+  for (int i = 0; i < kSize; ++i) {
+    if (vector.isNullAt(i)) {
+      ASSERT_EQ(vector.sizeAt(i), 0);
+      ASSERT_EQ(vector.offsetAt(i), 0);
+    }
+  }
 }
 
 TEST_F(VectorTest, pushDictionaryToRowVectorLeaves) {

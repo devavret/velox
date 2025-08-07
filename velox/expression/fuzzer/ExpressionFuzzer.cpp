@@ -114,9 +114,11 @@ static void filterSignatures(
     facebook::velox::FunctionSignatureMap& input,
     const std::string& onlyFunctions,
     const std::unordered_set<std::string>& skipFunctions) {
-  if (!onlyFunctions.empty()) {
+  auto filteredFunctions = filterOnly(onlyFunctions, skipFunctions);
+
+  if (!filteredFunctions.empty()) {
     // Parse, lower case and trim it.
-    auto nameSet = exec::splitNames(onlyFunctions);
+    auto nameSet = exec::splitNames(filteredFunctions);
 
     // Use the generated set to filter the input signatures.
     for (auto it = input.begin(); it != input.end();) {
@@ -1094,8 +1096,8 @@ core::TypedExprPtr ExpressionFuzzer::generateCastExpression(
   markSelected("cast");
 
   // Generate try_cast expression with 50% chance.
-  bool nullOnFailure = vectorFuzzer_->coinToss(0.5);
-  return std::make_shared<core::CastTypedExpr>(returnType, args, nullOnFailure);
+  bool isTryCast = vectorFuzzer_->coinToss(0.5);
+  return std::make_shared<core::CastTypedExpr>(returnType, args, isTryCast);
 }
 
 core::TypedExprPtr ExpressionFuzzer::generateRowConstructorExpression(

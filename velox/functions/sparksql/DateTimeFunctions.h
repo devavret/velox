@@ -580,6 +580,51 @@ struct DateTruncFunction {
   const tz::TimeZone* timeZone_ = nullptr;
 };
 
+/// Truncates a date to a specified time unit. Return NULL if the format is
+/// invalid. Format as abbreviated unit string is allowed.
+template <typename T>
+struct TruncFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void initialize(
+      const std::vector<TypePtr>& /*inputTypes*/,
+      const core::QueryConfig& config,
+      const arg_type<Date>* /*date*/,
+      const arg_type<Varchar>* format) {
+    if (format != nullptr) {
+      unit_ = fromDateTimeUnitString(
+          *format,
+          /*throwIfInvalid=*/false,
+          /*allowMicro=*/false,
+          /*allowAbbreviated=*/true);
+    }
+  }
+
+  FOLLY_ALWAYS_INLINE bool call(
+      out_type<Date>& result,
+      const arg_type<Date>& date,
+      const arg_type<Varchar>& format) {
+    const auto unitOption = unit_.has_value() ? unit_
+                                              : fromDateTimeUnitString(
+                                                    format,
+                                                    /*throwIfInvalid=*/false,
+                                                    /*allowMicro=*/false,
+                                                    /*allowAbbreviated=*/true);
+    // Return NULL if unit is illegal or unit is less than week.
+    if (!unitOption.has_value() || unitOption.value() < DateTimeUnit::kWeek) {
+      return false;
+    }
+    auto dateTime = getDateTime(date);
+    adjustDateTime(dateTime, unitOption.value());
+
+    result = Timestamp::calendarUtcToEpoch(dateTime) / kSecondsInDay;
+    return true;
+  }
+
+ private:
+  std::optional<DateTimeUnit> unit_;
+};
+
 template <typename T>
 struct DateAddFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
@@ -904,6 +949,41 @@ struct MillisToTimestampFunction {
   FOLLY_ALWAYS_INLINE void call(out_type<Timestamp>& result, const T& millis) {
     result = Timestamp::fromMillisNoError(millis);
   }
+};
+
+template <typename T>
+struct TimestampDiffFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void initialize(
+      const std::vector<TypePtr>& /*inputTypes*/,
+      const core::QueryConfig& config,
+      const arg_type<Varchar>* unitString,
+      const arg_type<Timestamp>* /*timestamp1*/,
+      const arg_type<Timestamp>* /*timestamp2*/) {
+    VELOX_USER_CHECK_NOT_NULL(unitString);
+    unit_ = fromDateTimeUnitString(
+        *unitString, /*throwIfInvalid=*/true, /*allowMicro=*/true);
+    sessionTimeZone_ = getTimeZoneFromConfig(config);
+  }
+
+  FOLLY_ALWAYS_INLINE void call(
+      int64_t& result,
+      const arg_type<Varchar>& /*unitString*/,
+      const arg_type<Timestamp>& timestamp1,
+      const arg_type<Timestamp>& timestamp2) {
+    const auto unit = unit_.value();
+    result = diffTimestamp(
+        unit,
+        timestamp1,
+        timestamp2,
+        sessionTimeZone_,
+        /*respectLastDay=*/false);
+  }
+
+ private:
+  const tz::TimeZone* sessionTimeZone_ = nullptr;
+  std::optional<DateTimeUnit> unit_ = std::nullopt;
 };
 
 } // namespace facebook::velox::functions::sparksql

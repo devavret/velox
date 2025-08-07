@@ -13,7 +13,7 @@
 # limitations under the License.
 cmake_minimum_required(VERSION 3.28)
 message(STATUS "Building using CMake version: ${CMAKE_VERSION}")
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_CXX_EXTENSIONS ON) # Big Int is an extension
 message(STATUS "CXX standard: ${CMAKE_CXX_STANDARD}")
@@ -135,7 +135,6 @@ option(VELOX_ENABLE_EXPRESSION "Build expression." ON)
 option(
   VELOX_ENABLE_EXAMPLES
   "Build examples. This will enable VELOX_ENABLE_EXPRESSION automatically." OFF)
-option(VELOX_ENABLE_SUBSTRAIT "Build Substrait-to-Velox converter." OFF)
 option(VELOX_ENABLE_BENCHMARKS "Enable Velox top level benchmarks." OFF)
 option(VELOX_ENABLE_BENCHMARKS_BASIC "Enable Velox basic benchmarks." OFF)
 option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
@@ -144,7 +143,7 @@ option(VELOX_ENABLE_ABFS "Build Abfs Connector" OFF)
 option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" ON)
 option(VELOX_ENABLE_ARROW "Enable Arrow support" OFF)
-option(VELOX_ENABLE_GEO "Enable Geospatial support" ON)
+option(VELOX_ENABLE_GEO "Enable Geospatial support" OFF)
 option(VELOX_ENABLE_REMOTE_FUNCTIONS "Enable remote function support" OFF)
 option(VELOX_ENABLE_CCACHE "Use ccache if installed." ON)
 option(VELOX_ENABLE_COMPRESSION_LZ4 "Enable Lz4 compression support." OFF)
@@ -160,6 +159,7 @@ option(
   OFF)
 option(VELOX_SIMDJSON_SKIPUTF8VALIDATION
        "Skip simdjson utf8 validation in JSON parsing" OFF)
+option(VELOX_ENABLE_FAISS "Build faiss vector search support" OFF)
 
 # Explicitly force compilers to generate colored output. Compilers usually do
 # this by default if they detect the output is a terminal, but this assumption
@@ -181,7 +181,6 @@ if(${VELOX_BUILD_MINIMAL} OR ${VELOX_BUILD_MINIMAL_WITH_DWIO})
   set(VELOX_ENABLE_S3 OFF)
   set(VELOX_ENABLE_GCS OFF)
   set(VELOX_ENABLE_ABFS OFF)
-  set(VELOX_ENABLE_SUBSTRAIT OFF)
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS})
@@ -227,6 +226,14 @@ endif()
 if(${VELOX_ENABLE_DUCKDB})
   velox_set_source(DuckDB)
   velox_resolve_dependency(DuckDB)
+endif()
+
+if(VELOX_ENABLE_FAISS)
+  velox_set_source(faiss)
+  velox_resolve_dependency(faiss)
+  if(NOT TARGET FAISS::faiss)
+    add_library(FAISS::faiss ALIAS faiss)
+  endif()
 endif()
 
 if(DEFINED ENV{INSTALL_PREFIX})
@@ -321,6 +328,20 @@ endif()
 # Required so velox code can be used in a dynamic library
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 
+# For C++20 support we need GNU GCC11 (or later versions) or Clang/AppleClang 15
+# (or later versions) to get support for the used features.
+if(NOT
+   (("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" AND ${CMAKE_CXX_COMPILER_VERSION}
+                                                   VERSION_GREATER_EQUAL 11)
+    OR (("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang"
+         OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+        AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)))
+  message(
+    FATAL_ERROR
+      "Unsupported compiler ${CMAKE_CXX_COMPILER_ID} with version ${CMAKE_CXX_COMPILER_VERSION} found."
+  )
+endif()
+
 execute_process(
   COMMAND
     bash -c
@@ -381,6 +402,11 @@ if(ENABLE_ALL_WARNINGS)
          -Wno-unused-result \
          -Wno-format-overflow \
          -Wno-strict-aliasing")
+    # Avoid compiler bug for GCC 12.2.1
+    # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105329
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL "12.2.1")
+      string(APPEND KNOWN_COMPILER_SPECIFIC_WARNINGS " -Wno-restrict")
+    endif()
   endif()
 
   set(KNOWN_WARNINGS
@@ -501,7 +527,6 @@ if(${VELOX_BUILD_MINIMAL_WITH_DWIO} OR ${VELOX_ENABLE_HIVE_CONNECTOR})
   #
   # TODO: make these optional and pluggable.
   find_package(ZLIB REQUIRED)
-  find_package(lzo2 REQUIRED)
   find_package(zstd REQUIRED)
   find_package(Snappy REQUIRED)
   if(NOT TARGET zstd::zstd)
@@ -526,10 +551,9 @@ if(${VELOX_BUILD_PYTHON_PACKAGE})
   velox_resolve_dependency(pybind11 2.10.0)
 endif()
 
-# DWIO (ORC/DWRF) and Substrait depend on protobuf.
+# DWIO (ORC/DWRF) depends on protobuf.
 if(${VELOX_BUILD_MINIMAL_WITH_DWIO}
    OR ${VELOX_ENABLE_HIVE_CONNECTOR}
-   OR ${VELOX_ENABLE_SUBSTRAIT}
    OR VELOX_ENABLE_GCS)
 
   # Locate or build protobuf.
@@ -574,13 +598,6 @@ endif()
 
 # GCC needs to link a library to enable std::filesystem.
 if("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU")
-
-  # Ensure we have gcc at least 9+.
-  if(CMAKE_CXX_COMPILER_VERSION LESS 9.0)
-    message(
-      FATAL_ERROR "VELOX requires gcc > 9. Found ${CMAKE_CXX_COMPILER_VERSION}")
-  endif()
-
   # Find Threads library
   find_package(Threads REQUIRED)
 endif()

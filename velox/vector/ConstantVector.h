@@ -345,9 +345,9 @@ class ConstantVector final : public SimpleVector<T> {
     }
 
     if (isNull_) {
-      return "null";
+      return std::string(BaseVector::kNullValueString);
     } else {
-      return SimpleVector<T>::valueToString(value());
+      return BaseVector::type()->template valueToString<T>(value());
     }
   }
 

@@ -18,6 +18,7 @@
 #include "velox/expression/EvalCtx.h"
 #include "velox/vector/ConstantVector.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/vector/LazyVector.h"
 
 namespace facebook::velox::exec {
 
@@ -121,7 +122,6 @@ void gatherCopy(
 bool shouldAggregateRuntimeMetric(const std::string& name) {
   static const folly::F14FastSet<std::string> metricNames{
       "dataSourceAddSplitWallNanos",
-      "dataSourceReadWallNanos",
       "dataSourceLazyWallNanos",
       "queuedWallNanos",
       "flushTimes"};

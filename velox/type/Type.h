@@ -32,6 +32,7 @@
 #include <typeindex>
 #include <vector>
 
+#include <velox/common/Enums.h>
 #include "velox/common/base/ClassName.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/serialization/Serializable.h"
@@ -87,14 +88,22 @@ enum class TypeKind : int8_t {
   INVALID = 36
 };
 
-/// Returns the typekind represented by the `name`. Throws if no match found.
-TypeKind mapNameToTypeKind(const std::string& name);
+VELOX_DECLARE_ENUM_NAME(TypeKind);
 
-/// Returns the typekind represented by the `name` and std::nullopt if no
-/// match found.
-std::optional<TypeKind> tryMapNameToTypeKind(const std::string& name);
+/// Deprecated.
+inline TypeKind mapNameToTypeKind(const std::string& name) {
+  return TypeKindName::toTypeKind(name);
+}
 
-std::string mapTypeKindToName(const TypeKind& typeKind);
+[[deprecated("Use TypeKindName::tryToTypeKind")]]
+inline std::optional<TypeKind> tryMapNameToTypeKind(const std::string& name) {
+  return TypeKindName::tryToTypeKind(name);
+}
+
+/// Deprecated.
+inline std::string mapTypeKindToName(const TypeKind& typeKind) {
+  return std::string(TypeKindName::toName(typeKind));
+}
 
 std::ostream& operator<<(std::ostream& os, const TypeKind& kind);
 
@@ -425,7 +434,7 @@ struct TypeParameter {
       : kind{TypeParameterKind::kType},
         type{std::move(_type)},
         longLiteral{std::nullopt},
-        rowFieldName(_rowFieldName) {}
+        rowFieldName(std::move(_rowFieldName)) {}
 
   /// Creates kLongLiteral parameter.
   explicit TypeParameter(int64_t _longLiteral)
@@ -449,7 +458,7 @@ struct TypeParameter {
 ///                   BigintType
 class Type : public Tree<const TypePtr>, public velox::ISerializable {
  public:
-  explicit Type(TypeKind kind, bool providesCustomComparison = false)
+  constexpr explicit Type(TypeKind kind, bool providesCustomComparison = false)
       : kind_{kind}, providesCustomComparison_(providesCustomComparison) {}
 
   TypeKind kind() const {
@@ -538,7 +547,7 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
 
   virtual bool isFixedWidth() const = 0;
 
-  static std::shared_ptr<const Type> create(const folly::dynamic& obj);
+  static TypePtr create(const folly::dynamic& obj);
 
   static void registerSerDe();
 
@@ -546,7 +555,7 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
   virtual size_t hashKind() const;
 
   /// Recursive kind match (uses only TypeKind).
-  bool kindEquals(const std::shared_ptr<const Type>& other) const;
+  bool kindEquals(const TypePtr& other) const;
 
   template <TypeKind KIND, typename... CHILDREN>
   static std::shared_ptr<const typename TypeTraits<KIND>::ImplType> create(
@@ -584,6 +593,9 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
   bool isDate() const;
 
   bool containsUnknown() const;
+
+  template <typename T>
+  std::string valueToString(T value) const;
 
   VELOX_DEFINE_CLASS_NAME(Type)
 
@@ -625,7 +637,9 @@ class TypeBase : public Type {
  public:
   using NativeType = typename TypeTraits<KIND>::NativeType;
 
-  explicit TypeBase(bool providesCustomComparison = false)
+  constexpr explicit TypeBase() : Type{KIND, false} {}
+
+  explicit TypeBase(bool providesCustomComparison)
       : Type{KIND, providesCustomComparison} {
     if (providesCustomComparison) {
       VELOX_CHECK(
@@ -667,7 +681,9 @@ class TypeBase : public Type {
 template <TypeKind KIND>
 class CanProvideCustomComparisonType : public TypeBase<KIND> {
  public:
-  explicit CanProvideCustomComparisonType(bool providesCustomComparison = false)
+  constexpr explicit CanProvideCustomComparisonType() = default;
+
+  explicit CanProvideCustomComparisonType(bool providesCustomComparison)
       : TypeBase<KIND>{providesCustomComparison} {}
 
   virtual int32_t compare(
@@ -691,14 +707,16 @@ class CanProvideCustomComparisonType : public TypeBase<KIND> {
 template <TypeKind KIND>
 class ScalarType : public CanProvideCustomComparisonType<KIND> {
  public:
-  explicit ScalarType(bool providesCustomComparison = false)
+  constexpr explicit ScalarType() = default;
+
+  explicit ScalarType(bool providesCustomComparison)
       : CanProvideCustomComparisonType<KIND>{providesCustomComparison} {}
 
   uint32_t size() const override {
     return 0;
   }
 
-  const std::shared_ptr<const Type>& childAt(uint32_t) const override {
+  const TypePtr& childAt(uint32_t) const override {
     VELOX_FAIL("scalar type has no children");
   }
 
@@ -722,7 +740,10 @@ class ScalarType : public CanProvideCustomComparisonType<KIND> {
     return Type::cppSizeInBytes();
   }
 
-  FOLLY_NOINLINE static const std::shared_ptr<const ScalarType<KIND>> create();
+  FOLLY_NOINLINE static std::shared_ptr<const ScalarType<KIND>> create() {
+    static constexpr ScalarType<KIND> kInstance;
+    return {std::shared_ptr<const ScalarType<KIND>>{}, &kInstance};
+  }
 
   bool equivalent(const Type& other) const override {
     return Type::hasSameTypeId(other);
@@ -736,12 +757,6 @@ class ScalarType : public CanProvideCustomComparisonType<KIND> {
     return obj;
   }
 };
-
-template <TypeKind KIND>
-const std::shared_ptr<const ScalarType<KIND>> ScalarType<KIND>::create() {
-  static const auto instance = std::make_shared<const ScalarType<KIND>>();
-  return instance;
-}
 
 /// This class represents the fixed-point numbers.
 /// The parameter "precision" represents the number of digits the
@@ -825,6 +840,8 @@ class LongDecimalType : public DecimalType<TypeKind::HUGEINT> {
  public:
   LongDecimalType(int precision, int scale)
       : DecimalType<TypeKind::HUGEINT>(precision, scale) {}
+
+  static std::string toString(int128_t value, const Type& type);
 };
 
 TypePtr DECIMAL(uint8_t precision, uint8_t scale);
@@ -857,7 +874,9 @@ std::pair<uint8_t, uint8_t> getDecimalPrecisionScale(const Type& type);
 
 class UnknownType : public CanProvideCustomComparisonType<TypeKind::UNKNOWN> {
  public:
-  explicit UnknownType(bool proivdesCustomComparison = false)
+  constexpr explicit UnknownType() = default;
+
+  explicit UnknownType(bool proivdesCustomComparison)
       : CanProvideCustomComparisonType<TypeKind::UNKNOWN>(
             proivdesCustomComparison) {}
 
@@ -865,7 +884,7 @@ class UnknownType : public CanProvideCustomComparisonType<TypeKind::UNKNOWN> {
     return 0;
   }
 
-  const std::shared_ptr<const Type>& childAt(uint32_t) const override {
+  const TypePtr& childAt(uint32_t) const override {
     throw std::invalid_argument{"UnknownType type has no children"};
   }
 
@@ -930,7 +949,7 @@ class ArrayType : public TypeBase<TypeKind::ARRAY> {
     return child_->isComparable();
   }
 
-  const std::shared_ptr<const Type>& childAt(uint32_t idx) const override;
+  const TypePtr& childAt(uint32_t idx) const override;
 
   const char* nameOf(uint32_t idx) const {
     VELOX_USER_CHECK_EQ(idx, 0, "Array type should have only one child");
@@ -950,9 +969,11 @@ class ArrayType : public TypeBase<TypeKind::ARRAY> {
  protected:
   bool equals(const Type& other) const override;
 
-  TypePtr child_;
+  const TypePtr child_;
   const std::vector<TypeParameter> parameters_;
 };
+
+using ArrayTypePtr = std::shared_ptr<const ArrayType>;
 
 class MapType : public TypeBase<TypeKind::MAP> {
  public:
@@ -1010,11 +1031,14 @@ class MapType : public TypeBase<TypeKind::MAP> {
   const std::vector<TypeParameter> parameters_;
 };
 
+using MapTypePtr = std::shared_ptr<const MapType>;
+
 class RowType : public TypeBase<TypeKind::ROW> {
  public:
-  RowType(
-      std::vector<std::string>&& names,
-      std::vector<std::shared_ptr<const Type>>&& types);
+  /// @param names Child names. Case sensitive. Can be empty. May contain
+  /// duplicates.
+  /// @param types List of child types aligned with 'names'.
+  RowType(std::vector<std::string>&& names, std::vector<TypePtr>&& types);
 
   ~RowType() override;
 
@@ -1027,27 +1051,38 @@ class RowType : public TypeBase<TypeKind::ROW> {
     return children_[idx];
   }
 
-  const std::vector<std::shared_ptr<const Type>>& children() const {
+  const std::vector<TypePtr>& children() const {
     return children_;
   }
 
+  /// Returns true if all child types are orderable.
   bool isOrderable() const override;
 
+  /// Returns true if all child types are comparable.
   bool isComparable() const override;
 
-  const std::shared_ptr<const Type>& findChild(folly::StringPiece name) const;
+  /// Returns type of the first child with matching name. Throws if child with
+  /// this name doesn't exist.
+  const TypePtr& findChild(folly::StringPiece name) const;
 
+  /// Returns true if child with specified name exists.
   bool containsChild(std::string_view name) const;
 
+  /// Returns zero-based index of the first child with matching name. Throws if
+  /// child with this name doesn't exist.
   uint32_t getChildIdx(std::string_view name) const;
 
+  /// Returns an optional zero-based index of the first child with matching
+  /// name. Return std::nullopt if child with this name doesn't exist.
   std::optional<uint32_t> getChildIdxIfExists(std::string_view name) const;
 
+  /// Returns the name of the child at specified index.
   const std::string& nameOf(uint32_t idx) const {
     VELOX_CHECK_LT(idx, names_.size());
     return names_[idx];
   }
 
+  /// Returns true if the 'other' type is the same except for child names.
   bool equivalent(const Type& other) const override;
 
   std::string toString() const override;
@@ -1056,8 +1091,10 @@ class RowType : public TypeBase<TypeKind::ROW> {
   void printChildren(std::stringstream& ss, std::string_view delimiter = ",")
       const;
 
-  std::shared_ptr<RowType> unionWith(
-      std::shared_ptr<const RowType> rowType) const;
+  /// Concatenates child names and types of 'this' with 'other'.
+  /// {a, b, c}->unionWith({d, e, f}) => {a, b, c, d, e, f}.
+  std::shared_ptr<const RowType> unionWith(
+      const std::shared_ptr<const RowType>& other) const;
 
   folly::dynamic serialize() const override;
 
@@ -1087,7 +1124,7 @@ class RowType : public TypeBase<TypeKind::ROW> {
   std::unique_ptr<std::vector<TypeParameter>> makeParameters() const;
 
   const std::vector<std::string> names_;
-  const std::vector<std::shared_ptr<const Type>> children_;
+  const std::vector<TypePtr> children_;
   mutable std::atomic<std::vector<TypeParameter>*> parameters_{nullptr};
   mutable std::atomic_bool hashKindComputed_{false};
   mutable std::atomic_size_t hashKind_;
@@ -1103,20 +1140,18 @@ inline RowTypePtr asRowType(const TypePtr& type) {
 /// followed by the return value type.
 class FunctionType : public TypeBase<TypeKind::FUNCTION> {
  public:
-  FunctionType(
-      std::vector<std::shared_ptr<const Type>>&& argumentTypes,
-      std::shared_ptr<const Type> returnType);
+  FunctionType(std::vector<TypePtr>&& argumentTypes, TypePtr returnType);
 
   uint32_t size() const override {
     return children_.size();
   }
 
-  const std::shared_ptr<const Type>& childAt(uint32_t idx) const override {
+  const TypePtr& childAt(uint32_t idx) const override {
     VELOX_CHECK_LT(idx, children_.size());
     return children_[idx];
   }
 
-  const std::vector<std::shared_ptr<const Type>>& children() const {
+  const std::vector<TypePtr>& children() const {
     return children_;
   }
 
@@ -1142,15 +1177,15 @@ class FunctionType : public TypeBase<TypeKind::FUNCTION> {
   bool equals(const Type& other) const override;
 
  private:
-  static std::vector<std::shared_ptr<const Type>> allChildren(
-      std::vector<std::shared_ptr<const Type>>&& argumentTypes,
-      std::shared_ptr<const Type> returnType) {
+  static std::vector<TypePtr> allChildren(
+      std::vector<TypePtr>&& argumentTypes,
+      TypePtr returnType) {
     auto children = std::move(argumentTypes);
     children.push_back(returnType);
     return children;
   }
   // Argument types from left to right followed by return value type.
-  const std::vector<std::shared_ptr<const Type>> children_;
+  const std::vector<TypePtr> children_;
   const std::vector<TypeParameter> parameters_;
 };
 
@@ -1167,7 +1202,7 @@ class OpaqueType : public TypeBase<TypeKind::OPAQUE> {
     return 0;
   }
 
-  const std::shared_ptr<const Type>& childAt(uint32_t) const override {
+  const TypePtr& childAt(uint32_t) const override {
     VELOX_FAIL("OpaqueType type has no children");
   }
 
@@ -1180,6 +1215,7 @@ class OpaqueType : public TypeBase<TypeKind::OPAQUE> {
   }
 
   folly::dynamic serialize() const override;
+
   /// In special cases specific OpaqueTypes might want to serialize additional
   /// metadata. In those cases we need to deserialize it back. Since
   /// OpaqueType::create<T>() returns canonical type for T without metadata,
@@ -1200,9 +1236,8 @@ class OpaqueType : public TypeBase<TypeKind::OPAQUE> {
   FOLLY_NOINLINE static std::shared_ptr<const OpaqueType> create() {
     /// static vars in templates are dangerous across DSOs, but it's just a
     /// performance optimization. Comparison looks at type_index anyway.
-    static const auto instance =
-        std::make_shared<const OpaqueType>(std::type_index(typeid(Class)));
-    return instance;
+    static const OpaqueType kInstance{std::type_index(typeid(Class))};
+    return {std::shared_ptr<const OpaqueType>{}, &kInstance};
   }
 
   /// This function currently doesn't do synchronization neither with reads
@@ -1455,48 +1490,46 @@ struct TypeFactory {
 
 template <>
 struct TypeFactory<TypeKind::UNKNOWN> {
-  static std::shared_ptr<const UnknownType> create() {
-    return std::make_shared<UnknownType>();
+  FOLLY_NOINLINE static std::shared_ptr<const UnknownType> create() {
+    static const UnknownType kInstance;
+    return {std::shared_ptr<const UnknownType>{}, &kInstance};
   }
 };
 
 template <>
 struct TypeFactory<TypeKind::ARRAY> {
-  static std::shared_ptr<const ArrayType> create(TypePtr elementType) {
-    return std::make_shared<ArrayType>(std::move(elementType));
+  static ArrayTypePtr create(TypePtr elementType) {
+    return std::make_shared<const ArrayType>(std::move(elementType));
   }
 };
 
 template <>
 struct TypeFactory<TypeKind::MAP> {
-  static std::shared_ptr<const MapType> create(
-      TypePtr keyType,
-      TypePtr valType) {
-    return std::make_shared<MapType>(std::move(keyType), std::move(valType));
+  static MapTypePtr create(TypePtr keyType, TypePtr valType) {
+    return std::make_shared<const MapType>(
+        std::move(keyType), std::move(valType));
   }
 };
 
 template <>
 struct TypeFactory<TypeKind::ROW> {
-  static std::shared_ptr<const RowType> create(
+  static RowTypePtr create(
       std::vector<std::string>&& names,
       std::vector<TypePtr>&& types) {
     return std::make_shared<const RowType>(std::move(names), std::move(types));
   }
 };
 
-std::shared_ptr<const ArrayType> ARRAY(TypePtr elementType);
+ArrayTypePtr ARRAY(TypePtr elementType);
 
-std::shared_ptr<const RowType> ROW(
-    std::vector<std::string>&& names,
-    std::vector<TypePtr>&& types);
+RowTypePtr ROW(std::vector<std::string> names, std::vector<TypePtr> types);
 
-std::shared_ptr<const RowType> ROW(
+RowTypePtr ROW(
     std::initializer_list<std::pair<const std::string, TypePtr>>&& pairs);
 
-std::shared_ptr<const RowType> ROW(std::vector<TypePtr>&& pairs);
+RowTypePtr ROW(std::vector<TypePtr>&& types);
 
-std::shared_ptr<const MapType> MAP(TypePtr keyType, TypePtr valType);
+MapTypePtr MAP(TypePtr keyType, TypePtr valType);
 
 std::shared_ptr<const FunctionType> FUNCTION(
     std::vector<TypePtr>&& argumentTypes,
@@ -1879,15 +1912,13 @@ VELOX_SCALAR_ACCESSOR(VARBINARY);
 TypePtr UNKNOWN();
 
 template <TypeKind KIND>
-std::shared_ptr<const Type> createScalarType() {
+TypePtr createScalarType() {
   return ScalarType<KIND>::create();
 }
 
-std::shared_ptr<const Type> createScalarType(TypeKind kind);
+TypePtr createScalarType(TypeKind kind);
 
-std::shared_ptr<const Type> createType(
-    TypeKind kind,
-    std::vector<std::shared_ptr<const Type>>&& children);
+TypePtr createType(TypeKind kind, std::vector<TypePtr>&& children);
 
 /// Returns true built-in or custom type with specified name exists.
 bool hasType(const std::string& name);
@@ -1899,8 +1930,7 @@ TypePtr getType(
     const std::vector<TypeParameter>& parameters);
 
 template <TypeKind KIND>
-std::shared_ptr<const Type> createType(
-    std::vector<std::shared_ptr<const Type>>&& children) {
+TypePtr createType(std::vector<TypePtr>&& children) {
   if (children.size() != 0) {
     throw std::invalid_argument{
         std::string(TypeTraits<KIND>::name) +
@@ -1911,20 +1941,16 @@ std::shared_ptr<const Type> createType(
 }
 
 template <>
-std::shared_ptr<const Type> createType<TypeKind::ROW>(
-    std::vector<std::shared_ptr<const Type>>&& children);
+TypePtr createType<TypeKind::ROW>(std::vector<TypePtr>&& children);
 
 template <>
-std::shared_ptr<const Type> createType<TypeKind::ARRAY>(
-    std::vector<std::shared_ptr<const Type>>&& children);
+TypePtr createType<TypeKind::ARRAY>(std::vector<TypePtr>&& children);
 
 template <>
-std::shared_ptr<const Type> createType<TypeKind::MAP>(
-    std::vector<std::shared_ptr<const Type>>&& children);
+TypePtr createType<TypeKind::MAP>(std::vector<TypePtr>&& children);
 
 template <>
-std::shared_ptr<const Type> createType<TypeKind::OPAQUE>(
-    std::vector<std::shared_ptr<const Type>>&& children);
+TypePtr createType<TypeKind::OPAQUE>(std::vector<TypePtr>&& children);
 
 #undef VELOX_SCALAR_ACCESSOR
 
@@ -1979,7 +2005,7 @@ static inline T to(const U& value) {
 }
 
 template <>
-inline Timestamp to(const std::string& value) {
+inline Timestamp to(const std::string&) {
   return Timestamp(0, 0);
 }
 
@@ -2004,7 +2030,7 @@ inline std::string to(const velox::StringView& value) {
 }
 
 template <>
-inline std::string to(const ComplexType& value) {
+inline std::string to(const ComplexType&) {
   return std::string("ComplexType");
 }
 
@@ -2022,8 +2048,12 @@ using CastOperatorPtr = std::shared_ptr<const CastOperator>;
 } // namespace exec
 
 /// Forward declaration.
-class variant;
+class Variant;
 class AbstractInputGenerator;
+
+namespace memory {
+class MemoryPool;
+} // namespace memory
 
 using AbstractInputGeneratorPtr = std::shared_ptr<AbstractInputGenerator>;
 using FuzzerGenerator = folly::detail::DefaultGenerator;
@@ -2032,13 +2062,15 @@ struct InputGeneratorConfig {
   // TODO: hook up the rest options in VectorFuzzer::Options.
   size_t seed_;
   double nullRatio_;
+  memory::MemoryPool* pool_;
+  TypePtr type_{nullptr}; // Added type to support
 };
 
 /// Associates custom types with their custom operators to be the payload in
 /// the custom type registry.
-class CustomTypeFactories {
+class CustomTypeFactory {
  public:
-  virtual ~CustomTypeFactories();
+  virtual ~CustomTypeFactory();
 
   /// Returns a shared pointer to the custom type.
   virtual TypePtr getType(
@@ -2067,7 +2099,7 @@ class AbstractInputGenerator {
 
   virtual ~AbstractInputGenerator();
 
-  virtual variant generate() = 0;
+  virtual Variant generate() = 0;
 
   TypePtr type() const {
     return type_;
@@ -2088,7 +2120,7 @@ class AbstractInputGenerator {
 /// false if type with the specified name already exists.
 bool registerCustomType(
     const std::string& name,
-    std::unique_ptr<const CustomTypeFactories> factories);
+    std::unique_ptr<const CustomTypeFactory> factories);
 
 // See registerOpaqueType() for documentation on type index and opaque type
 // alias.
@@ -2253,6 +2285,42 @@ class DeserializedTypeCache {
 };
 
 DeserializedTypeCache& deserializedTypeCache();
+
+template <typename T>
+std::string Type::valueToString(T value) const {
+  if constexpr (std::is_same_v<T, bool>) {
+    return value ? "true" : "false";
+  } else if constexpr (std::is_same_v<T, std::shared_ptr<void>>) {
+    return "<opaque>";
+  } else if constexpr (
+      std::is_same_v<T, int64_t> || std::is_same_v<T, int128_t>) {
+    if (isDecimal()) {
+      return LongDecimalType::toString(value, *this);
+    } else {
+      return velox::to<std::string>(value);
+    }
+  } else if constexpr (std::is_same_v<T, int32_t>) {
+    if (isDate()) {
+      return DATE()->toString(value);
+    } else {
+      return velox::to<std::string>(value);
+    }
+  } else {
+    return velox::to<std::string>(value);
+  }
+}
+
+/// Return a string representation of a limited number of elements at the
+/// start of the array or map.
+///
+/// @param size Total number of elements.
+/// @param stringifyElement Function to call to append individual elements.
+/// Will be called up to 'limit' times.
+/// @param limit Maximum number of elements to include in the result.
+std::string stringifyTruncatedElementList(
+    size_t size,
+    const std::function<void(std::stringstream&, size_t)>& stringifyElement,
+    size_t limit = 5);
 
 } // namespace facebook::velox
 

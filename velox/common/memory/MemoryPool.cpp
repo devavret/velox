@@ -227,7 +227,6 @@ MemoryPool::MemoryPool(
       trackUsage_(options.trackUsage),
       threadSafe_(options.threadSafe),
       debugOptions_(options.debugOptions),
-      poolPriority_(options.poolPriority),
       coreOnAllocationFailureEnabled_(options.coreOnAllocationFailureEnabled),
       getPreferredSize_(
           options.getPreferredSize == nullptr
@@ -385,7 +384,7 @@ void MemoryPool::dropChild(const MemoryPool* child) {
       1,
       "Child memory pool {} doesn't exist in {}",
       child->name(),
-      toString());
+      name());
 }
 
 bool MemoryPool::aborted() const {

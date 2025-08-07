@@ -61,12 +61,21 @@ class TDigestType : public VarbinaryType {
     return obj;
   }
 
+  bool isOrderable() const override {
+    return false;
+  }
+
  private:
   explicit TDigestType(const TypePtr& dataType)
       : parameters_({TypeParameter(dataType)}) {}
 
   const std::vector<TypeParameter> parameters_;
 };
+
+inline bool isTDigestType(const TypePtr& type) {
+  // Pointer comparison works since this type is a singleton.
+  return TDigestType::get(DOUBLE()) == type;
+}
 
 inline std::shared_ptr<const TDigestType> TDIGEST(const TypePtr& dataType) {
   return TDigestType::get(dataType);

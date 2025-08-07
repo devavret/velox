@@ -73,6 +73,10 @@ class QDigestType : public VarbinaryType {
     return obj;
   }
 
+  bool isOrderable() const override {
+    return false;
+  }
+
  private:
   explicit QDigestType(const TypePtr& dataType)
       : parameters_({TypeParameter(dataType)}) {}
@@ -82,6 +86,11 @@ class QDigestType : public VarbinaryType {
 
 inline std::shared_ptr<const QDigestType> QDIGEST(const TypePtr& dataType) {
   return QDigestType::get(dataType);
+}
+
+inline bool isQDigestType(const TypePtr& type) {
+  return QDigestType::get(DOUBLE()) == type ||
+      QDigestType::get(REAL()) == type || QDigestType::get(BIGINT()) == type;
 }
 
 // Type to use for inputs and outputs of simple functions, e.g.

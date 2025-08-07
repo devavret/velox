@@ -31,7 +31,9 @@
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
+#include "velox/exec/TaskTraceWriter.h"
 #include "velox/exec/TraceUtil.h"
 
 using facebook::velox::common::testutil::TestValue;
@@ -55,7 +57,7 @@ class EventCompletionNotifier {
       std::vector<ContinuePromise> promises,
       std::function<void()> callback = nullptr) {
     active_ = true;
-    callback_ = callback;
+    callback_ = std::move(callback);
     promises_ = std::move(promises);
   }
 
@@ -185,6 +187,7 @@ void movePromisesOut(
   }
   from.clear();
 }
+
 } // namespace
 
 std::string executionModeString(Task::ExecutionMode mode) {
@@ -338,9 +341,8 @@ Task::Task(
       memoryArbitrationPriority_(memoryArbitrationPriority),
       queryCtx_(std::move(queryCtx)),
       planFragment_(std::move(planFragment)),
-      supportBarrier_(
-          (mode_ == Task::ExecutionMode::kSerial) &&
-          planFragment_.supportsBarrier()),
+      firstNodeNotSupportingBarrier_(
+          planFragment_.firstNodeNotSupportingBarrier()),
       traceConfig_(maybeMakeTraceConfig()),
       consumerSupplier_(std::move(consumerSupplier)),
       onError_(std::move(onError)),
@@ -361,7 +363,10 @@ Task::Task(
 void Task::initSplitListeners() {
   splitListenerFactories().withRLock([&](const auto& factories) {
     for (const auto& factory : factories) {
-      splitListeners_.emplace_back(factory->create(taskId_, uuid_));
+      auto listener = factory->create(taskId_, uuid_, queryCtx_->queryConfig());
+      if (listener != nullptr) {
+        splitListeners_.emplace_back(std::move(listener));
+      }
     }
   });
 }
@@ -415,6 +420,19 @@ Task::~Task() {
   for (auto& promise : taskDeletionPromises) {
     promise.setValue();
   }
+}
+
+void Task::ensureBarrierSupport() const {
+  VELOX_CHECK_EQ(
+      mode_,
+      Task::ExecutionMode::kSerial,
+      "Task doesn't support barriered execution.");
+
+  VELOX_CHECK_NULL(
+      firstNodeNotSupportingBarrier_,
+      "Task doesn't support barriered execution. Name of the first node that "
+      "doesn't support barriered execution: {}",
+      firstNodeNotSupportingBarrier_->name());
 }
 
 Task::TaskList& Task::taskList() {
@@ -1241,6 +1259,7 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
     // execution, from the split group id.
     const uint32_t driverIdOffset =
         factory->numDrivers * (groupedExecutionDrivers ? splitGroupId : 0);
+    auto filters = std::make_shared<PipelinePushdownFilters>();
     for (uint32_t partitionId = 0; partitionId < factory->numDrivers;
          ++partitionId) {
       drivers.emplace_back(factory->createDriver(
@@ -1251,6 +1270,7 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
               splitGroupId,
               partitionId),
           getExchangeClientLocked(pipeline),
+          filters,
           [self](size_t i) {
             return i < self->driverFactories_.size()
                 ? self->driverFactories_[i]->numTotalDrivers
@@ -1500,7 +1520,7 @@ std::unique_ptr<ContinuePromise> Task::addSplitLocked(
     SplitsState& splitsState,
     const exec::Split& split) {
   if (split.isBarrier()) {
-    VELOX_CHECK(supportBarrier_);
+    ensureBarrierSupport();
     VELOX_CHECK(splitsState.sourceIsTableScan);
     VELOX_CHECK(!splitsState.noMoreSplits);
     return addSplitToStoreLocked(
@@ -1641,12 +1661,12 @@ void Task::noMoreSplits(const core::PlanNodeId& planNodeId) {
 }
 
 ContinueFuture Task::requestBarrier() {
-  VELOX_CHECK(supportBarrier_, "Task doesn't support barrier");
+  ensureBarrierSupport();
   return startBarrier("Task::requestBarrier");
 }
 
 ContinueFuture Task::startBarrier(std::string_view comment) {
-  VELOX_CHECK(supportBarrier_);
+  ensureBarrierSupport();
   std::vector<std::unique_ptr<ContinuePromise>> promises;
   SCOPE_EXIT {
     for (auto& promise : promises) {
@@ -1742,6 +1762,7 @@ namespace {
 bool isTableScan(const Operator* op) {
   return dynamic_cast<const TableScan*>(op) != nullptr;
 }
+
 } // namespace
 
 void Task::dropInput(Operator* op) {
@@ -3407,40 +3428,23 @@ std::optional<TraceConfig> Task::maybeMakeTraceConfig() const {
     return std::nullopt;
   }
 
-  const auto traceNodes = queryConfig.queryTraceNodeIds();
-  VELOX_USER_CHECK(!traceNodes.empty(), "Query trace nodes are not set");
+  const auto traceNodeId = queryConfig.queryTraceNodeId();
+  VELOX_USER_CHECK(!traceNodeId.empty(), "Query trace node ID are not set");
 
   const auto traceDir = trace::getTaskTraceDirectory(
       queryConfig.queryTraceDir(), queryCtx_->queryId(), taskId_);
 
-  std::vector<std::string> traceNodeIds;
-  folly::split(',', traceNodes, traceNodeIds);
-  std::unordered_set<std::string> traceNodeIdSet(
-      traceNodeIds.begin(), traceNodeIds.end());
-  VELOX_USER_CHECK_EQ(
-      traceNodeIdSet.size(),
-      traceNodeIds.size(),
-      "Duplicate trace nodes found: {}",
-      folly::join(", ", traceNodeIds));
+  VELOX_USER_CHECK_NOT_NULL(
+      core::PlanNode::findFirstNode(
+          planFragment_.planNode.get(),
+          [traceNodeId](const core::PlanNode* node) -> bool {
+            return node->id() == traceNodeId;
+          }),
+      "Trace plan node ID = {} not found from task {}",
+      traceNodeId,
+      taskId_);
 
-  bool foundTraceNode{false};
-  for (const auto& traceNodeId : traceNodeIds) {
-    if (core::PlanNode::findFirstNode(
-            planFragment_.planNode.get(),
-            [traceNodeId](const core::PlanNode* node) -> bool {
-              return node->id() == traceNodeId;
-            })) {
-      foundTraceNode = true;
-      break;
-    }
-  }
-  VELOX_USER_CHECK(
-      foundTraceNode,
-      "Trace plan nodes not found from task {}: {}",
-      taskId_,
-      folly::join(",", traceNodeIdSet));
-
-  LOG(INFO) << "Trace input for plan nodes " << traceNodes << " from task "
+  LOG(INFO) << "Trace input for plan nodes " << traceNodeId << " from task "
             << taskId_;
 
   UpdateAndCheckTraceLimitCB updateAndCheckTraceLimitCB =
@@ -3448,10 +3452,11 @@ std::optional<TraceConfig> Task::maybeMakeTraceConfig() const {
         queryCtx_->updateTracedBytesAndCheckLimit(bytes);
       };
   return TraceConfig(
-      std::move(traceNodeIdSet),
+      traceNodeId,
       traceDir,
       std::move(updateAndCheckTraceLimitCB),
-      queryConfig.queryTraceTaskRegExp());
+      queryConfig.queryTraceTaskRegExp(),
+      queryConfig.queryTraceDryRun());
 }
 
 void Task::maybeInitTrace() {
@@ -3462,7 +3467,9 @@ void Task::maybeInitTrace() {
   trace::createTraceDirectory(traceConfig_->queryTraceDir);
   const auto metadataWriter = std::make_unique<trace::TaskTraceMetadataWriter>(
       traceConfig_->queryTraceDir, memory::traceMemoryPool());
-  metadataWriter->write(queryCtx_, planFragment_.planNode);
+  auto traceNode =
+      trace::getTraceNode(planFragment_.planNode, traceConfig_->queryNodeId);
+  metadataWriter->write(queryCtx_, traceNode);
 }
 
 void Task::testingVisitDrivers(const std::function<void(Driver*)>& callback) {

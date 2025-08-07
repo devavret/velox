@@ -35,6 +35,7 @@
 #include "velox/exec/NestedLoopJoinProbe.h"
 #include "velox/exec/OperatorTraceScan.h"
 #include "velox/exec/OrderBy.h"
+#include "velox/exec/ParallelProject.h"
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
 #include "velox/exec/RowNumber.h"
@@ -160,7 +161,7 @@ OperatorSupplier makeOperatorSupplier(
         VELOX_UNSUPPORTED(
             "Hash join currently does not support mixed grouped execution for join "
             "type {}",
-            core::joinTypeName(join->joinType()));
+            core::JoinTypeName::toName(join->joinType()));
       }
       return std::make_unique<HashBuild>(operatorId, ctx, join);
     };
@@ -204,10 +205,11 @@ void plan(
     OperatorSupplier operatorSupplier,
     std::vector<std::unique_ptr<DriverFactory>>* driverFactories) {
   if (!currentPlanNodes) {
-    driverFactories->push_back(std::make_unique<DriverFactory>());
-    currentPlanNodes = &driverFactories->back()->planNodes;
-    driverFactories->back()->operatorSupplier = std::move(operatorSupplier);
-    driverFactories->back()->consumerNode = consumerNode;
+    auto driverFactory = std::make_unique<DriverFactory>();
+    currentPlanNodes = &driverFactory->planNodes;
+    driverFactory->operatorSupplier = std::move(operatorSupplier);
+    driverFactory->consumerNode = consumerNode;
+    driverFactories->push_back(std::move(driverFactory));
   }
 
   const auto& sources = planNode->sources();
@@ -351,7 +353,7 @@ void LocalPlanner::plan(
       planFragment.planNode,
       nullptr,
       nullptr,
-      detail::makeOperatorSupplier(consumerSupplier),
+      detail::makeOperatorSupplier(std::move(consumerSupplier)),
       driverFactories);
 
   (*driverFactories)[0]->outputDriver = true;
@@ -401,14 +403,14 @@ void LocalPlanner::determineGroupedExecutionPipelines(
       size_t numGroupedExecutionSources{0};
       for (const auto& sourceNode : localPartitionNode->sources()) {
         for (auto& anotherFactory : driverFactories) {
-          if (sourceNode == anotherFactory->planNodes.back() and
+          if (sourceNode == anotherFactory->planNodes.back() &&
               anotherFactory->groupedExecution) {
             ++numGroupedExecutionSources;
             break;
           }
         }
       }
-      if (numGroupedExecutionSources > 0 and
+      if (numGroupedExecutionSources > 0 &&
           numGroupedExecutionSources == localPartitionNode->sources().size()) {
         factory->groupedExecution = true;
       }
@@ -464,6 +466,7 @@ void LocalPlanner::markMixedJoinBridges(
 std::shared_ptr<Driver> DriverFactory::createDriver(
     std::unique_ptr<DriverCtx> ctx,
     std::shared_ptr<ExchangeClient> exchangeClient,
+    std::shared_ptr<PipelinePushdownFilters> filters,
     std::function<int(int pipelineId)> numDrivers) {
   auto driver = std::shared_ptr<Driver>(new Driver());
   ctx->driver = driver.get();
@@ -494,6 +497,12 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
             std::dynamic_pointer_cast<const core::ProjectNode>(planNode)) {
       operators.push_back(
           std::make_unique<FilterProject>(id, ctx.get(), nullptr, projectNode));
+    } else if (
+        auto projectNode =
+            std::dynamic_pointer_cast<const core::ParallelProjectNode>(
+                planNode)) {
+      operators.push_back(
+          std::make_unique<ParallelProject>(id, ctx.get(), projectNode));
     } else if (
         auto valuesNode =
             std::dynamic_pointer_cast<const core::ValuesNode>(planNode)) {
@@ -672,6 +681,11 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     operators.push_back(operatorSupplier(operators.size(), ctx.get()));
   }
 
+  if (filters->empty()) {
+    filters->resize(operators.size());
+  } else {
+    VELOX_CHECK_EQ(filters->size(), operators.size());
+  }
   driver->init(std::move(ctx), std::move(operators));
   for (auto& adapter : adapters) {
     if (adapter.adapt(*this, *driver)) {
@@ -679,6 +693,7 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     }
   }
   driver->isAdaptable_ = false;
+  driver->pushdownFilters_ = std::move(filters);
   return driver;
 }
 

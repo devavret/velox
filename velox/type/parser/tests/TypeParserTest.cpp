@@ -42,9 +42,9 @@ static const TypePtr& TIMESTAMP_WITH_TIME_ZONE() {
   return instance;
 }
 
-class TypeFactories : public CustomTypeFactories {
+class TypeFactory : public CustomTypeFactory {
  public:
-  TypeFactories(const TypePtr& type) : type_(type) {}
+  TypeFactory(const TypePtr& type) : type_(type) {}
 
   TypePtr getType(
       const std::vector<TypeParameter>& /*parameters*/) const override {
@@ -68,10 +68,10 @@ class TypeParserTest : public ::testing::Test {
  private:
   void SetUp() override {
     // Register custom types with and without spaces.
-    registerCustomType("json", std::make_unique<const TypeFactories>(JSON()));
+    registerCustomType("json", std::make_unique<const TypeFactory>(JSON()));
     registerCustomType(
         "timestamp with time zone",
-        std::make_unique<const TypeFactories>(TIMESTAMP_WITH_TIME_ZONE()));
+        std::make_unique<const TypeFactory>(TIMESTAMP_WITH_TIME_ZONE()));
   }
 };
 
@@ -296,6 +296,11 @@ TEST_F(TypeParserTest, typesWithSpaces) {
       *ROW(
           {"timestamp with time zone", "double"},
           {TIMESTAMP_WITH_TIME_ZONE(), DOUBLE()}));
+
+  // quoted filed name with special characters & spaces
+  ASSERT_EQ(
+      *parseType("row(\"Nested Some more weirdtt +- \\:\\: charact\" varchar)"),
+      *ROW({"Nested Some more weirdtt +- \\:\\: charact"}, {VARCHAR()}));
 
   // quoted field name with invalid type with spaces.
   VELOX_ASSERT_UNSUPPORTED_THROW(
