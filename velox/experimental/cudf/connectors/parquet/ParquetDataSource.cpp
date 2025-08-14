@@ -23,6 +23,12 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/connectors/hive/HiveConnectorUtil.h"
+#include "velox/dwio/common/CachedBufferedInput.h"
+#include "velox/dwio/common/SeekableInputStream.h"
+#include "velox/expression/FieldReference.h"
+
+#include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -34,15 +40,81 @@
 #include <memory>
 #include <string>
 
+// ---------------- Internal helper ----------------
+// A cudf::io::datasource that serves bytes via Velox BufferedInput so that
+// reads benefit from AsyncDataCache / SSD cache and are always returned as
+// contiguous buffers.
+class BufferedInputDataSource : public cudf::io::datasource {
+ public:
+  explicit BufferedInputDataSource(
+      std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input)
+      : input_(std::move(input)), fileSize_(input_->getReadFile()->size()) {}
+
+  [[nodiscard]] size_t size() const override {
+    return fileSize_;
+  }
+
+  std::unique_ptr<datasource::buffer> host_read(size_t offset, size_t size)
+      override {
+    if (offset >= fileSize_) {
+      return datasource::buffer::create(std::vector<uint8_t>{});
+    }
+    const size_t readSize = std::min(size, fileSize_ - offset);
+    std::vector<uint8_t> data(readSize);
+    readContiguous(offset, readSize, data.data());
+    return datasource::buffer::create(std::move(data));
+  }
+
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override {
+    if (offset >= fileSize_) {
+      return 0;
+    }
+    const size_t readSize = std::min(size, fileSize_ - offset);
+    readContiguous(offset, readSize, dst);
+    return readSize;
+  }
+
+  std::future<std::unique_ptr<datasource::buffer>> host_read_async(
+      size_t offset,
+      size_t size) override {
+    return std::async(std::launch::deferred, [this, offset, size]() {
+      return this->host_read(offset, size);
+    });
+  }
+
+  std::future<size_t> host_read_async(size_t offset, size_t size, uint8_t* dst)
+      override {
+    return std::async(std::launch::deferred, [this, offset, size, dst]() {
+      return this->host_read(offset, size, dst);
+    });
+  }
+
+  [[nodiscard]] bool supports_device_read() const override {
+    return false;
+  }
+
+ private:
+  void readContiguous(size_t offset, size_t size, uint8_t* dst) {
+    using namespace facebook::velox::dwio::common;
+    // BufferedInput::read gives us a stream over the exact region.
+    auto stream = input_->read(offset, size, LogType::FILE);
+    VELOX_CHECK(stream != nullptr, "read() returned null stream");
+    stream->readFully(reinterpret_cast<char*>(dst), size);
+  }
+
+  std::shared_ptr<facebook::velox::dwio::common::BufferedInput> input_;
+  const size_t fileSize_;
+};
+
 namespace facebook::velox::cudf_velox::connector::parquet {
 
 using namespace facebook::velox::connector;
 
 ParquetDataSource::ParquetDataSource(
-    const std::shared_ptr<const RowType>& outputType,
-    const std::shared_ptr<ConnectorTableHandle>& tableHandle,
-    const std::unordered_map<std::string, std::shared_ptr<ColumnHandle>>&
-        columnHandles,
+    const RowTypePtr& outputType,
+    const ConnectorTableHandlePtr& tableHandle,
+    const ColumnHandleMap& columnHandles,
+    FileHandleFactory* fileHandleFactory,
     folly::Executor* executor,
     const ConnectorQueryCtx* connectorQueryCtx,
     const std::shared_ptr<ParquetConfig>& parquetConfig)
@@ -54,6 +126,9 @@ ParquetDataSource::ParquetDataSource(
       executor_(executor),
       connectorQueryCtx_(connectorQueryCtx),
       pool_(connectorQueryCtx->memoryPool()),
+      fileHandleFactory_(fileHandleFactory),
+      baseReaderOpts_(connectorQueryCtx->memoryPool()),
+      fsStats_(std::make_shared<filesystems::File::IoStats>()),
       outputType_(outputType),
       expressionEvaluator_(connectorQueryCtx->expressionEvaluator()) {
   // Set up column projection if needed
@@ -196,15 +271,38 @@ void ParquetDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   // more table bytes
   const auto& filePaths = split_->getCudfSourceInfo().filepaths();
   for (const auto& filePath : filePaths) {
-    completedBytes_ += std::filesystem::file_size(filePath);
+    // DM: Needed only for stats (TableScan operator)
+    // completedBytes_ += std::filesystem::file_size(filePath);
   }
 }
 
+// TODO (dm): Something broke running with cudf but without cudf scan:
+// Line: /velox/velox/exec/TableScan.cpp:331, Function:getSplit, Expression:
+// connector_->connectorId() == connectorSplit->connectorId (test-parquet vs.
+// test-hive) Got splits with different connector IDs, Source: RUNTIME,
+// ErrorCode: INVALID_STATE
+
 std::unique_ptr<cudf::io::chunked_parquet_reader>
 ParquetDataSource::createSplitReader() {
+  FileHandleCachedPtr fileHandleCachePtr =
+      fileHandleFactory_->generate(split_->filePath, nullptr, nullptr);
+  VELOX_CHECK_NOT_NULL(fileHandleCachePtr.get());
+
+  auto bufferedInput = ::facebook::velox::connector::hive::createBufferedInput(
+      *fileHandleCachePtr,
+      baseReaderOpts_,
+      connectorQueryCtx_,
+      ioStats_,
+      fsStats_,
+      executor_);
+
+  datasource_ =
+      std::make_unique<BufferedInputDataSource>(std::move(bufferedInput));
+
   // Reader options
   auto readerOptions =
-      cudf::io::parquet_reader_options::builder(split_->getCudfSourceInfo())
+      cudf::io::parquet_reader_options::builder(
+          cudf::io::source_info(datasource_.get()))
           .skip_rows(parquetConfig_->skipRows())
           .use_pandas_metadata(parquetConfig_->isUsePandasMetadata())
           .use_arrow_schema(parquetConfig_->isUseArrowSchema())

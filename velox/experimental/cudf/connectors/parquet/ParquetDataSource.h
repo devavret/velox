@@ -25,9 +25,11 @@
 #include "velox/common/base/RandomUtil.h"
 #include "velox/common/io/IoStatistics.h"
 #include "velox/connectors/Connector.h"
+#include "velox/connectors/hive/FileHandle.h"
 #include "velox/dwio/common/Statistics.h"
 #include "velox/type/Type.h"
 
+#include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
@@ -38,10 +40,10 @@ using namespace facebook::velox::connector;
 class ParquetDataSource : public DataSource, public NvtxHelper {
  public:
   ParquetDataSource(
-      const std::shared_ptr<const RowType>& outputType,
-      const std::shared_ptr<ConnectorTableHandle>& tableHandle,
-      const std::unordered_map<std::string, std::shared_ptr<ColumnHandle>>&
-          columnHandles,
+      const RowTypePtr& outputType,
+      const ConnectorTableHandlePtr& tableHandle,
+      const ColumnHandleMap& columnHandles,
+      FileHandleFactory* fileHandleFactory,
       folly::Executor* executor,
       const ConnectorQueryCtx* connectorQueryCtx,
       const std::shared_ptr<ParquetConfig>& ParquetConfig);
@@ -103,6 +105,13 @@ class ParquetDataSource : public DataSource, public NvtxHelper {
   cudf::io::parquet_reader_options readerOptions_;
   std::unique_ptr<cudf::io::chunked_parquet_reader> splitReader_;
   rmm::cuda_stream_view stream_;
+
+  FileHandleFactory* const fileHandleFactory_;
+  dwio::common::ReaderOptions baseReaderOpts_;
+
+  std::unique_ptr<cudf::io::datasource> datasource_;
+
+  const std::shared_ptr<filesystems::File::IoStats> fsStats_;
 
   // Table column names read from the Parquet file
   std::vector<std::string> columnNames_;

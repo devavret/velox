@@ -248,8 +248,18 @@ std::vector<std::shared_ptr<connector::parquet::ParquetConnectorSplit>>
 ParquetConnectorTestBase::makeParquetConnectorSplits(
     const std::string& filePath,
     uint32_t splitCount) {
+  std::unordered_map<std::string, std::string> properties;
+  properties["hive.s3.endpoint"] = "http://172.18.0.2:9000";
+  properties["hive.s3.endpoint.region"] = "us-east-1";
+  properties["hive.s3.aws-access-key"] = "minioadmin";
+  properties["hive.s3.aws-secret-key"] = "minioadmin";
+  properties["hive.s3.use-instance-credentials"] = "false";
+  properties["hive.s3.path-style-access"] = "true";
+  properties["hive.s3.ssl.enabled"] = "false";
+  auto config = std::make_shared<config::ConfigBase>(std::move(properties));
+
   auto file =
-      filesystems::getFileSystem(filePath, nullptr)->openFileForRead(filePath);
+      filesystems::getFileSystem(filePath, config)->openFileForRead(filePath);
   const int64_t fileSize = file->size();
   // Take the upper bound.
   const int64_t splitSize = std::ceil((fileSize) / splitCount);

@@ -15,6 +15,8 @@
  */
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
+#include <connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h>
+#include "velox/connectors/hive/HiveConnector.h"
 
 DEFINE_string(data_format, "parquet", "Data format");
 
@@ -187,6 +189,7 @@ void QueryBenchmarkBase::initialize() {
   aggregate::prestosql::registerAllAggregateFunctions();
   parse::registerTypeResolver();
   filesystems::registerLocalFileSystem();
+  filesystems::registerS3FileSystem();
 
   ioExecutor_ =
       std::make_unique<folly::IOThreadPoolExecutor>(FLAGS_num_io_threads);
@@ -199,6 +202,14 @@ void QueryBenchmarkBase::initialize() {
       FLAGS_max_coalesced_distance_bytes;
   configurationValues[connector::hive::HiveConfig::kPrefetchRowGroups] =
       std::to_string(FLAGS_parquet_prefetch_rowgroups);
+  configurationValues["hive.s3.endpoint"] = "http://172.18.0.2:9000";
+  configurationValues["hive.s3.endpoint.region"] =
+      "us-east-1"; // Dummy region for MinIO
+  configurationValues["hive.s3.aws-access-key"] = "minioadmin";
+  configurationValues["hive.s3.aws-secret-key"] = "minioadmin";
+  configurationValues["hive.s3.use-instance-credentials"] = "false";
+  configurationValues["hive.s3.path-style-access"] = "true";
+  configurationValues["hive.s3.ssl.enabled"] = "false";
   auto properties = std::make_shared<const config::ConfigBase>(
       std::move(configurationValues));
 

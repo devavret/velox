@@ -41,6 +41,7 @@ if(${VELOX_ENABLE_BENCHMARKS})
 endif()
 
 add_library(velox_query_benchmark QueryBenchmarkBase.cpp)
+target_compile_options(velox_query_benchmark PRIVATE -g -O0)
 target_link_libraries(
   velox_query_benchmark
   velox_aggregates
@@ -56,6 +57,7 @@ target_link_libraries(
   velox_process
   velox_serialization
   velox_encode
+  velox_s3fs
   velox_type
   velox_type_fbhive
   velox_caching

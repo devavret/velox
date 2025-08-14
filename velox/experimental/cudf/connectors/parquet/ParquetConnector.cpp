@@ -27,6 +27,10 @@ ParquetConnector::ParquetConnector(
     folly::Executor* executor)
     : Connector(id),
       parquetConfig_(std::make_shared<ParquetConfig>(config)),
+      fileHandleFactory_(
+          // TODO (dm): make this configurable like it is in hive connector
+          std::make_unique<SimpleLRUCache<std::string, FileHandle>>(1000),
+          std::make_unique<FileHandleGenerator>(config)),
       executor_(executor) {
   LOG(INFO) << "cudf::Parquet connector " << connectorId() << " created.";
 }
@@ -41,6 +45,7 @@ std::unique_ptr<DataSource> ParquetConnector::createDataSource(
       outputType,
       tableHandle,
       columnHandles,
+      &fileHandleFactory_,
       executor_,
       connectorQueryCtx,
       parquetConfig_);

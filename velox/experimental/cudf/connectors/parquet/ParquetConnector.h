@@ -62,6 +62,7 @@ class ParquetConnector final : public Connector {
 
  protected:
   const std::shared_ptr<ParquetConfig> parquetConfig_;
+  FileHandleFactory fileHandleFactory_;
   folly::Executor* executor_;
 };
 

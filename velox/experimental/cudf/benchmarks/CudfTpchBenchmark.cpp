@@ -60,6 +60,16 @@ class CudfTpchBenchmark : public TpchBenchmark {
     parquetConfigurationValues[cudf_velox::connector::parquet::ParquetConfig::
                                    kAllowMismatchedParquetSchemas] =
         std::to_string(true);
+
+    parquetConfigurationValues["hive.s3.endpoint"] = "http://172.18.0.2:9000";
+    parquetConfigurationValues["hive.s3.endpoint.region"] =
+        "us-east-1"; // Dummy region for MinIO
+    parquetConfigurationValues["hive.s3.aws-access-key"] = "minioadmin";
+    parquetConfigurationValues["hive.s3.aws-secret-key"] = "minioadmin";
+    parquetConfigurationValues["hive.s3.use-instance-credentials"] = "false";
+    parquetConfigurationValues["hive.s3.path-style-access"] = "true";
+    parquetConfigurationValues["hive.s3.ssl.enabled"] = "false";
+
     auto parquetProperties = std::make_shared<const config::ConfigBase>(
         std::move(parquetConfigurationValues));
 
