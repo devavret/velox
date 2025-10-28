@@ -24,6 +24,7 @@
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/ConstantVector.h"
 
+#include <cudf/ast/detail/operators.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
@@ -166,25 +167,27 @@ const std::unordered_set<std::string> astSupportedSpecialExprNames =
 
 namespace detail {
 
-// extract raw types from Expr inputs
-const std::vector<TypePtr> getRawInputTypes(const std::vector<std::shared_ptr<velox::exec::Expr>>& inputs) {
-  std::vector<TypePtr> types;
+// get cuDF types of Expr inputs
+const std::vector<cudf::data_type> getInputCudfDataTypes(
+    const std::vector<std::shared_ptr<velox::exec::Expr>>& inputs) {
+  std::vector<cudf::data_type> types;
   for (const auto& input : inputs) {
-    types.push_back(input->type());
+    types.push_back(cudf::data_type(veloxToCudfTypeId(input->type())));
   }
   return types;
 }
 
-// extract raw types from TypedExpr inputs
-const std::vector<TypePtr> getRawInputTypes(const std::vector<core::TypedExprPtr>& inputs) {
-  std::vector<TypePtr> types;
+// get cuDF types of TypedExpr inputs
+const std::vector<cudf::data_type> getInputCudfDataTypes(
+    const std::vector<core::TypedExprPtr>& inputs) {
+  std::vector<cudf::data_type> types;
   for (const auto& input : inputs) {
-    types.push_back(input->type());
+    types.push_back(cudf::data_type(veloxToCudfTypeId(input->type())));
   }
   return types;
 }
 
-// return the simple AST operator for the given expression name
+// return the AST operator for the given expression name, if any
 std::optional<Op> opFromExprName(const std::string& exprName) {
   const auto name =
       stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
@@ -193,11 +196,14 @@ std::optional<Op> opFromExprName(const std::string& exprName) {
   } else if (unaryOps.find(name) != unaryOps.end()) {
     return unaryOps.at(name);
   }
-  return std::nullopt; 
+  return std::nullopt;
 }
 
 // check for support of compound AST operations
 bool isSupportedSpecialExpr(const std::string& exprName) {
+  //
+  // NOT YET IMPLEMENTED
+  //
   const auto name =
       stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
   return astSupportedSpecialExprNames.count(name);
@@ -206,17 +212,38 @@ bool isSupportedSpecialExpr(const std::string& exprName) {
 // check if the expression (name + input types) is supported in AST
 bool isAstSupported(
     const std::string& exprName,
-    const std::vector<TypePtr>& inputTypes) {
-  // Check for simple binary/unary operations
-  if (opFromExprName(exprName).has_value()) {
-    return true;
-  }
-
-  // Check for special expressions
+    const std::vector<cudf::data_type>& inputCudfDataTypes) {
+  // is it a special op?
   if (isSupportedSpecialExpr(exprName)) {
-    return true;
+    //
+    // NOT YET IMPLEMENTED
+    //
+    return false;
   }
-
+  // get regular op from name
+  const auto maybe_op = opFromExprName(exprName);
+  if (!maybe_op.has_value()) {
+    // not a supported regular op
+    return false;
+  }
+  const auto op = *maybe_op;
+  // check arity
+  const auto arity = cudf::ast::detail::ast_operator_arity(op);
+  if (arity != static_cast<int>(inputCudfDataTypes.size())) {
+    // arity mismatch
+    // throw a warning?
+    return false;
+  }
+  // check for a cuDF implementation of this op with these inputs
+  try {
+    // this will throw if no matching implementation is found
+    const auto return_cudf_type =
+        cudf::ast::detail::ast_operator_return_type(op, inputCudfDataTypes);
+    // check it's a sensible type
+    return return_cudf_type.id() != cudf::type_id::EMPTY;
+  } catch (...) {
+    // no matching cuDF implementation
+  }
   return false;
 }
 
@@ -656,7 +683,8 @@ ColumnOrView ASTExpression::eval(
 }
 
 bool ASTExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
-  return detail::isAstSupported(expr->name(), detail::getRawInputTypes(expr->inputs())) ||
+  return detail::isAstSupported(
+             expr->name(), detail::getInputCudfDataTypes(expr->inputs())) ||
       std::dynamic_pointer_cast<velox::exec::FieldReference>(expr) != nullptr;
 }
 
@@ -671,7 +699,8 @@ bool ASTExpression::canEvaluate(const core::TypedExprPtr& expr) {
     case ExprKind::kCall: {
       const auto* call =
           expr->asUnchecked<facebook::velox::core::CallTypedExpr>();
-      return detail::isAstSupported(call->name(), detail::getRawInputTypes(call->inputs()));
+      return detail::isAstSupported(
+          call->name(), detail::getInputCudfDataTypes(call->inputs()));
     }
     case core::ExprKind::kCast: {
       const auto* cast = expr->asUnchecked<core::CastTypedExpr>();
