@@ -161,18 +161,63 @@ const std::unordered_map<std::string, Op> binaryOps = [] {
 
 const std::map<std::string, Op> unaryOps = {{"not", Op::NOT}};
 
-const std::unordered_set<std::string> astSupportedOps =
+const std::unordered_set<std::string> astSupportedSpecialExprNames =
     {"literal", "between", "in", "cast", "switch", "if", "isnotnull"};
 
 namespace detail {
 
-// Check if this specific operation is supported by AST (shallow check only)
-bool isAstSupported(const std::string& exprName) {
+// extract raw types from Expr inputs
+const std::vector<TypePtr> getRawInputTypes(const std::vector<std::shared_ptr<velox::exec::Expr>>& inputs) {
+  std::vector<TypePtr> types;
+  for (const auto& input : inputs) {
+    types.push_back(input->type());
+  }
+  return types;
+}
+
+// extract raw types from TypedExpr inputs
+const std::vector<TypePtr> getRawInputTypes(const std::vector<core::TypedExprPtr>& inputs) {
+  std::vector<TypePtr> types;
+  for (const auto& input : inputs) {
+    types.push_back(input->type());
+  }
+  return types;
+}
+
+// return the simple AST operator for the given expression name
+std::optional<Op> opFromExprName(const std::string& exprName) {
   const auto name =
       stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
+  if (binaryOps.find(name) != binaryOps.end()) {
+    return binaryOps.at(name);
+  } else if (unaryOps.find(name) != unaryOps.end()) {
+    return unaryOps.at(name);
+  }
+  return std::nullopt; 
+}
 
-  return astSupportedOps.count(name) || binaryOps.count(name) ||
-      unaryOps.count(name);
+// check for support of compound AST operations
+bool isSupportedSpecialExpr(const std::string& exprName) {
+  const auto name =
+      stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
+  return astSupportedSpecialExprNames.count(name);
+}
+
+// check if the expression (name + input types) is supported in AST
+bool isAstSupported(
+    const std::string& exprName,
+    const std::vector<TypePtr>& inputTypes) {
+  // Check for simple binary/unary operations
+  if (opFromExprName(exprName).has_value()) {
+    return true;
+  }
+
+  // Check for special expressions
+  if (isSupportedSpecialExpr(exprName)) {
+    return true;
+  }
+
+  return false;
 }
 
 } // namespace detail
@@ -611,7 +656,7 @@ ColumnOrView ASTExpression::eval(
 }
 
 bool ASTExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
-  return detail::isAstSupported(expr->name()) ||
+  return detail::isAstSupported(expr->name(), detail::getRawInputTypes(expr->inputs())) ||
       std::dynamic_pointer_cast<velox::exec::FieldReference>(expr) != nullptr;
 }
 
@@ -626,7 +671,7 @@ bool ASTExpression::canEvaluate(const core::TypedExprPtr& expr) {
     case ExprKind::kCall: {
       const auto* call =
           expr->asUnchecked<facebook::velox::core::CallTypedExpr>();
-      return detail::isAstSupported(call->name());
+      return detail::isAstSupported(call->name(), detail::getRawInputTypes(call->inputs()));
     }
     case core::ExprKind::kCast: {
       const auto* cast = expr->asUnchecked<core::CastTypedExpr>();
