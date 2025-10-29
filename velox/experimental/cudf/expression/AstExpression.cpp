@@ -164,26 +164,7 @@ const std::map<std::string, Op> unaryOps = {{"not", Op::NOT}};
 
 namespace detail {
 
-// get cuDF types of Expr inputs
-const std::vector<cudf::data_type> getInputCudfDataTypes(
-    const std::vector<std::shared_ptr<velox::exec::Expr>>& inputs) {
-  std::vector<cudf::data_type> types;
-  for (const auto& input : inputs) {
-    types.push_back(cudf::data_type(veloxToCudfTypeId(input->type())));
-  }
-  return types;
-}
-
-// get cuDF types of TypedExpr inputs
-const std::vector<cudf::data_type> getInputCudfDataTypes(
-    const std::vector<core::TypedExprPtr>& inputs) {
-  std::vector<cudf::data_type> types;
-  for (const auto& input : inputs) {
-    types.push_back(cudf::data_type(veloxToCudfTypeId(input->type())));
-  }
-  return types;
-}
-
+// check if the data type is numeric
 bool isNumericDataType(const cudf::data_type& dataType) {
   switch (dataType.id()) {
     case cudf::type_id::INT8:
@@ -192,24 +173,6 @@ bool isNumericDataType(const cudf::data_type& dataType) {
     case cudf::type_id::INT64:
     case cudf::type_id::FLOAT32:
     case cudf::type_id::FLOAT64:
-      // more needed?
-      return true;
-    default:
-      break;
-  }
-  return false;
-}
-
-bool isLiteralDataType(const cudf::data_type& dataType) {
-  switch (dataType.id()) {
-    case cudf::type_id::BOOL8:
-    case cudf::type_id::INT8:
-    case cudf::type_id::INT16:
-    case cudf::type_id::INT32:
-    case cudf::type_id::INT64:
-    case cudf::type_id::FLOAT32:
-    case cudf::type_id::FLOAT64:
-    case cudf::type_id::STRING:
       // more needed?
       return true;
     default:
@@ -252,20 +215,11 @@ bool isOpAndInputsSupported(
 }
 
 // check if the expression (name + input types) is supported in AST
-bool isAstSupported(
-    const std::string& exprName,
+bool isFunctionNameAndInputsSupported(
+    const std::string& funcName,
     const std::vector<cudf::data_type>& inputCudfDataTypes) {
-  std::cout << "***** DEBUG ***** Checking AST Function Support for: "
-            << exprName << std::endl;
-  // get plain function name
-  const auto funcName =
-      stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
-  // is it a compound function?
-  if (funcName == "literal") {
-    // CHECK THIS
-    return inputCudfDataTypes.size() == 1 &&
-        isLiteralDataType(inputCudfDataTypes[0]);
-  } else if (funcName == "between") {
+  // check by function name
+  if (funcName == "between") {
     return inputCudfDataTypes.size() == 3 &&
         isOpAndInputsSupported(
                cudf::ast::ast_operator::GREATER_EQUAL,
@@ -293,13 +247,64 @@ bool isAstSupported(
         isOpAndInputsSupported(
                cudf::ast::ast_operator::IS_NULL, inputCudfDataTypes);
   }
+
   // get regular op from name
   const auto maybe_op = opFromFunctionName(funcName);
   if (!maybe_op.has_value()) {
     // not a supported regular op
     return false;
   }
+
+  // check op + input types
   return isOpAndInputsSupported(*maybe_op, inputCudfDataTypes);
+}
+
+// check if the expression (name + input types) is supported in AST
+bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
+  // get plain function name
+  const auto funcName =
+      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
+
+  std::cout << "***** DEBUG ***** Checking AST Function Support for Expr '"
+            << funcName << "'" << std::endl;
+
+  // check special kinds
+  if (expr->isConstant()) {
+    // all constants supported
+    // CHECK THIS!
+    return true;
+  }
+  // others?
+
+  // get input types
+  std::vector<cudf::data_type> inputCudfDataTypes;
+  for (const auto& input : expr->inputs()) {
+    inputCudfDataTypes.push_back(
+        cudf::data_type(veloxToCudfTypeId(input->type())));
+  }
+
+  // just check by name and input types
+  return isFunctionNameAndInputsSupported(funcName, inputCudfDataTypes);
+}
+
+bool isAstCallTypedExprSupported(const core::CallTypedExpr* expr) {
+  // get plain function name
+  const auto funcName =
+      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
+
+  std::cout
+      << "***** DEBUG ***** Checking AST Function Support for CallTypedExpr '"
+      << funcName << "'" << std::endl;
+
+  // get inputs
+  std::vector<cudf::data_type> inputCudfDataTypes;
+  for (const auto& input : expr->inputs()) {
+    inputCudfDataTypes.push_back(
+        cudf::data_type(veloxToCudfTypeId(input->type())));
+  }
+
+  // just check by name and input types
+  return isFunctionNameAndInputsSupported(funcName, inputCudfDataTypes);
 }
 
 } // namespace detail
@@ -749,9 +754,9 @@ ColumnOrView ASTExpression::eval(
 }
 
 bool ASTExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
-  return detail::isAstSupported(
-             expr->name(), detail::getInputCudfDataTypes(expr->inputs())) ||
-      std::dynamic_pointer_cast<velox::exec::FieldReference>(expr) != nullptr;
+  return std::dynamic_pointer_cast<velox::exec::FieldReference>(expr) !=
+      nullptr ||
+      detail::isAstExprSupported(expr);
 }
 
 bool ASTExpression::canEvaluate(const core::TypedExprPtr& expr) {
@@ -763,10 +768,8 @@ bool ASTExpression::canEvaluate(const core::TypedExprPtr& expr) {
     case ExprKind::kInput:
       return true;
     case ExprKind::kCall: {
-      const auto* call =
-          expr->asUnchecked<facebook::velox::core::CallTypedExpr>();
-      return detail::isAstSupported(
-          call->name(), detail::getInputCudfDataTypes(call->inputs()));
+      const auto* call = expr->asUnchecked<core::CallTypedExpr>();
+      return detail::isAstCallTypedExprSupported(call);
     }
     case core::ExprKind::kCast: {
       const auto* cast = expr->asUnchecked<core::CastTypedExpr>();
