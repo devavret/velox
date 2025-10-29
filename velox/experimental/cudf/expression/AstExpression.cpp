@@ -201,9 +201,6 @@ std::optional<Op> opFromExprName(const std::string& exprName) {
 
 // check for support of compound AST operations
 bool isSupportedSpecialExpr(const std::string& exprName) {
-  //
-  // NOT YET IMPLEMENTED
-  //
   const auto name =
       stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
   return astSupportedSpecialExprNames.count(name);
@@ -213,12 +210,14 @@ bool isSupportedSpecialExpr(const std::string& exprName) {
 bool isAstSupported(
     const std::string& exprName,
     const std::vector<cudf::data_type>& inputCudfDataTypes) {
+  std::cout << "***** DEBUG ***** Checking AST Function Support for: "
+            << exprName << std::endl;
   // is it a special op?
   if (isSupportedSpecialExpr(exprName)) {
     //
-    // NOT YET IMPLEMENTED
+    // NOT YET IMPLEMENTED, ASSUME YES
     //
-    return false;
+    return true;
   }
   // get regular op from name
   const auto maybe_op = opFromExprName(exprName);
