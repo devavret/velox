@@ -749,7 +749,6 @@ ColumnOrView ASTExpression::eval(
 }
 
 bool ASTExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
-  std::cout << "***** DEBUG ***** ASTExpression expression" << std::endl;
   return detail::isAstSupported(
              expr->name(), detail::getInputCudfDataTypes(expr->inputs())) ||
       std::dynamic_pointer_cast<velox::exec::FieldReference>(expr) != nullptr;
@@ -766,7 +765,6 @@ bool ASTExpression::canEvaluate(const core::TypedExprPtr& expr) {
     case ExprKind::kCall: {
       const auto* call =
           expr->asUnchecked<facebook::velox::core::CallTypedExpr>();
-      std::cout << "***** DEBUG ***** ASTExpression typed expr" << std::endl;
       return detail::isAstSupported(
           call->name(), detail::getInputCudfDataTypes(call->inputs()));
     }
