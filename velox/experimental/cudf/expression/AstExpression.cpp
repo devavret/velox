@@ -184,6 +184,40 @@ const std::vector<cudf::data_type> getInputCudfDataTypes(
   return types;
 }
 
+bool isNumericDataType(const cudf::data_type& dataType) {
+  switch (dataType.id()) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32:
+    case cudf::type_id::INT64:
+    case cudf::type_id::FLOAT32:
+    case cudf::type_id::FLOAT64:
+      // more needed?
+      return true;
+    default:
+      break;
+  }
+  return false;
+}
+
+bool isLiteralDataType(const cudf::data_type& dataType) {
+  switch (dataType.id()) {
+    case cudf::type_id::BOOL8:
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32:
+    case cudf::type_id::INT64:
+    case cudf::type_id::FLOAT32:
+    case cudf::type_id::FLOAT64:
+    case cudf::type_id::STRING:
+      // more needed?
+      return true;
+    default:
+      break;
+  }
+  return false;
+}
+
 // return the AST operator for the given expression name, if any
 std::optional<Op> opFromFunctionName(const std::string& funcName) {
   if (binaryOps.find(funcName) != binaryOps.end()) {
@@ -228,26 +262,26 @@ bool isAstSupported(
       stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
   // is it a compound function?
   if (funcName == "literal") {
-    // NYI
-    return true;
+    // CHECK THIS
+    return inputCudfDataTypes.size() == 1 &&
+        isLiteralDataType(inputCudfDataTypes[0]);
   } else if (funcName == "between") {
-    return isOpAndInputsSupported(
+    return inputCudfDataTypes.size() == 3 &&
+        isOpAndInputsSupported(
                cudf::ast::ast_operator::GREATER_EQUAL,
                {inputCudfDataTypes[0], inputCudfDataTypes[1]}) &&
         isOpAndInputsSupported(
                cudf::ast::ast_operator::LESS_EQUAL,
-               {inputCudfDataTypes[0], inputCudfDataTypes[2]}) &&
-        isOpAndInputsSupported(
-               cudf::ast::ast_operator::NULL_LOGICAL_AND, // probably
-                                                          // superfluous
-               {cudf::data_type(cudf::type_id::BOOL8),
-                cudf::data_type(cudf::type_id::BOOL8)});
+               {inputCudfDataTypes[0], inputCudfDataTypes[2]});
   } else if (funcName == "in") {
-    // NYI
-    return true;
+    // CHECK THIS
+    return inputCudfDataTypes.size() == 2 &&
+        isNumericDataType(inputCudfDataTypes[0]) &&
+        inputCudfDataTypes[1].id() == cudf::type_id::LIST;
   } else if (funcName == "cast") {
-    // NYI
-    return true;
+    // support casting of numeric types only for now
+    return inputCudfDataTypes.size() == 1 &&
+        isNumericDataType(inputCudfDataTypes[0]);
   } else if (funcName == "switch") {
     // NYI
     return true;
@@ -255,8 +289,9 @@ bool isAstSupported(
     // NYI
     return true;
   } else if (funcName == "isnotnull") {
-    // NYI
-    return true;
+    return inputCudfDataTypes.size() == 1 &&
+        isOpAndInputsSupported(
+               cudf::ast::ast_operator::IS_NULL, inputCudfDataTypes);
   }
   // get regular op from name
   const auto maybe_op = opFromFunctionName(funcName);
