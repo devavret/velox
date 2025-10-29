@@ -57,8 +57,10 @@ class CudfExpressionSelectionTest : public ::testing::Test {
         {"name", VARCHAR()},
         {"date", TIMESTAMP()},
         {"c", INTEGER()},
-        {"d", DOUBLE()},
-        {"r", REAL()},
+        {"d1", DOUBLE()},
+        {"d2", DOUBLE()},
+        {"r1", REAL()},
+        {"r2", REAL()},
     });
 
     parse::registerTypeResolver();
@@ -272,7 +274,7 @@ TEST_F(CudfExpressionSelectionTest, astRootBad1) {
 }
 
 TEST_F(CudfExpressionSelectionTest, astRootBad2) {
-  auto expr = compileExecExpr("a + d", rowType_, execCtx_.get());
+  auto expr = compileExecExpr("d1 + d2", rowType_, execCtx_.get());
   auto cudfExpr = createCudfExpression(expr, rowType_);
   auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
   ASSERT_NE(ast, nullptr);
@@ -280,7 +282,15 @@ TEST_F(CudfExpressionSelectionTest, astRootBad2) {
 }
 
 TEST_F(CudfExpressionSelectionTest, astRootBad3) {
-  auto expr = compileExecExpr("a + r", rowType_, execCtx_.get());
+  auto expr = compileExecExpr("r1 + r2", rowType_, execCtx_.get());
+  auto cudfExpr = createCudfExpression(expr, rowType_);
+  auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
+  ASSERT_NE(ast, nullptr);
+  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
+}
+
+TEST_F(CudfExpressionSelectionTest, astRootBad4) {
+  auto expr = compileExecExpr("d1 + r2", rowType_, execCtx_.get());
   auto cudfExpr = createCudfExpression(expr, rowType_);
   auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
   ASSERT_NE(ast, nullptr);
