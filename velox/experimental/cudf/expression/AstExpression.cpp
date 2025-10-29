@@ -383,7 +383,8 @@ cudf::ast::expression const& AstContext::multipleInputsToPairWise(
 /// @param expr The expression to push into the AST tree
 /// @return A reference to the resulting AST expression
 cudf::ast::expression const& AstContext::pushExprToTree(
-    const std::shared_ptr<velox::exec::Expr>& expr) {
+    const std::shared_ptr<velox::exec::Expr>& expr,
+    const bool disable_for_table_scan = false) {
   using Op = cudf::ast::ast_operator;
   using Operation = cudf::ast::operation;
   using velox::exec::ConstantExpr;
@@ -550,7 +551,7 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       }
     }
     VELOX_FAIL("Field not found, " + name);
-  } else if (canBeEvaluatedByCudf(expr)) {
+  } else if (canBeEvaluatedByCudf(expr) && !disable_for_table_scan) {
     // Shallow check: only verify this operation is supported
     // Children will be recursively handled by createCudfExpression
     auto node =
