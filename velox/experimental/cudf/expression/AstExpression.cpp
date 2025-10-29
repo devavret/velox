@@ -162,9 +162,6 @@ const std::unordered_map<std::string, Op> binaryOps = [] {
 
 const std::map<std::string, Op> unaryOps = {{"not", Op::NOT}};
 
-const std::unordered_set<std::string> astSupportedSpecialExprNames =
-    {"literal", "between", "in", "cast", "switch", "if", "isnotnull"};
-
 namespace detail {
 
 // get cuDF types of Expr inputs
@@ -188,9 +185,7 @@ const std::vector<cudf::data_type> getInputCudfDataTypes(
 }
 
 // return the AST operator for the given expression name, if any
-std::optional<Op> opFromExprName(const std::string& exprName) {
-  const auto name =
-      stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
+std::optional<Op> opFromFunctionName(const std::string& funcName) {
   if (binaryOps.find(name) != binaryOps.end()) {
     return binaryOps.at(name);
   } else if (unaryOps.find(name) != unaryOps.end()) {
@@ -206,26 +201,9 @@ bool isSupportedSpecialExpr(const std::string& exprName) {
   return astSupportedSpecialExprNames.count(name);
 }
 
-// check if the expression (name + input types) is supported in AST
-bool isAstSupported(
-    const std::string& exprName,
+bool isOpAndInputsSupported(
+    const cudf::ast::ast_operator op,
     const std::vector<cudf::data_type>& inputCudfDataTypes) {
-  std::cout << "***** DEBUG ***** Checking AST Function Support for: "
-            << exprName << std::endl;
-  // is it a special op?
-  if (isSupportedSpecialExpr(exprName)) {
-    //
-    // NOT YET IMPLEMENTED, ASSUME YES
-    //
-    return true;
-  }
-  // get regular op from name
-  const auto maybe_op = opFromExprName(exprName);
-  if (!maybe_op.has_value()) {
-    // not a supported regular op
-    return false;
-  }
-  const auto op = *maybe_op;
   // check arity
   const auto arity = cudf::ast::detail::ast_operator_arity(op);
   if (arity != static_cast<int>(inputCudfDataTypes.size())) {
@@ -244,6 +222,56 @@ bool isAstSupported(
     // no matching cuDF implementation
   }
   return false;
+}
+
+// check if the expression (name + input types) is supported in AST
+bool isAstSupported(
+    const std::string& exprName,
+    const std::vector<cudf::data_type>& inputCudfDataTypes) {
+  std::cout << "***** DEBUG ***** Checking AST Function Support for: "
+            << exprName << std::endl;
+  // get plain function name
+  const auto funcName =
+      stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
+  // is it a compound function?
+  if (funcName == "literal") {
+    // NYI
+    return true;
+  } else if (funcName == "between") {
+    return isOpAndInputsSupported(
+               cudf::ast::ast_operator::GREATER_EQUAL,
+               {inputCudfDataTypes[0], inputCudfDataTypes[1]}) &&
+        isOpAndInputsSupported(
+               cudf::ast::ast_operator::LESS_EQUAL,
+               {inputCudfDataTypes[0], inputCudfDataTypes[2]}) &&
+        isOpAndInputsSupported(
+               cudf::ast::ast_operator::NULL_LOGICAL_AND, // probably
+                                                          // superfluous
+               {cudf::data_type(cudf::type_id::BOOL8),
+                cudf::data_type(cudf::type_id::BOOL8)});
+  } else if (funcName == "in") {
+    // NYI
+    return true;
+  } else if (funcName == "cast") {
+    // NYI
+    return true;
+  } else if (funcName == "switch") {
+    // NYI
+    return true;
+  } else if (funcName == "if") {
+    // NYI
+    return true;
+  } else if (funcName == "isnotnull") {
+    // NYI
+    return true;
+  }
+  // get regular op from name
+  const auto maybe_op = opFromFuncName(funcName);
+  if (!maybe_op.has_value()) {
+    // not a supported regular op
+    return false;
+  }
+  return isOpAndInputsSupported(*maybe_op, inputCudfDataTypes);
 }
 
 } // namespace detail
