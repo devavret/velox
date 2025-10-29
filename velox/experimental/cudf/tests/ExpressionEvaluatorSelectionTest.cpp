@@ -57,6 +57,8 @@ class CudfExpressionSelectionTest : public ::testing::Test {
         {"name", VARCHAR()},
         {"date", TIMESTAMP()},
         {"c", INTEGER()},
+        {"d", DOUBLE()},
+        {"r", REAL()},
     });
 
     parse::registerTypeResolver();
@@ -259,6 +261,30 @@ TEST_F(CudfExpressionSelectionTest, castAndTryCast) {
   auto badCast = parseAndInferTypedExpr(
       "cast(length(name) < 10 AS date)", rowType_, execCtx_.get());
   ASSERT_FALSE(canBeEvaluatedByCudf(badCast));
+}
+
+TEST_F(CudfExpressionSelectionTest, astRootBad1) {
+  auto expr = compileExecExpr("a + c", rowType_, execCtx_.get());
+  auto cudfExpr = createCudfExpression(expr, rowType_);
+  auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
+  ASSERT_NE(ast, nullptr);
+  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
+}
+
+TEST_F(CudfExpressionSelectionTest, astRootBad2) {
+  auto expr = compileExecExpr("a + d", rowType_, execCtx_.get());
+  auto cudfExpr = createCudfExpression(expr, rowType_);
+  auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
+  ASSERT_NE(ast, nullptr);
+  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
+}
+
+TEST_F(CudfExpressionSelectionTest, astRootBad3) {
+  auto expr = compileExecExpr("a + r", rowType_, execCtx_.get());
+  auto cudfExpr = createCudfExpression(expr, rowType_);
+  auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
+  ASSERT_NE(ast, nullptr);
+  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
 }
 
 } // namespace
