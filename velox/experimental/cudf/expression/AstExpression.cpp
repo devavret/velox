@@ -186,19 +186,12 @@ const std::vector<cudf::data_type> getInputCudfDataTypes(
 
 // return the AST operator for the given expression name, if any
 std::optional<Op> opFromFunctionName(const std::string& funcName) {
-  if (binaryOps.find(name) != binaryOps.end()) {
-    return binaryOps.at(name);
-  } else if (unaryOps.find(name) != unaryOps.end()) {
-    return unaryOps.at(name);
+  if (binaryOps.find(funcName) != binaryOps.end()) {
+    return binaryOps.at(funcName);
+  } else if (unaryOps.find(funcName) != unaryOps.end()) {
+    return unaryOps.at(funcName);
   }
   return std::nullopt;
-}
-
-// check for support of compound AST operations
-bool isSupportedSpecialExpr(const std::string& exprName) {
-  const auto name =
-      stripPrefix(exprName, CudfConfig::getInstance().functionNamePrefix);
-  return astSupportedSpecialExprNames.count(name);
 }
 
 bool isOpAndInputsSupported(
@@ -266,7 +259,7 @@ bool isAstSupported(
     return true;
   }
   // get regular op from name
-  const auto maybe_op = opFromFuncName(funcName);
+  const auto maybe_op = opFromFunctionName(funcName);
   if (!maybe_op.has_value()) {
     // not a supported regular op
     return false;
@@ -284,6 +277,7 @@ struct AstContext {
       precomputeInstructions;
   const std::shared_ptr<velox::exec::Expr>
       rootExpr; // Track the root expression
+  bool allowPureAstOnly;
 
   cudf::ast::expression const& pushExprToTree(
       const std::shared_ptr<velox::exec::Expr>& expr);
@@ -383,8 +377,7 @@ cudf::ast::expression const& AstContext::multipleInputsToPairWise(
 /// @param expr The expression to push into the AST tree
 /// @return A reference to the resulting AST expression
 cudf::ast::expression const& AstContext::pushExprToTree(
-    const std::shared_ptr<velox::exec::Expr>& expr,
-    const bool disable_for_table_scan = false) {
+    const std::shared_ptr<velox::exec::Expr>& expr) {
   using Op = cudf::ast::ast_operator;
   using Operation = cudf::ast::operation;
   using velox::exec::ConstantExpr;
@@ -522,7 +515,7 @@ cudf::ast::expression const& AstContext::pushExprToTree(
         c1 and c1->toString() == "1:INTEGER" and c2 and
         c2->toString() == "0:INTEGER") {
       return pushExprToTree(expr->inputs()[0]);
-    } else {
+    } else if (!allowPureAstOnly) {
       // TODO (dm): This can be better handled by checking which function
       // signatures are supported before dispatching. e.g. in this case, it
       // would be better if ast never agreed to evaluate a top level switch on
@@ -530,6 +523,8 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       auto node =
           createCudfExpression(expr, inputRowSchema[0], kAstEvaluatorName);
       return addPrecomputeInstructionOnSide(0, 0, name, "", node);
+    } else {
+      VELOX_FAIL("Unsupported expression: " + name);
     }
   } else if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
     // Refer to the appropriate side
@@ -551,7 +546,7 @@ cudf::ast::expression const& AstContext::pushExprToTree(
       }
     }
     VELOX_FAIL("Field not found, " + name);
-  } else if (canBeEvaluatedByCudf(expr) && !disable_for_table_scan) {
+  } else if (!allowPureAstOnly && canBeEvaluatedByCudf(expr)) {
     // Shallow check: only verify this operation is supported
     // Children will be recursively handled by createCudfExpression
     auto node =
@@ -621,8 +616,14 @@ cudf::ast::expression const& createAstTree(
     std::vector<std::unique_ptr<cudf::scalar>>& scalars,
     const RowTypePtr& inputRowSchema,
     std::vector<PrecomputeInstruction>& precomputeInstructions) {
+  static constexpr bool kAllowPureAstOnly = false;
   AstContext context{
-      tree, scalars, {inputRowSchema}, {precomputeInstructions}, expr};
+      tree,
+      scalars,
+      {inputRowSchema},
+      {precomputeInstructions},
+      expr,
+      kAllowPureAstOnly};
   return context.pushExprToTree(expr);
 }
 
@@ -633,13 +634,15 @@ cudf::ast::expression const& createAstTree(
     const RowTypePtr& leftRowSchema,
     const RowTypePtr& rightRowSchema,
     std::vector<PrecomputeInstruction>& leftPrecomputeInstructions,
-    std::vector<PrecomputeInstruction>& rightPrecomputeInstructions) {
+    std::vector<PrecomputeInstruction>& rightPrecomputeInstructions,
+    const bool allowPureAstOnly) {
   AstContext context{
       tree,
       scalars,
       {leftRowSchema, rightRowSchema},
       {leftPrecomputeInstructions, rightPrecomputeInstructions},
-      expr};
+      expr,
+      allowPureAstOnly};
   return context.pushExprToTree(expr);
 }
 
@@ -711,6 +714,7 @@ ColumnOrView ASTExpression::eval(
 }
 
 bool ASTExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
+  std::cout << "***** DEBUG ***** ASTExpression expression" << std::endl;
   return detail::isAstSupported(
              expr->name(), detail::getInputCudfDataTypes(expr->inputs())) ||
       std::dynamic_pointer_cast<velox::exec::FieldReference>(expr) != nullptr;
@@ -727,6 +731,7 @@ bool ASTExpression::canEvaluate(const core::TypedExprPtr& expr) {
     case ExprKind::kCall: {
       const auto* call =
           expr->asUnchecked<facebook::velox::core::CallTypedExpr>();
+      std::cout << "***** DEBUG ***** ASTExpression typed expr" << std::endl;
       return detail::isAstSupported(
           call->name(), detail::getInputCudfDataTypes(call->inputs()));
     }

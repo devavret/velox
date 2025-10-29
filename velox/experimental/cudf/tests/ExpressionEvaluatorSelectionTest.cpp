@@ -290,10 +290,13 @@ TEST_F(CudfExpressionSelectionTest, astRootBad3) {
 }
 
 TEST_F(CudfExpressionSelectionTest, astRootBad4) {
+  std::cout << "***** DEBUG ***** Test astRootBad4 a" << std::endl;
   auto expr = compileExecExpr("d1 + r2", rowType_, execCtx_.get());
+  std::cout << "***** DEBUG ***** Test astRootBad4 b" << std::endl;
   auto cudfExpr = createCudfExpression(expr, rowType_);
   auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
   ASSERT_NE(ast, nullptr);
+  std::cout << "***** DEBUG ***** Test astRootBad4 c" << std::endl;
   ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
 }
 
