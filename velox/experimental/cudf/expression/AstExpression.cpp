@@ -247,20 +247,29 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
   const auto funcName =
       stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
 
-  // check special kinds
-  if (expr->isConstant()) {
-    // all constants supported
-    // CHECK THIS!
-    return true;
-  }
-  // others?
-
-  // get input types
+  // get input types as cudf data types
   std::vector<cudf::data_type> inputCudfDataTypes;
   for (const auto& input : expr->inputs()) {
     inputCudfDataTypes.push_back(
         cudf::data_type(veloxToCudfTypeId(input->type())));
   }
+
+  // check special kinds
+  if (expr->isConstant()) {
+    // all constants supported
+    // CHECK THIS!
+    return true;
+  } else if (expr->isCast()) {
+    // support casting of numeric types only for now
+    // DO WE NEED TO SUPPORT NON-NUMERIC TYPES?
+    return inputCudfDataTypes.size() == 1 &&
+        isNumericDataType(inputCudfDataTypes[0]);
+  } else if (expr->isConditional() || expr->isSwitch()) {
+    // NOT YET IMPLEMENTED
+    // JUST REPORT AS SUPPORTED
+    return true;
+  }
+  // others?
 
   // just check by name and input types
   return isFunctionNameAndInputsSupported(funcName, inputCudfDataTypes);
@@ -271,7 +280,7 @@ bool isAstCallTypedExprSupported(const core::CallTypedExpr* expr) {
   const auto funcName =
       stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
 
-  // get inputs
+  // get input types as cudf data types
   std::vector<cudf::data_type> inputCudfDataTypes;
   for (const auto& input : expr->inputs()) {
     inputCudfDataTypes.push_back(
