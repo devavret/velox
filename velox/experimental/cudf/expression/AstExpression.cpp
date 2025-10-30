@@ -160,7 +160,9 @@ const std::unordered_map<std::string, Op> binaryOps = [] {
   return merged;
 }();
 
-const std::map<std::string, Op> unaryOps = {{"not", Op::NOT}};
+const std::map<std::string, Op> unaryOps = {
+    {"not", Op::NOT},
+    {"is_null", Op::IS_NULL}};
 
 namespace detail {
 
@@ -228,24 +230,20 @@ bool isFunctionNameAndInputsSupported(
                cudf::ast::ast_operator::LESS_EQUAL,
                {inputCudfDataTypes[0], inputCudfDataTypes[2]});
   } else if (funcName == "in") {
-    // CHECK THIS
+    // NOT SURE HOW TO TEST THIS
+    // "a IN (1,2,3)" does not work
     return inputCudfDataTypes.size() == 2 &&
         isNumericDataType(inputCudfDataTypes[0]) &&
         inputCudfDataTypes[1].id() == cudf::type_id::LIST;
   } else if (funcName == "cast") {
     // support casting of numeric types only for now
+    // DO WE NEED TO SUPPORT NON-NUMERIC TYPES?
     return inputCudfDataTypes.size() == 1 &&
         isNumericDataType(inputCudfDataTypes[0]);
-  } else if (funcName == "switch") {
-    // NYI
+  } else if (funcName == "switch" || funcName == "if") {
+    // NOT YET IMPLEMENTED
+    // JUST REPORT AS SUPPORTED
     return true;
-  } else if (funcName == "if") {
-    // NYI
-    return true;
-  } else if (funcName == "isnotnull") {
-    return inputCudfDataTypes.size() == 1 &&
-        isOpAndInputsSupported(
-               cudf::ast::ast_operator::IS_NULL, inputCudfDataTypes);
   }
 
   // get regular op from name
