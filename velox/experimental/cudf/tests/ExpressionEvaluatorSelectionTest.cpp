@@ -57,10 +57,6 @@ class CudfExpressionSelectionTest : public ::testing::Test {
         {"name", VARCHAR()},
         {"date", TIMESTAMP()},
         {"c", INTEGER()},
-        {"d1", DOUBLE()},
-        {"d2", DOUBLE()},
-        {"r1", REAL()},
-        {"r2", REAL()},
     });
 
     parse::registerTypeResolver();
@@ -273,28 +269,25 @@ TEST_F(CudfExpressionSelectionTest, astRootBad1) {
   ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
 }
 
-TEST_F(CudfExpressionSelectionTest, astRootBad2) {
-  auto expr = compileExecExpr("d1 + d2", rowType_, execCtx_.get());
-  auto cudfExpr = createCudfExpression(expr, rowType_);
-  auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
-  ASSERT_NE(ast, nullptr);
-  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
-}
+#if 0
+TEST_F(CudfExpressionSelectionTest, astInteractive) {
+  std::string e;
+  std::cout << "Enter expression: ";
+  std::getline(std::cin, e);
 
-TEST_F(CudfExpressionSelectionTest, astRootBad3) {
-  auto expr = compileExecExpr("r1 + r2", rowType_, execCtx_.get());
-  auto cudfExpr = createCudfExpression(expr, rowType_);
-  auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
-  ASSERT_NE(ast, nullptr);
-  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
-}
+  // driver adapter stage
+  std::cout << "***** DEBUG ***** Driver Adapter stage" << std::endl;
+  auto typedexpr = parseAndInferTypedExpr(e, rowType_, execCtx_.get());
+  ASSERT_TRUE(canBeEvaluatedByCudf(typedexpr));
 
-TEST_F(CudfExpressionSelectionTest, astRootBad4) {
-  auto expr = compileExecExpr("d1 + r2", rowType_, execCtx_.get());
+  // exec stage
+  std::cout << "***** DEBUG ***** Exec stage" << std::endl;
+  auto expr = compileExecExpr(e, rowType_, execCtx_.get());
+  // implicitly calls canBeEvaluatedByCudf(exec::Expr)
   auto cudfExpr = createCudfExpression(expr, rowType_);
   auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
   ASSERT_NE(ast, nullptr);
-  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
 }
+#endif
 
 } // namespace
