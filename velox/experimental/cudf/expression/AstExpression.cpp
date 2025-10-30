@@ -206,10 +206,10 @@ bool isOpAndInputsSupported(
   // check for a cuDF implementation of this op with these inputs
   try {
     // this will throw if no matching implementation is found
-    const auto return_cudf_type =
+    const auto returnCudfType =
         cudf::ast::detail::ast_operator_return_type(op, inputCudfDataTypes);
     // check it's a sensible type
-    return return_cudf_type.id() != cudf::type_id::EMPTY;
+    return returnCudfType.id() != cudf::type_id::EMPTY;
   } catch (...) {
     // no matching cuDF implementation
   }
@@ -247,14 +247,14 @@ bool isFunctionNameAndInputsSupported(
   }
 
   // get regular op from name
-  const auto maybe_op = opFromFunctionName(funcName);
-  if (!maybe_op.has_value()) {
+  const auto maybeOp = opFromFunctionName(funcName);
+  if (!maybeOp.has_value()) {
     // not a supported regular op
     return false;
   }
 
   // check op + input types
-  return isOpAndInputsSupported(*maybe_op, inputCudfDataTypes);
+  return isOpAndInputsSupported(*maybeOp, inputCudfDataTypes);
 }
 
 // check if the expression (name + input types) is supported in AST
@@ -262,9 +262,6 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
   // get plain function name
   const auto funcName =
       stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
-
-  std::cout << "***** DEBUG ***** Checking AST Function Support for Expr '"
-            << funcName << "'" << std::endl;
 
   // check special kinds
   if (expr->isConstant()) {
@@ -289,10 +286,6 @@ bool isAstCallTypedExprSupported(const core::CallTypedExpr* expr) {
   // get plain function name
   const auto funcName =
       stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
-
-  std::cout
-      << "***** DEBUG ***** Checking AST Function Support for CallTypedExpr '"
-      << funcName << "'" << std::endl;
 
   // get inputs
   std::vector<cudf::data_type> inputCudfDataTypes;
