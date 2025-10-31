@@ -263,7 +263,7 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     // support casting of numeric types only for now
     // DO WE NEED TO SUPPORT NON-NUMERIC TYPES?
     return inputCudfDataTypes.size() == 1 &&
-        isNumericDataType(inputCudfDataTypes[0]);
+        cudf::is_numeric(inputCudfDataTypes[0]);
   } else if (expr->isConditional() || expr->isSwitch()) {
     // NOT YET IMPLEMENTED
     // JUST REPORT AS SUPPORTED
