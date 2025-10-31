@@ -29,6 +29,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -166,23 +167,6 @@ const std::map<std::string, Op> unaryOps = {
 
 namespace detail {
 
-// check if the data type is numeric
-bool isNumericDataType(const cudf::data_type& dataType) {
-  switch (dataType.id()) {
-    case cudf::type_id::INT8:
-    case cudf::type_id::INT16:
-    case cudf::type_id::INT32:
-    case cudf::type_id::INT64:
-    case cudf::type_id::FLOAT32:
-    case cudf::type_id::FLOAT64:
-      // more needed?
-      return true;
-    default:
-      break;
-  }
-  return false;
-}
-
 // return the AST operator for the given expression name, if any
 std::optional<Op> opFromFunctionName(const std::string& funcName) {
   if (binaryOps.find(funcName) != binaryOps.end()) {
@@ -233,13 +217,13 @@ bool isFunctionNameAndInputsSupported(
     // NOT SURE HOW TO TEST THIS
     // "a IN (1,2,3)" does not work
     return inputCudfDataTypes.size() == 2 &&
-        isNumericDataType(inputCudfDataTypes[0]) &&
+        cudf::is_numeric(inputCudfDataTypes[0]) &&
         inputCudfDataTypes[1].id() == cudf::type_id::LIST;
   } else if (funcName == "cast") {
     // support casting of numeric types only for now
     // DO WE NEED TO SUPPORT NON-NUMERIC TYPES?
     return inputCudfDataTypes.size() == 1 &&
-        isNumericDataType(inputCudfDataTypes[0]);
+        cudf::is_numeric(inputCudfDataTypes[0]);
   } else if (funcName == "switch" || funcName == "if") {
     // NOT YET IMPLEMENTED
     // JUST REPORT AS SUPPORTED
@@ -752,24 +736,37 @@ bool ASTExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
 
 bool ASTExpression::canEvaluate(const core::TypedExprPtr& expr) {
   using core::ExprKind;
+  auto cudfType = veloxToCudfTypeId(expr->type());
   switch (expr->kind()) {
+    case ExprKind::kInput:
+      return false;
     case ExprKind::kFieldAccess:
     case ExprKind::kDereference:
+    // TODO(kn): for pure ast only, check if not nested.
     case ExprKind::kConstant:
-    case ExprKind::kInput:
-      return true;
+      return cudf::is_fixed_width(cudf::data_type{cudfType}) ||
+          cudfType == cudf::type_id::STRING;
     case ExprKind::kCall: {
       const auto* call = expr->asUnchecked<core::CallTypedExpr>();
       return detail::isAstCallTypedExprSupported(call);
     }
     case core::ExprKind::kCast: {
       const auto* cast = expr->asUnchecked<core::CastTypedExpr>();
-      if (cast->isTryCast()) {
-        return false;
-      }
-      return true;
+      // cast->isTryCast() result is same.
+      // TODO (kn): check cast type support for function too. or PureAstOnly?
+      if (cast->type()->kind() == TypeKind::INTEGER ||
+          cast->type()->kind() == TypeKind::BIGINT)
+        return detail::isOpAndInputsSupported(
+            cudf::ast::ast_operator::CAST_TO_INT64,
+            {cudf::data_type{cudfType}});
+      else if (cast->type()->kind() == TypeKind::DOUBLE)
+        return detail::isOpAndInputsSupported(
+            cudf::ast::ast_operator::CAST_TO_FLOAT64,
+            {cudf::data_type{cudfType}});
+      return false;
     }
-
+    case ExprKind::kConcat:
+    case ExprKind::kLambda:
     default:
       return false;
   }
