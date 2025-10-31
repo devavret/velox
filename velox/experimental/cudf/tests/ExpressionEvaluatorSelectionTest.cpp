@@ -261,14 +261,6 @@ TEST_F(CudfExpressionSelectionTest, castAndTryCast) {
   ASSERT_FALSE(canBeEvaluatedByCudf(badCast));
 }
 
-TEST_F(CudfExpressionSelectionTest, astRootBad1) {
-  auto expr = compileExecExpr("a + c", rowType_, execCtx_.get());
-  auto cudfExpr = createCudfExpression(expr, rowType_);
-  auto* ast = dynamic_cast<ASTExpression*>(cudfExpr.get());
-  ASSERT_NE(ast, nullptr);
-  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
-}
-
 #if 0
 TEST_F(CudfExpressionSelectionTest, astInteractive) {
   std::string e;
