@@ -177,7 +177,9 @@ class MemoryManager {
     std::function<size_t(size_t)> getPreferredSize{nullptr};
   };
 
-  explicit MemoryManager(const Options& options = Options{});
+  explicit MemoryManager(
+      const Options& options = Options{},
+      std::shared_ptr<MemoryAllocator> customAllocator = nullptr);
 
   ~MemoryManager();
 

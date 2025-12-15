@@ -672,6 +672,20 @@ void Task::initTaskPool() {
       fmt::format("task.{}", taskId_.c_str()), createTaskReclaimer());
 }
 
+void Task::setGpuPool(std::shared_ptr<memory::MemoryPool> pool) {
+  gpuPool_ = std::move(pool);
+  if (gpuPool_ == nullptr) {
+    return;
+  }
+  if (queryCtx_->pool()->reclaimer() == nullptr ||
+      gpuPool_->reclaimer() != nullptr) {
+    return;
+  }
+  gpuPool_->setReclaimer(
+      Task::MemoryReclaimer::create(
+          shared_from_this(), memoryArbitrationPriority_));
+}
+
 velox::memory::MemoryPool* Task::getOrAddNodePool(
     const core::PlanNodeId& planNodeId) {
   if (nodePools_.count(planNodeId) == 1) {
@@ -3534,7 +3548,15 @@ uint64_t Task::MemoryReclaimer::reclaim(
   if (FOLLY_UNLIKELY(task == nullptr)) {
     return 0;
   }
-  VELOX_CHECK_EQ(task->pool()->name(), pool->name());
+  auto* cpuTaskPool = task->pool();
+  auto* gpuTaskPool = task->gpuPool();
+  VELOX_CHECK(
+      (cpuTaskPool != nullptr && cpuTaskPool->name() == pool->name()) ||
+          (gpuTaskPool != nullptr && gpuTaskPool->name() == pool->name()),
+      "Task::MemoryReclaimer used with unexpected pool {} (cpu: {}, gpu: {})",
+      pool->name(),
+      cpuTaskPool ? cpuTaskPool->name() : "<null>",
+      gpuTaskPool ? gpuTaskPool->name() : "<null>");
 
   uint64_t reclaimWaitTimeUs{0};
   uint64_t reclaimedBytes{0};
@@ -3618,7 +3640,15 @@ void Task::MemoryReclaimer::abort(
   if (FOLLY_UNLIKELY(task == nullptr)) {
     return;
   }
-  VELOX_CHECK_EQ(task->pool()->name(), pool->name());
+  auto* cpuTaskPool = task->pool();
+  auto* gpuTaskPool = task->gpuPool();
+  VELOX_CHECK(
+      (cpuTaskPool != nullptr && cpuTaskPool->name() == pool->name()) ||
+          (gpuTaskPool != nullptr && gpuTaskPool->name() == pool->name()),
+      "Task::MemoryReclaimer abort called with unexpected pool {} (cpu: {}, gpu: {})",
+      pool->name(),
+      cpuTaskPool ? cpuTaskPool->name() : "<null>",
+      gpuTaskPool ? gpuTaskPool->name() : "<null>");
 
   task->setError(error);
   // TODO: respect the memory arbitration request timeout later.

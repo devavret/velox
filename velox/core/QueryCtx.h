@@ -135,6 +135,15 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
     pool_ = std::move(pool);
   }
 
+  /// Returns the GPU query root memory pool if set, otherwise null.
+  memory::MemoryPool* gpuPool() const {
+    return gpuPool_.get();
+  }
+
+  /// Sets the GPU query root pool and attaches a QueryCtx::MemoryReclaimer
+  /// instance to it if not already present.
+  void setGpuPool(std::shared_ptr<memory::MemoryPool> pool);
+
   /// Indicates if the query is under memory arbitration or not.
   bool testingUnderArbitration() const {
     std::lock_guard<std::mutex> l(mutex_);
@@ -225,6 +234,7 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
   std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>
       connectorSessionProperties_;
   std::shared_ptr<memory::MemoryPool> pool_;
+  std::shared_ptr<memory::MemoryPool> gpuPool_;
   QueryConfig queryConfig_;
   std::atomic<uint64_t> numSpilledBytes_{0};
   std::atomic<uint64_t> numTracedBytes_{0};

@@ -133,8 +133,10 @@ class SysMemoryReclaimer : public memory::MemoryReclaimer {
 };
 } // namespace
 
-MemoryManager::MemoryManager(const MemoryManager::Options& options)
-    : allocator_{createAllocator(options)},
+MemoryManager::MemoryManager(
+    const MemoryManager::Options& options,
+    std::shared_ptr<MemoryAllocator> customAllocator)
+    : allocator_{customAllocator ? std::move(customAllocator) : createAllocator(options)},
       arbitrator_(createArbitrator(options)),
       alignment_(std::max(MemoryAllocator::kMinAlignment, options.alignment)),
       checkUsageLeak_(options.checkUsageLeak),

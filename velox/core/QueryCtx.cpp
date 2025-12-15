@@ -103,6 +103,18 @@ void QueryCtx::updateTracedBytesAndCheckLimit(uint64_t bytes) {
   }
 }
 
+void QueryCtx::setGpuPool(std::shared_ptr<memory::MemoryPool> pool) {
+  gpuPool_ = std::move(pool);
+  if (gpuPool_ == nullptr) {
+    return;
+  }
+  if (gpuPool_->reclaimer() != nullptr) {
+    return;
+  }
+  gpuPool_->setReclaimer(
+      QueryCtx::MemoryReclaimer::create(this, gpuPool_.get()));
+}
+
 std::unique_ptr<memory::MemoryReclaimer> QueryCtx::MemoryReclaimer::create(
     QueryCtx* queryCtx,
     memory::MemoryPool* pool) {

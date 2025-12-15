@@ -27,6 +27,8 @@ add_executable(velox_cudf_table_scan_test Main.cpp TableScanTest.cpp)
 # Disabling writer tests until we re-add writing ability to CudfHiveConnector
 # add_executable(velox_cudf_table_write_test Main.cpp TableWriteTest.cpp)
 add_executable(velox_cudf_topn_test Main.cpp TopNTest.cpp)
+add_executable(velox_cudf_rmm_allocator_test Main.cpp RmmMemoryAllocatorTest.cpp)
+add_executable(velox_cudf_memory_reclaimer_test Main.cpp MemoryReclaimerTest.cpp)
 
 add_test(
   NAME velox_cudf_aggregation_test
@@ -111,6 +113,16 @@ add_test(
   COMMAND velox_cudf_topn_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+add_test(
+  NAME velox_cudf_rmm_allocator_test
+  COMMAND velox_cudf_rmm_allocator_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(
+  NAME velox_cudf_memory_reclaimer_test
+  COMMAND velox_cudf_memory_reclaimer_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 set_tests_properties(velox_cudf_hash_join_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_order_by_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
@@ -131,6 +143,8 @@ set_tests_properties(velox_cudf_subfield_filter_ast_test PROPERTIES LABELS cuda_
 set_tests_properties(velox_cudf_table_scan_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 # set_tests_properties(velox_cudf_table_write_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_topn_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
+set_tests_properties(velox_cudf_rmm_allocator_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
+set_tests_properties(velox_cudf_memory_reclaimer_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 
 target_link_libraries(
   velox_cudf_aggregation_test
@@ -272,6 +286,30 @@ target_link_libraries(
 
 target_link_libraries(
   velox_cudf_topn_test
+  velox_cudf_exec
+  velox_exec
+  velox_exec_test_lib
+  velox_test_util
+  gtest
+  gtest_main
+  fmt::fmt
+)
+
+target_compile_options(velox_cudf_rmm_allocator_test PRIVATE -g -O0)
+
+target_link_libraries(
+  velox_cudf_rmm_allocator_test
+  velox_cudf_exec
+  velox_exec_test_lib
+  velox_exec
+  velox_test_util
+  gtest
+  gtest_main
+  fmt::fmt
+)
+
+target_link_libraries(
+  velox_cudf_memory_reclaimer_test
   velox_cudf_exec
   velox_exec
   velox_exec_test_lib

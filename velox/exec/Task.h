@@ -152,6 +152,15 @@ class Task : public std::enable_shared_from_this<Task> {
     return pool_.get();
   }
 
+  /// Returns the GPU task memory pool if set, otherwise null.
+  memory::MemoryPool* gpuPool() const {
+    return gpuPool_.get();
+  }
+
+  /// Sets the GPU task pool and attaches a Task::MemoryReclaimer instance to it
+  /// if not already present.
+  void setGpuPool(std::shared_ptr<memory::MemoryPool> pool);
+
   /// Returns query trace config if specified.
   const std::optional<TraceConfig>& traceConfig() const {
     return traceConfig_;
@@ -1175,6 +1184,8 @@ class Task : public std::enable_shared_from_this<Task> {
   // Root MemoryPool for this Task. All member variables that hold references
   // to pool_ must be defined after pool_, childPools_.
   std::shared_ptr<memory::MemoryPool> pool_;
+  // Optional GPU root MemoryPool for this Task.
+  std::shared_ptr<memory::MemoryPool> gpuPool_;
 
   // Keep driver and operator memory pools alive for the duration of the task
   // to allow for sharing vectors across drivers without copy.

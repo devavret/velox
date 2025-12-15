@@ -24,6 +24,7 @@ add_library(
   CudfOrderBy.cpp
   CudfTopN.cpp
   DebugUtil.cpp
+  RmmMemoryAllocator.cpp
   ToCudf.cpp
   Utilities.cpp
   VeloxCudfInterop.cpp
