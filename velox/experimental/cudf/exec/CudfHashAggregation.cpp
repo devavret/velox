@@ -489,10 +489,22 @@ bool hasFinalAggs(
   });
 }
 
-auto toAggregators(
+enum class AggregatorResultTypeMode {
+  // Use intermediate types for partial output steps, otherwise use the plan
+  // node's output type.
+  kFromPlanNodeOutputUnlessPartial,
+
+  // Always use intermediate-state types (used for streaming final merge
+  // accumulation).
+  kAlwaysIntermediate,
+};
+
+auto buildAggregators(
     core::AggregationNode const& aggregationNode,
-    exec::OperatorCtx const& operatorCtx) {
-  auto const step = aggregationNode.step();
+    exec::OperatorCtx const& operatorCtx,
+    core::AggregationNode::Step baseStep,
+    bool applyCompanionStepOverride,
+    AggregatorResultTypeMode resultTypeMode) {
   bool const isGlobal = aggregationNode.groupingKeys().empty();
   auto const& inputRowSchema = aggregationNode.sources()[0]->outputType();
   const auto numKeys = aggregationNode.groupingKeys().size();
@@ -534,16 +546,33 @@ auto toAggregators(
     auto const kind = aggregate.call->name();
     auto const inputIndex = aggInputs[0];
     auto const constant = aggConstants.empty() ? nullptr : aggConstants[0];
-    auto const companionStep = getCompanionStep(kind, step);
+
+    auto const step = applyCompanionStepOverride
+        ? getCompanionStep(kind, baseStep)
+        : baseStep;
+
     const auto originalName = getOriginalName(kind);
-    const auto resultType = exec::isPartialOutput(companionStep)
+    const auto resultType =
+        (resultTypeMode == AggregatorResultTypeMode::kAlwaysIntermediate ||
+         exec::isPartialOutput(step))
         ? exec::resolveIntermediateType(originalName, aggregate.rawInputTypes)
         : outputType->childAt(numKeys + i);
 
     aggregators.push_back(createAggregator(
-        companionStep, kind, inputIndex, constant, isGlobal, resultType));
+        step, kind, inputIndex, constant, isGlobal, resultType));
   }
   return aggregators;
+}
+
+auto toAggregators(
+    core::AggregationNode const& aggregationNode,
+    exec::OperatorCtx const& operatorCtx) {
+  return buildAggregators(
+      aggregationNode,
+      operatorCtx,
+      aggregationNode.step(),
+      /*applyCompanionStepOverride*/ true,
+      AggregatorResultTypeMode::kFromPlanNodeOutputUnlessPartial);
 }
 
 auto toIntermediateAggregators(
@@ -575,6 +604,46 @@ auto toIntermediateAggregators(
     }
   }
   return aggregators;
+}
+
+auto toFinalMergeAggregators(
+    core::AggregationNode const& aggregationNode,
+    exec::OperatorCtx const& operatorCtx) {
+  // For final streaming aggregation we want to keep a merged intermediate state
+  // (kIntermediate) and only extract to final output types once at the end.
+  //
+  // NOTE: We explicitly do NOT apply the companion step override here (e.g.
+  // *_merge_extract) because we need merge semantics (kIntermediate) while
+  // accumulating the streaming state.
+  return buildAggregators(
+      aggregationNode,
+      operatorCtx,
+      core::AggregationNode::Step::kIntermediate,
+      /*applyCompanionStepOverride*/ false,
+      AggregatorResultTypeMode::kAlwaysIntermediate);
+}
+
+RowTypePtr finalMergeOutputType(core::AggregationNode const& aggregationNode) {
+  // Start from the plan node output schema (keys + final outputs) and replace
+  // the aggregate output types with their intermediate-state types. This keeps
+  // names and ordering consistent with the plan node.
+  const auto outputRowType = asRowType(aggregationNode.outputType());
+  const auto numKeys = aggregationNode.groupingKeys().size();
+
+  std::vector<std::string> names = outputRowType->names();
+  std::vector<TypePtr> types = outputRowType->children();
+
+  VELOX_CHECK_EQ(names.size(), types.size());
+  VELOX_CHECK_GE(types.size(), numKeys + aggregationNode.aggregates().size());
+
+  for (auto i = 0; i < aggregationNode.aggregates().size(); ++i) {
+    auto const& aggregate = aggregationNode.aggregates()[i];
+    const auto originalName = getOriginalName(aggregate.call->name());
+    types[numKeys + i] =
+        exec::resolveIntermediateType(originalName, aggregate.rawInputTypes);
+  }
+
+  return ROW(std::move(names), std::move(types));
 }
 
 } // namespace
@@ -627,6 +696,16 @@ void CudfHashAggregation::initialize() {
   aggregators_ = toAggregators(*aggregationNode_, *operatorCtx_);
   intermediateAggregators_ =
       toIntermediateAggregators(*aggregationNode_, *operatorCtx_);
+
+  // Prepare final streaming state if this is a final aggregation with GROUP BY.
+  // We keep a merged intermediate state per group and only extract to final
+  // output types in getOutput() once all input has arrived.
+  if (aggregationNode_->step() == core::AggregationNode::Step::kFinal &&
+      !isGlobal_ && !isDistinct_ && numAggregates_ > 0) {
+    finalMergeOutputType_ = finalMergeOutputType(*aggregationNode_);
+    finalMergeAggregators_ =
+        toFinalMergeAggregators(*aggregationNode_, *operatorCtx_);
+  }
 
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
@@ -682,6 +761,7 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
       tbl->getTableView(),
       groupingKeyInputChannels_,
       aggregators_,
+      outputType_,
       inputTableStream);
 
   // If we already have partial output, concatenate the new results with it.
@@ -708,6 +788,7 @@ void CudfHashAggregation::computeIntermediateGroupbyPartial(CudfVectorPtr tbl) {
         concatenatedTable->view(),
         groupingKeyOutputChannels_,
         intermediateAggregators_,
+        outputType_,
         partialOutputStream);
     partialOutput_ = compactedOutput;
   } else {
@@ -746,6 +827,7 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
     auto distinctOutput = getDistinctKeys(
         concatenatedTable->view(),
         groupingKeyOutputChannels_,
+        outputType_,
         inputTableStream);
     partialOutput_ = distinctOutput;
   } else {
@@ -753,8 +835,54 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
     // distinct. Use getTableView() to avoid expensive materialization for
     // packed_table. tbl stays alive during this function call.
     partialOutput_ = getDistinctKeys(
-        tbl->getTableView(), groupingKeyInputChannels_, inputTableStream);
+        tbl->getTableView(),
+        groupingKeyInputChannels_,
+        outputType_,
+        inputTableStream);
   }
+}
+
+void CudfHashAggregation::computeFinalGroupbyStreaming(CudfVectorPtr tbl) {
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat("finalStreamingBatches", RuntimeCounter(1));
+  }
+
+  auto inputTableStream = tbl->stream();
+  const bool inputKeysAlreadyFirst =
+      groupingKeyInputChannels_ == groupingKeyOutputChannels_;
+
+  VELOX_CHECK(
+      inputKeysAlreadyFirst,
+      "Final streaming aggregation expects input batches to be in "
+      "'keys first, then aggregates' layout. groupingKeyInputChannels_.size={} "
+      "groupingKeyOutputChannels_.size={}",
+      groupingKeyInputChannels_.size(),
+      groupingKeyOutputChannels_.size());
+
+  // Input is already in keys-first layout. Avoid an extra groupby by doing
+  // concatenate + single merge-groupby.
+  if (!finalMergeOutput_) {
+    finalMergeOutput_ = tbl;
+    return;
+  }
+
+  std::vector<cudf::table_view> tablesToConcat;
+  tablesToConcat.push_back(finalMergeOutput_->getTableView());
+  tablesToConcat.push_back(tbl->getTableView());
+
+  auto finalStream = finalMergeOutput_->stream();
+  cudf::detail::join_streams(
+      std::vector<rmm::cuda_stream_view>{inputTableStream}, finalStream);
+
+  auto concatenatedTable = cudf::concatenate(tablesToConcat, finalStream);
+  auto compactedOutput = doGroupByAggregation(
+      concatenatedTable->view(),
+      groupingKeyOutputChannels_,
+      finalMergeAggregators_,
+      finalMergeOutputType_,
+      finalStream);
+  finalMergeOutput_ = compactedOutput;
 }
 
 void CudfHashAggregation::addInput(RowVectorPtr input) {
@@ -778,7 +906,19 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
     return;
   }
 
-  // Handle final aggregation or global cases.
+  // Streaming final GROUP BY: keep a merged intermediate state as input
+  // arrives.
+  if (!isPartialOutput_ && !isGlobal_ && !isDistinct_ &&
+      !finalMergeAggregators_.empty()) {
+    computeFinalGroupbyStreaming(cudfInput);
+    return;
+  }
+
+  // Handle non-streaming final aggregation or global cases.
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat("finalBufferedInputBatches", RuntimeCounter(1));
+  }
   inputs_.push_back(std::move(cudfInput));
 }
 
@@ -786,6 +926,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     cudf::table_view tableView,
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
+    TypePtr const& outputType,
     rmm::cuda_stream_view stream) {
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
@@ -831,22 +972,23 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   }
 
   return std::make_shared<cudf_velox::CudfVector>(
-      pool(), outputType_, numRows, std::move(resultTable), stream);
+      pool(), outputType, numRows, std::move(resultTable), stream);
 }
 
 CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
     cudf::table_view tableView,
+    TypePtr const& outputType,
     rmm::cuda_stream_view stream) {
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(aggregators_.size());
   for (auto i = 0; i < aggregators_.size(); i++) {
     resultColumns.push_back(
-        aggregators_[i]->doReduce(tableView, outputType_->childAt(i), stream));
+        aggregators_[i]->doReduce(tableView, outputType->childAt(i), stream));
   }
 
   return std::make_shared<cudf_velox::CudfVector>(
       pool(),
-      outputType_,
+      outputType,
       1,
       std::make_unique<cudf::table>(std::move(resultColumns)),
       stream);
@@ -855,6 +997,7 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
 CudfVectorPtr CudfHashAggregation::getDistinctKeys(
     cudf::table_view tableView,
     std::vector<column_index_t> const& groupByKeys,
+    TypePtr const& outputType,
     rmm::cuda_stream_view stream) {
   auto result = cudf::distinct(
       tableView.select(groupByKeys.begin(), groupByKeys.end()),
@@ -872,7 +1015,7 @@ CudfVectorPtr CudfHashAggregation::getDistinctKeys(
   }
 
   return std::make_shared<cudf_velox::CudfVector>(
-      pool(), outputType_, numRows, std::move(result), stream);
+      pool(), outputType, numRows, std::move(result), stream);
 }
 
 CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
@@ -926,6 +1069,28 @@ RowVectorPtr CudfHashAggregation::getOutput() {
     return nullptr;
   }
 
+  // Final streaming GROUP BY: extract once at end.
+  if (!isPartialOutput_ && !isGlobal_ && !isDistinct_ &&
+      !finalMergeAggregators_.empty()) {
+    if (!noMoreInput_) {
+      return nullptr;
+    }
+    finished_ = true;
+    if (!finalMergeOutput_) {
+      return nullptr;
+    }
+    auto stream = finalMergeOutput_->stream();
+    auto result = doGroupByAggregation(
+        finalMergeOutput_->getTableView(),
+        groupingKeyOutputChannels_,
+        aggregators_,
+        outputType_,
+        stream);
+    stream.synchronize();
+    finalMergeOutput_.reset();
+    return result;
+  }
+
   if (inputs_.empty() && !noMoreInput_) {
     return nullptr;
   }
@@ -947,12 +1112,17 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   // Use tbl->view() instead of moving the table.
   // tbl stays alive until the end of this function, keeping the view valid.
   if (isDistinct_) {
-    return getDistinctKeys(tbl->view(), groupingKeyInputChannels_, stream);
+    return getDistinctKeys(
+        tbl->view(), groupingKeyInputChannels_, outputType_, stream);
   } else if (isGlobal_) {
-    return doGlobalAggregation(tbl->view(), stream);
+    return doGlobalAggregation(tbl->view(), outputType_, stream);
   } else {
     return doGroupByAggregation(
-        tbl->view(), groupingKeyInputChannels_, aggregators_, stream);
+        tbl->view(),
+        groupingKeyInputChannels_,
+        aggregators_,
+        outputType_,
+        stream);
   }
 }
 

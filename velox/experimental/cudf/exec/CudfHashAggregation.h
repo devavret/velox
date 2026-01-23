@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/exec/Operator.h"
+#include "velox/type/Type.h"
 
 #include <cudf/groupby.hpp>
 
@@ -101,13 +102,16 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
       cudf::table_view tableView,
       std::vector<column_index_t> const& groupByKeys,
       std::vector<std::unique_ptr<Aggregator>>& aggregators,
+      TypePtr const& outputType,
       rmm::cuda_stream_view stream);
   CudfVectorPtr doGlobalAggregation(
       cudf::table_view tableView,
+      TypePtr const& outputType,
       rmm::cuda_stream_view stream);
   CudfVectorPtr getDistinctKeys(
       cudf::table_view tableView,
       std::vector<column_index_t> const& groupByKeys,
+      TypePtr const& outputType,
       rmm::cuda_stream_view stream);
 
   CudfVectorPtr releaseAndResetPartialOutput();
@@ -149,7 +153,15 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   void computeIntermediateDistinctPartial(CudfVectorPtr tbl);
 
+  void computeFinalGroupbyStreaming(CudfVectorPtr tbl);
+
   CudfVectorPtr partialOutput_;
+
+  // Streaming state for final (non-partial) aggregation. We keep a merged
+  // intermediate state and extract to final output types once at the end.
+  RowTypePtr finalMergeOutputType_;
+  std::vector<std::unique_ptr<Aggregator>> finalMergeAggregators_;
+  CudfVectorPtr finalMergeOutput_;
 };
 
 } // namespace facebook::velox::cudf_velox

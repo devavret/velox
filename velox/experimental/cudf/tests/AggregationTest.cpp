@@ -593,6 +593,49 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
           .customStats.count("flushRowCount"));
 }
 
+TEST_F(AggregationTest, finalAggregationStreamsOnAddInput) {
+  auto vectors = {
+      makeRowVector({makeFlatVector<int32_t>(
+          100, [](auto row) { return row; }, nullEvery(5))}),
+      makeRowVector({makeFlatVector<int32_t>(
+          110, [](auto row) { return row + 29; }, nullEvery(7))}),
+      makeRowVector({makeFlatVector<int32_t>(
+          90, [](auto row) { return row - 71; }, nullEvery(7))}),
+  };
+
+  createDuckDbTable(vectors);
+
+  // Force the final aggregation to see multiple addInput() calls by inserting a
+  // local partition between partial and final, and using multiple drivers.
+  core::PlanNodeId partialAggId;
+  core::PlanNodeId finalAggId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .maxDrivers(4)
+                  .plan(
+                      PlanBuilder()
+                          .values(vectors)
+                          .partialAggregation({"c0"}, {"sum(c0)"})
+                          .capturePlanNodeId(partialAggId)
+                          .localPartition({"c0"})
+                          .finalAggregation()
+                          .capturePlanNodeId(finalAggId)
+                          .planNode())
+                  .assertResults("SELECT c0, sum(c0) FROM tmp GROUP BY 1");
+
+  const auto planStats = toPlanStats(task->taskStats());
+
+  const auto finalStreamingBatches =
+      planStats.at(finalAggId).customStats.at("finalStreamingBatches").sum;
+  EXPECT_GT(finalStreamingBatches, 1);
+
+  const auto& finalCustomStats = planStats.at(finalAggId).customStats;
+  const auto finalBufferedBatches =
+      finalCustomStats.count("finalBufferedInputBatches")
+      ? finalCustomStats.at("finalBufferedInputBatches").sum
+      : 0;
+  EXPECT_EQ(finalBufferedBatches, 0);
+}
+
 class EmptyInputAggregationTest : public AggregationTest {
  protected:
   void SetUp() override {
