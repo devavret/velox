@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
+#include "velox/experimental/cudf/exec/CudfBatchConcat.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
@@ -355,6 +356,18 @@ bool CompileState::compile(bool allowCpuFallback) {
     } else if (
         auto localExchangeOp = dynamic_cast<exec::LocalExchange*>(oper)) {
       keepOperator = 1;
+      // Insert a GPU batch concatenation operator after LocalExchange if the
+      // next operator consumes GPU input. This coalesces potentially small
+      // exchanged batches into larger ones before launching cuDF kernels.
+      if (operatorIndex < operators.size() - 1 &&
+          acceptsGpuInput(operators[operatorIndex + 1])) {
+        auto planNode = getPlanNode(oper->planNodeId());
+        replaceOp.push_back(std::make_unique<CudfBatchConcat>(
+            id,
+            ctx,
+            planNode->outputType(),
+            planNode->id() + "-batch-concat"));
+      }
     } else if (
         auto assignUniqueIdOp = dynamic_cast<exec::AssignUniqueId*>(oper)) {
       auto planNode = std::dynamic_pointer_cast<const core::AssignUniqueIdNode>(
@@ -411,7 +424,7 @@ bool CompileState::compile(bool allowCpuFallback) {
     // as-is
     auto condition = (GpuReplacedOperator(oper) && !replaceOp.empty() &&
                       keepOperator == 0) ||
-        (GpuRetainedOperator(oper) && replaceOp.empty() && keepOperator == 1);
+        (GpuRetainedOperator(oper) && keepOperator == 1);
     if (CudfConfig::getInstance().debugEnabled) {
       LOG(INFO) << "GpuReplacedOperator = " << GpuReplacedOperator(oper)
                 << ", GpuRetainedOperator = " << GpuRetainedOperator(oper)
