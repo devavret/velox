@@ -689,26 +689,6 @@ class Connector {
         "Connector {} does not support index source", connectorId());
   }
 
-#ifdef VELOX_ENABLE_BACKWARD_COMPATIBILITY
-  virtual std::shared_ptr<IndexSource> createIndexSource(
-      const RowTypePtr& inputType,
-      size_t numJoinKeys,
-      const std::vector<std::shared_ptr<core::IndexLookupCondition>>&
-          joinConditions,
-      const RowTypePtr& outputType,
-      const ConnectorTableHandlePtr& tableHandle,
-      const connector::ColumnHandleMap& columnHandles,
-      ConnectorQueryCtx* connectorQueryCtx) {
-    return createIndexSource(
-        inputType,
-        joinConditions,
-        outputType,
-        tableHandle,
-        columnHandles,
-        connectorQueryCtx);
-  }
-#endif
-
   virtual std::unique_ptr<DataSink> createDataSink(
       RowTypePtr inputType,
       ConnectorInsertTableHandlePtr connectorInsertTableHandle,
@@ -739,6 +719,29 @@ class Connector {
   /// data/index sources.
   static inline const std::string kTotalRemainingFilterTime{
       "totalRemainingFilterWallNanos"};
+
+  /// Total time spent waiting for synchronously issued IO or for an in-progress
+  /// read-ahead to finish.
+  static inline const std::string kIoWaitWallNanos{"ioWaitWallNanos"};
+
+  /// Time spent waiting for remote storage reads (S3, HDFS, etc.)
+  static inline const std::string kStorageReadWallNanos{"storageReadWallNanos"};
+
+  /// Time spent waiting for SSD cache reads.
+  static inline const std::string kSsdCacheReadWallNanos{
+      "ssdCacheReadWallNanos"};
+
+  /// Time spent waiting for EXCLUSIVE cache entries (another thread is
+  /// loading).
+  static inline const std::string kCacheWaitWallNanos{"cacheWaitWallNanos"};
+
+  /// Time spent waiting for coalesced loads from SSD cache.
+  static inline const std::string kCoalescedSsdLoadWallNanos{
+      "coalescedSsdLoadWallNanos"};
+
+  /// Time spent waiting for coalesced loads from remote storage.
+  static inline const std::string kCoalescedStorageLoadWallNanos{
+      "coalescedStorageLoadWallNanos"};
 
  private:
   static void unregisterTracker(cache::ScanTracker* tracker);
