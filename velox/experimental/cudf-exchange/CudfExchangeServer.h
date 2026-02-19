@@ -25,6 +25,7 @@
 #include <future>
 #include <memory>
 #include <tuple>
+#include <rmm/cuda_stream_view.hpp>
 #include "velox/experimental/cudf-exchange/CommElement.h"
 #include "velox/experimental/cudf-exchange/EndpointRef.h"
 #include "velox/experimental/cudf-exchange/PartitionKey.h"
@@ -130,6 +131,7 @@ class CudfExchangeServer
 
   std::atomic<ServerState> state_;
   std::unique_ptr<cudf::packed_columns> dataPtr_{nullptr};
+  rmm::cuda_stream_view dataStream_{rmm::cuda_stream_default};
   std::recursive_mutex dataMutex_; // mutex for above ptr.
   std::atomic<bool> closed_{false};
 

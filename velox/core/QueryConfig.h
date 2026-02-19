@@ -1026,7 +1026,7 @@ class QueryConfig {
   }
 
   int64_t cudfPartitionedOutputBatchRows() const {
-    return get<int64_t>(kCudfPartitionedOutputBatchRows, 10'000);
+    return get<int64_t>(kCudfPartitionedOutputBatchRows, 10'000'000);
   }
 
   uint64_t preferredOutputBatchBytes() const {

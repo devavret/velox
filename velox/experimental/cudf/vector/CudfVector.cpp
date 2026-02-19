@@ -101,9 +101,9 @@ void logDefaultStreamIfNeeded(
   if (stream.value() != rmm::cuda_stream_default.value()) {
     return;
   }
-  LOG(WARNING) << constructorName
-               << " constructed with default CUDA stream. Backtrace:\n"
-               << process::StackTrace().toString();
+  // LOG(WARNING) << constructorName
+  //              << " constructed with default CUDA stream. Backtrace:\n"
+  //              << process::StackTrace().toString();
 }
 
 } // namespace

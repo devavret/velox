@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf-exchange/Communicator.h"
 #include "velox/experimental/cudf-exchange/CudfExchangeProtocol.h"
 #include "velox/experimental/cudf-exchange/IntraNodeTransferRegistry.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 
 namespace facebook::velox::cudf_exchange {
 
@@ -110,6 +111,11 @@ void CudfExchangeServer::process() {
                 self->dataPtr_ == nullptr,
                 "Data pointer exists: Illegal state!");
             self->dataPtr_ = std::move(data);
+            // Always propagate a non-default stream through intra-node handoff.
+            // Data is synchronized by producer before enqueue, so this stream is
+            // used for ordering/context and to avoid default-stream fallbacks.
+            self->dataStream_ =
+                facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
             self->setState(ServerState::DataReady);
             self->communicator_->addToWorkQueue(self);
           });
@@ -225,10 +231,12 @@ void CudfExchangeServer::sendData() {
       IntraNodeTransferKey key{
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
       // Pass default stream since data is already synchronized (the producer
-      // calls stream.synchronize() before enqueuing).
+      // calls stream.synchronize() before enqueuing). We still pass a
+      // non-default pooled stream so downstream operators avoid default-stream
+      // behavior while preserving correctness.
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
-              key, sharedData, rmm::cuda_stream_default, /*atEnd=*/false);
+              key, sharedData, dataStream_, /*atEnd=*/false);
       intraNodeAtEndPublished_ = false;
 
       // Transition to WaitingForIntraNodeRetrieve state
@@ -245,7 +253,7 @@ void CudfExchangeServer::sendData() {
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
       intraNodeRetrieveFuture_ =
           IntraNodeTransferRegistry::getInstance()->publish(
-              key, nullptr, rmm::cuda_stream_default, /*atEnd=*/true);
+              key, nullptr, dataStream_, /*atEnd=*/true);
       intraNodeAtEndPublished_ = true;
 
       queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
