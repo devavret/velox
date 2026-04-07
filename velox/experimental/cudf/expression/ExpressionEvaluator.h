@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "velox/expression/Expr.h"
+#include "velox/core/Expressions.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/type/Type.h"
 
@@ -72,7 +72,7 @@ class CudfFunction {
 
 using CudfFunctionFactory = std::function<std::shared_ptr<CudfFunction>(
     const std::string& name,
-    const std::shared_ptr<velox::exec::Expr>& expr)>;
+    const core::TypedExprPtr& expr)>;
 
 struct CudfFunctionSpec {
   CudfFunctionFactory factory;
@@ -108,10 +108,10 @@ class CudfExpression {
 using CudfExpressionPtr = std::shared_ptr<CudfExpression>;
 
 using CudfExpressionEvaluatorCanEvaluate =
-    std::function<bool(std::shared_ptr<velox::exec::Expr> expr)>;
+    std::function<bool(const core::TypedExprPtr& expr)>;
 using CudfExpressionEvaluatorCreate =
     std::function<std::shared_ptr<CudfExpression>(
-        std::shared_ptr<velox::exec::Expr> expr,
+        const core::TypedExprPtr& expr,
         const RowTypePtr& inputRowSchema)>;
 
 // Register a CudfExpression evaluator.
@@ -130,7 +130,7 @@ bool registerCudfExpressionEvaluator(
 class FunctionExpression : public CudfExpression {
  public:
   static std::shared_ptr<FunctionExpression> create(
-      const std::shared_ptr<velox::exec::Expr>& expr,
+      const core::TypedExprPtr& expr,
       const RowTypePtr& inputRowSchema);
 
   // TODO (dm): A storage for keeping results in case this is a multiply
@@ -146,10 +146,10 @@ class FunctionExpression : public CudfExpression {
 
   // Check if this specific operation can be evaluated by FunctionExpression
   // (does not recursively check children)
-  static bool canEvaluate(std::shared_ptr<velox::exec::Expr> expr);
+  static bool canEvaluate(const core::TypedExprPtr& expr);
 
  private:
-  std::shared_ptr<velox::exec::Expr> expr_;
+  core::TypedExprPtr expr_;
   std::shared_ptr<CudfFunction> function_;
   std::vector<std::shared_ptr<CudfExpression>> subexpressions_;
 
@@ -157,7 +157,7 @@ class FunctionExpression : public CudfExpression {
 };
 
 std::shared_ptr<CudfExpression> createCudfExpression(
-    std::shared_ptr<velox::exec::Expr> expr,
+    const core::TypedExprPtr& expr,
     const RowTypePtr& inputRowSchema,
     std::optional<std::string> except = std::nullopt);
 
@@ -168,7 +168,7 @@ std::shared_ptr<CudfExpression> createCudfExpression(
 ///             if false, only check if the top-level operation is supported
 ///             (useful when delegating to subexpressions)
 bool canBeEvaluatedByCudf(
-    std::shared_ptr<velox::exec::Expr> expr,
+    const core::TypedExprPtr& expr,
     bool deep = true);
 
 } // namespace facebook::velox::cudf_velox

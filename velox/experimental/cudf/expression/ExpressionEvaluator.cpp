@@ -17,9 +17,8 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/expression/TypedExprUtils.h"
 
-#include "velox/expression/ConstantExpr.h"
-#include "velox/expression/FieldReference.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/expression/SignatureBinder.h"
 #include "velox/type/Type.h"
@@ -47,6 +46,10 @@
 namespace facebook::velox::cudf_velox {
 namespace {
 
+std::string constantToString(const core::TypedExprPtr& expr) {
+  return constantValueVector(expr)->toString(0);
+}
+
 struct CudfExpressionEvaluatorEntry {
   int priority;
   CudfExpressionEvaluatorCanEvaluate canEvaluate;
@@ -72,11 +75,11 @@ static void ensureBuiltinExpressionEvaluatorsRegistered() {
   registerCudfExpressionEvaluator(
       "function",
       kFunctionPriority,
-      [](std::shared_ptr<velox::exec::Expr> expr) {
-        return FunctionExpression::canEvaluate(std::move(expr));
+      [](const core::TypedExprPtr& expr) {
+        return FunctionExpression::canEvaluate(expr);
       },
-      [](std::shared_ptr<velox::exec::Expr> expr, const RowTypePtr& row) {
-        return FunctionExpression::create(std::move(expr), row);
+      [](const core::TypedExprPtr& expr, const RowTypePtr& row) {
+        return FunctionExpression::create(expr, row);
       },
       /*overwrite=*/false);
 
@@ -108,12 +111,12 @@ std::unordered_map<std::string, CudfFunctionSpec>& getCudfFunctionRegistry() {
 namespace {
 
 static bool matchCallAgainstSignatures(
-    const velox::exec::Expr& call,
+    const core::TypedExprPtr& call,
     const std::vector<exec::FunctionSignaturePtr>& sigs) {
-  const auto n = call.inputs().size();
+  const auto n = call->inputs().size();
   std::vector<TypePtr> argTypes;
   argTypes.reserve(n);
-  for (const auto& in : call.inputs()) {
+  for (const auto& in : call->inputs()) {
     argTypes.push_back(in->type());
   }
   for (const auto& sig : sigs) {
@@ -127,7 +130,7 @@ static bool matchCallAgainstSignatures(
     const size_t fixed = std::min(constArgs.size(), n);
     bool ok = true;
     for (size_t i = 0; i < fixed; ++i) {
-      if (constArgs[i] && call.inputs()[i]->name() != "literal") {
+      if (constArgs[i] && !call->inputs()[i]->isConstantKind()) {
         ok = false;
         break;
       }
@@ -144,18 +147,12 @@ static bool matchCallAgainstSignatures(
 
 class SplitFunction : public CudfFunction {
  public:
-  SplitFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
+  SplitFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK(expr->inputs()[1]->isConstantKind(), "split delimiter must be a constant");
+    delimiter_ = constantToString(expr->inputs()[1]);
 
-    auto delimiterExpr =
-        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
-    VELOX_CHECK_NOT_NULL(delimiterExpr, "split delimiter must be a constant");
-    delimiter_ = delimiterExpr->value()->toString(0);
-
-    auto limitExpr =
-        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr->inputs()[2]);
-    VELOX_CHECK_NOT_NULL(limitExpr, "split limit must be a constant");
-    maxSplitCount_ = std::stoll(limitExpr->value()->toString(0));
+    VELOX_CHECK(expr->inputs()[2]->isConstantKind(), "split limit must be a constant");
+    maxSplitCount_ = std::stoll(constantToString(expr->inputs()[2]));
 
     // Presto specifies maxSplitCount as the maximum size of the returned array
     // while cuDF understands the parameter as how many splits can it perform.
@@ -179,7 +176,7 @@ class SplitFunction : public CudfFunction {
 
 class CastFunction : public CudfFunction {
  public:
-  CastFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  CastFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 1, "cast expects exactly 1 input");
 
     targetCudfType_ =
@@ -211,15 +208,13 @@ class CastFunction : public CudfFunction {
 // function.
 class DateAddFunction : public CudfFunction {
  public:
-  DateAddFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  DateAddFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 2, "date_add function expects exactly 2 inputs");
     VELOX_CHECK(
         expr->inputs()[0]->type()->isDate(),
         "First argument to date_add must be a date");
-    VELOX_CHECK_NULL(
-        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-            expr->inputs()[0]));
+    VELOX_CHECK(!expr->inputs()[0]->isConstantKind());
     // The date_add second argument could be int8_t, int16_t, int32_t.
     value_ = makeScalarFromConstantExpr(
         expr->inputs()[1], cudf::type_id::DURATION_DAYS);
@@ -245,7 +240,7 @@ class DateAddFunction : public CudfFunction {
 
 class CardinalityFunction : public CudfFunction {
  public:
-  CardinalityFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  CardinalityFunction(const core::TypedExprPtr& expr) {
     // Cardinality doesn't need any pre-computed scalars, just validates input
     // count
     VELOX_CHECK_EQ(
@@ -263,17 +258,15 @@ class CardinalityFunction : public CudfFunction {
 
 class RoundFunction : public CudfFunction {
  public:
-  explicit RoundFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  explicit RoundFunction(const core::TypedExprPtr& expr) {
     const auto argSize = expr->inputs().size();
     VELOX_CHECK(argSize >= 1 && argSize <= 2, "round expects 1 or 2 inputs");
-    VELOX_CHECK_NULL(
-        std::dynamic_pointer_cast<exec::ConstantExpr>(expr->inputs()[0]),
-        "round expects first column is not literal");
+    VELOX_CHECK(!expr->inputs()[0]->isConstantKind(), "round expects first column is not literal");
     if (argSize == 2) {
-      auto scaleExpr =
-          std::dynamic_pointer_cast<exec::ConstantExpr>(expr->inputs()[1]);
-      VELOX_CHECK_NOT_NULL(scaleExpr, "round scale must be a constant");
-      scale_ = scaleExpr->value()->as<SimpleVector<int32_t>>()->valueAt(0);
+      VELOX_CHECK(expr->inputs()[1]->isConstantKind(), "round scale must be a constant");
+      scale_ = constantValueVector(expr->inputs()[1])
+                   ->as<SimpleVector<int32_t>>()
+                   ->valueAt(0);
     }
   }
 
@@ -297,23 +290,16 @@ class RoundFunction : public CudfFunction {
 class BinaryFunction : public CudfFunction {
  public:
   BinaryFunction(
-      const std::shared_ptr<velox::exec::Expr>& expr,
+      const core::TypedExprPtr& expr,
       cudf::binary_operator op)
       : op_(op),
         type_(cudf::data_type(cudf_velox::veloxToCudfTypeId(expr->type()))) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 2, "binary function expects exactly 2 inputs");
-    if (auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-            expr->inputs()[0])) {
-      auto constValue = constExpr->value();
-      left_ = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-          createCudfScalar, constValue->typeKind(), constValue);
-    } else if (
-        auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-            expr->inputs()[1])) {
-      auto constValue = constExpr->value();
-      right_ = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-          createCudfScalar, constValue->typeKind(), constValue);
+    if (expr->inputs()[0]->isConstantKind()) {
+      left_ = makeScalarFromConstantExpr(expr->inputs()[0]);
+    } else if (expr->inputs()[1]->isConstantKind()) {
+      right_ = makeScalarFromConstantExpr(expr->inputs()[1]);
     }
 
     VELOX_CHECK(
@@ -350,27 +336,19 @@ class BinaryFunction : public CudfFunction {
 
 class SwitchFunction : public CudfFunction {
  public:
-  SwitchFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  SwitchFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 3, "case when expects exactly 3 inputs");
     VELOX_CHECK_EQ(
         expr->inputs()[0]->type()->kind(),
         TypeKind::BOOLEAN,
         "The switch condition result type should be boolean");
-    VELOX_CHECK_NULL(
-        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr),
-        "The condition should not be constant");
-    if (auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-            expr->inputs()[1])) {
-      auto constValue = constExpr->value();
-      left_ = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-          createCudfScalar, constValue->typeKind(), constValue);
+    VELOX_CHECK(!expr->isConstantKind(), "The condition should not be constant");
+    if (expr->inputs()[1]->isConstantKind()) {
+      left_ = makeScalarFromConstantExpr(expr->inputs()[1]);
     }
-    if (auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-            expr->inputs()[2])) {
-      auto constValue = constExpr->value();
-      right_ = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-          createCudfScalar, constValue->typeKind(), constValue);
+    if (expr->inputs()[2]->isConstantKind()) {
+      right_ = makeScalarFromConstantExpr(expr->inputs()[2]);
     }
   }
 
@@ -408,18 +386,15 @@ class SwitchFunction : public CudfFunction {
 
 class SubstrFunction : public CudfFunction {
  public:
-  SubstrFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
-
+  SubstrFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_GE(
         expr->inputs().size(), 2, "substr expects at least 2 inputs");
     VELOX_CHECK_LE(expr->inputs().size(), 3, "substr expects at most 3 inputs");
 
-    auto startExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
-    VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");
-
-    auto startValue =
-        startExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+    VELOX_CHECK(expr->inputs()[1]->isConstantKind(), "substr start must be a constant");
+    auto startValue = constantValueVector(expr->inputs()[1])
+                          ->as<SimpleVector<int64_t>>()
+                          ->valueAt(0);
     start_ = static_cast<cudf::size_type>(startValue);
     if (startValue >= 1) {
       // cuDF indexing starts at 0.
@@ -429,12 +404,10 @@ class SubstrFunction : public CudfFunction {
     }
 
     if (expr->inputs().size() > 2) {
-      auto lengthExpr =
-          std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[2]);
-      VELOX_CHECK_NOT_NULL(lengthExpr, "substr length must be a constant");
-
-      auto lengthValue =
-          lengthExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+      VELOX_CHECK(expr->inputs()[2]->isConstantKind(), "substr length must be a constant");
+      auto lengthValue = constantValueVector(expr->inputs()[2])
+                             ->as<SimpleVector<int64_t>>()
+                             ->valueAt(0);
       // cuDF uses indices [begin, end).
       // Presto uses length as the length of the substring.
       // We compute the end as start + length.
@@ -464,32 +437,18 @@ class SubstrFunction : public CudfFunction {
 
 class CoalesceFunction : public CudfFunction {
  public:
-  CoalesceFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
-
+  CoalesceFunction(const core::TypedExprPtr& expr) {
     // Storing the first literal that appears in inputs because we don't need to
     // process after that. This is the last fallback.
     numColumnsBeforeLiteral_ = expr->inputs().size();
     for (size_t i = 0; i < expr->inputs().size(); ++i) {
       const auto& input = expr->inputs()[i];
-      if (auto c =
-              std::dynamic_pointer_cast<velox::exec::ConstantExpr>(input)) {
-        if (!c->value()->isNullAt(0)) {
-          literalScalar_ = makeScalarFromConstantExpr(c);
+      if (input->isConstantKind()) {
+        const auto value = constantValueVector(input);
+        if (!value->isNullAt(0)) {
+          literalScalar_ = makeScalarFromConstantExpr(input);
           numColumnsBeforeLiteral_ = i;
           break;
-        }
-      } else if (input->distinctFields().empty() && !input->inputs().empty()) {
-        // Handle constant expressions that weren't folded (e.g., cast of
-        // literal).
-        if (auto innerConst =
-                std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-                    input->inputs()[0])) {
-          if (!innerConst->value()->isNullAt(0)) {
-            literalScalar_ = makeScalarFromConstantExpr(innerConst);
-            numColumnsBeforeLiteral_ = i;
-            break;
-          }
         }
       }
     }
@@ -537,13 +496,15 @@ class CoalesceFunction : public CudfFunction {
 
 class HashFunction : public CudfFunction {
  public:
-  HashFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
-    VELOX_CHECK_GE(expr->inputs().size(), 2, "hash expects at least 2 inputs");
-    auto seedExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
-    VELOX_CHECK_NOT_NULL(seedExpr, "hash seed must be a constant");
-    int32_t seedValue =
-        seedExpr->value()->as<SimpleVector<int32_t>>()->valueAt(0);
+  HashFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(),
+        2,
+        "hash_with_seed expects exactly 2 inputs");
+    VELOX_CHECK(expr->inputs()[0]->isConstantKind(), "hash seed must be a constant");
+    int32_t seedValue = constantValueVector(expr->inputs()[0])
+                            ->as<SimpleVector<int32_t>>()
+                            ->valueAt(0);
     VELOX_CHECK_GE(seedValue, 0);
     seedValue_ = seedValue;
   }
@@ -576,7 +537,7 @@ class HashFunction : public CudfFunction {
 
 class YearFunction : public CudfFunction {
  public:
-  explicit YearFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  explicit YearFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 1, "year expects exactly 1 input column");
   }
@@ -593,7 +554,7 @@ class YearFunction : public CudfFunction {
 
 class LengthFunction : public CudfFunction {
  public:
-  explicit LengthFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  explicit LengthFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 1, "length expects exactly 1 input column");
   }
@@ -609,7 +570,7 @@ class LengthFunction : public CudfFunction {
 
 class LowerFunction : public CudfFunction {
  public:
-  explicit LowerFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  explicit LowerFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 1, "lower expects exactly 1 input column");
   }
@@ -625,7 +586,7 @@ class LowerFunction : public CudfFunction {
 
 class UpperFunction : public CudfFunction {
  public:
-  explicit UpperFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  explicit UpperFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 1, "upper expects exactly 1 input column");
   }
@@ -641,14 +602,10 @@ class UpperFunction : public CudfFunction {
 
 class LikeFunction : public CudfFunction {
  public:
-  explicit LikeFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
+  explicit LikeFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "like expects 2 inputs");
-
-    auto patternExpr =
-        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
-    VELOX_CHECK_NOT_NULL(patternExpr, "like pattern must be a constant");
-    pattern_ = patternExpr->value()->toString(0);
+    VELOX_CHECK(expr->inputs()[1]->isConstantKind(), "like pattern must be a constant");
+    pattern_ = constantToString(expr->inputs()[1]);
   }
 
   ColumnOrView eval(
@@ -666,14 +623,12 @@ class LikeFunction : public CudfFunction {
 
 class StartswithFunction : public CudfFunction {
  public:
-  explicit StartswithFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
+  explicit StartswithFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "startswith expects 2 inputs");
-
-    auto patternExpr =
-        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
-    VELOX_CHECK_NOT_NULL(patternExpr, "startswith pattern must be a constant");
-    pattern_ = patternExpr->value()->toString(0);
+    VELOX_CHECK(
+        expr->inputs()[1]->isConstantKind(),
+        "startswith pattern must be a constant");
+    pattern_ = constantToString(expr->inputs()[1]);
   }
 
   ColumnOrView eval(
@@ -691,14 +646,12 @@ class StartswithFunction : public CudfFunction {
 
 class EndswithFunction : public CudfFunction {
  public:
-  explicit EndswithFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
+  explicit EndswithFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "endswith expects 2 inputs");
-
-    auto patternExpr =
-        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
-    VELOX_CHECK_NOT_NULL(patternExpr, "endswith pattern must be a constant");
-    pattern_ = patternExpr->value()->toString(0);
+    VELOX_CHECK(
+        expr->inputs()[1]->isConstantKind(),
+        "endswith pattern must be a constant");
+    pattern_ = constantToString(expr->inputs()[1]);
   }
 
   ColumnOrView eval(
@@ -716,14 +669,12 @@ class EndswithFunction : public CudfFunction {
 
 class ContainsFunction : public CudfFunction {
  public:
-  explicit ContainsFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
+  explicit ContainsFunction(const core::TypedExprPtr& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "contains expects 2 inputs");
-
-    auto patternExpr =
-        std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
-    VELOX_CHECK_NOT_NULL(patternExpr, "contains pattern must be a constant");
-    pattern_ = patternExpr->value()->toString(0);
+    VELOX_CHECK(
+        expr->inputs()[1]->isConstantKind(),
+        "contains pattern must be a constant");
+    pattern_ = constantToString(expr->inputs()[1]);
   }
 
   ColumnOrView eval(
@@ -741,16 +692,14 @@ class ContainsFunction : public CudfFunction {
 
 class ConcatFunction : public CudfFunction {
  public:
-  explicit ConcatFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
+  explicit ConcatFunction(const core::TypedExprPtr& expr) {
     numInputs_ = expr->inputs().size();
     VELOX_CHECK_GE(numInputs_, 2, "concat expects at least 2 inputs");
 
     // Scan inputs for literals and store strings in map by input index.
     for (size_t i = 0; i < numInputs_; ++i) {
-      if (auto constant =
-              std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[i])) {
-        inputIndexToLiteral_[i] = constant->value()->toString(0);
+      if (expr->inputs()[i]->isConstantKind()) {
+        inputIndexToLiteral_[i] = constantToString(expr->inputs()[i]);
       }
     }
   }
@@ -836,7 +785,7 @@ void registerCudfFunctions(
 
 std::shared_ptr<CudfFunction> createCudfFunction(
     const std::string& name,
-    const std::shared_ptr<velox::exec::Expr>& expr) {
+    const core::TypedExprPtr& expr) {
   auto& registry = getCudfFunctionRegistry();
   auto it = registry.find(name);
   if (it != registry.end()) {
@@ -850,7 +799,7 @@ void registerSparkFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "hash_with_seed",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<HashFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -861,7 +810,7 @@ void registerSparkFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "date_add",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<DateAddFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -888,7 +837,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "split",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<SplitFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -909,7 +858,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "cardinality",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<CardinalityFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -919,7 +868,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunctions(
       {prefix + "substr", prefix + "substring"},
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<SubstrFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -937,7 +886,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   // Coalesce is special form and doesn't have a prefix in its name.
   registerCudfFunction(
       "coalesce",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<CoalesceFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -949,7 +898,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "round",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<RoundFunction>(expr);
       },
       {// TODO(dm): Enable after adding decimal support to velox-cudf
@@ -1005,7 +954,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "year",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<YearFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1019,7 +968,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "length",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<LengthFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1029,7 +978,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "lower",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<LowerFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1039,7 +988,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "upper",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<UpperFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1049,7 +998,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "like",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<LikeFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1060,7 +1009,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "concat",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<ConcatFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1075,7 +1024,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   // TODO (dm): This could break for decimal
   registerCudfFunctions(
       {prefix + "greaterthan", prefix + "gt"},
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<BinaryFunction>(
             expr, cudf::binary_operator::GREATER);
       },
@@ -1087,7 +1036,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 
   registerCudfFunction(
       prefix + "divide",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<BinaryFunction>(
             expr, cudf::binary_operator::DIV);
       },
@@ -1100,7 +1049,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   // No prefix because switch and if are special form
   registerCudfFunctions(
       {"switch", "if"},
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<SwitchFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -1114,7 +1063,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerCudfFunctions(
       // No signatures required for cast and try_cast. They are special forms.
       {"try_cast", "cast"},
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+      [](const std::string&, const core::TypedExprPtr& expr) {
         return std::make_shared<CastFunction>(expr);
       },
       {
@@ -1130,18 +1079,18 @@ bool registerBuiltinFunctions(const std::string& prefix) {
 }
 
 std::shared_ptr<FunctionExpression> FunctionExpression::create(
-    const std::shared_ptr<velox::exec::Expr>& expr,
+    const core::TypedExprPtr& expr,
     const RowTypePtr& inputRowSchema) {
   auto node = std::make_shared<FunctionExpression>();
   node->expr_ = expr;
   node->inputRowSchema_ = inputRowSchema;
 
-  auto name = expr->name();
+  auto name = exprName(expr);
   node->function_ = createCudfFunction(name, expr);
 
   if (node->function_) {
     for (const auto& input : expr->inputs()) {
-      if (input->name() != "literal") {
+      if (!input->isConstantKind()) {
         node->subexpressions_.push_back(
             createCudfExpression(input, inputRowSchema));
       }
@@ -1156,12 +1105,15 @@ ColumnOrView FunctionExpression::eval(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr,
     bool finalize) {
-  using velox::exec::FieldReference;
-
-  if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr_)) {
-    auto name = fieldExpr->name();
-    auto columnIndex = inputRowSchema_->getChildIdx(name);
-    return inputColumnViews[columnIndex];
+  if (isInputFieldReference(expr_)) {
+    const auto rootField = rootFieldName(expr_);
+    VELOX_CHECK(rootField.has_value(), "Field reference missing root field");
+    auto columnView =
+        inputColumnViews[inputRowSchema_->getChildIdx(*rootField)];
+    for (const auto index : nestedFieldIndices(expr_, inputRowSchema_)) {
+      columnView = columnView.child(index);
+    }
+    return columnView;
   }
 
   if (function_) {
@@ -1185,7 +1137,7 @@ ColumnOrView FunctionExpression::eval(
   }
 
   VELOX_FAIL(
-      "Unsupported expression for recursive evaluation: " + expr_->name());
+      "Unsupported expression for recursive evaluation: " + exprName(expr_));
 }
 
 void FunctionExpression::close() {
@@ -1193,15 +1145,13 @@ void FunctionExpression::close() {
   subexpressions_.clear();
 }
 
-bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
-  using velox::exec::FieldReference;
-
-  if (std::dynamic_pointer_cast<FieldReference>(expr)) {
+bool FunctionExpression::canEvaluate(const core::TypedExprPtr& expr) {
+  if (isInputFieldReference(expr)) {
     return true;
   }
 
-  const auto& opName = expr->name();
-  if (opName == "cast" || opName == "try_cast") {
+  const auto opName = exprName(expr);
+  if (expr->isCastKind()) {
     const auto& srcType =
         expr->inputs().empty() ? nullptr : expr->inputs()[0]->type();
     const auto& dstType = expr->type();
@@ -1214,15 +1164,19 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   }
 
   auto& registry = getCudfFunctionRegistry();
-  auto it = registry.find(expr->name());
+  auto it = registry.find(opName);
   if (it == registry.end()) {
     return false;
   }
-  const auto& spec = it->second;
-  return matchCallAgainstSignatures(*expr, spec.signatures);
+
+  try {
+    return createCudfFunction(opName, expr) != nullptr;
+  } catch (const std::exception&) {
+    return false;
+  }
 }
 
-bool canBeEvaluatedByCudf(std::shared_ptr<velox::exec::Expr> expr, bool deep) {
+bool canBeEvaluatedByCudf(const core::TypedExprPtr& expr, bool deep) {
   ensureBuiltinExpressionEvaluatorsRegistered();
   const auto& registry = getCudfExpressionEvaluatorRegistry();
 
@@ -1240,7 +1194,10 @@ bool canBeEvaluatedByCudf(std::shared_ptr<velox::exec::Expr> expr, bool deep) {
 
   if (deep) {
     for (const auto& input : expr->inputs()) {
-      if (input->name() != "literal" && !canBeEvaluatedByCudf(input, true)) {
+      if (input->isConstantKind() || input->isInputKind()) {
+        continue;
+      }
+      if (!canBeEvaluatedByCudf(input, true)) {
         return false;
       }
     }
@@ -1250,7 +1207,7 @@ bool canBeEvaluatedByCudf(std::shared_ptr<velox::exec::Expr> expr, bool deep) {
 }
 
 std::shared_ptr<CudfExpression> createCudfExpression(
-    std::shared_ptr<velox::exec::Expr> expr,
+    const core::TypedExprPtr& expr,
     const RowTypePtr& inputRowSchema,
     std::optional<std::string> except) {
   ensureBuiltinExpressionEvaluatorsRegistered();

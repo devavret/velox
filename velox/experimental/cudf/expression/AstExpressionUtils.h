@@ -21,11 +21,10 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
+#include "velox/experimental/cudf/expression/TypedExprUtils.h"
 // TODO(kn): in another PR
 // #include "velox/experimental/cudf/CudfNoDefaults.h"
 
-#include "velox/expression/ConstantExpr.h"
-#include "velox/expression/FieldReference.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/ConstantVector.h"
 
@@ -221,12 +220,11 @@ bool isOpAndInputsSupported(
 //   kCustom = 999,
 // };
 // check if the expression (name + input types) is supported in AST
-bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
-  using velox::exec::FieldReference;
+bool isAstExprSupported(const core::TypedExprPtr& expr) {
   using Op = cudf::ast::ast_operator;
 
   const auto name =
-      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
+      stripPrefix(exprName(expr), CudfConfig::getInstance().functionNamePrefix);
   const auto len = expr->inputs().size();
 
   // Literals and field references are always supported
@@ -244,10 +242,11 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
     auto type = expr->type();
     return isSupportedLiteral(type);
   }
-  if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
-    const auto fieldName =
-        fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
-    if (fieldExpr->field() == fieldName) {
+  if (isInputFieldReference(expr)) {
+    const auto fieldName = rootFieldName(expr);
+    const auto leafName = leafFieldName(expr);
+    VELOX_CHECK(fieldName.has_value() && leafName.has_value());
+    if (*leafName == *fieldName) {
       return true;
     }
     LOG(WARNING) << "Field " << name << "not found, in expression "
@@ -332,12 +331,11 @@ struct AstContext {
   const std::vector<RowTypePtr> inputRowSchema;
   const std::vector<std::reference_wrapper<std::vector<PrecomputeInstruction>>>
       precomputeInstructions;
-  const std::shared_ptr<velox::exec::Expr>
-      rootExpr; // Track the root expression
+  const core::TypedExprPtr rootExpr; // Track the root expression
   bool allowPureAstOnly;
 
   cudf::ast::expression const& pushExprToTree(
-      const std::shared_ptr<velox::exec::Expr>& expr);
+      const core::TypedExprPtr& expr);
   cudf::ast::expression const& addPrecomputeInstructionOnSide(
       size_t sideIdx,
       size_t columnIndex,
@@ -350,11 +348,11 @@ struct AstContext {
       std::string const& fieldName = {},
       const std::shared_ptr<CudfExpression>& node = nullptr);
   cudf::ast::expression const& multipleInputsToPairWise(
-      const std::shared_ptr<velox::exec::Expr>& expr);
-  static bool canBeEvaluated(const std::shared_ptr<velox::exec::Expr>& expr);
+      const core::TypedExprPtr& expr);
+  static bool canBeEvaluated(const core::TypedExprPtr& expr);
   // Determines which side (0=left, 1=right) an expression references by
   // examining its field references. Returns -1 if no fields found.
-  int findExpressionSide(const std::shared_ptr<velox::exec::Expr>& expr) const;
+  int findExpressionSide(const core::TypedExprPtr& expr) const;
 };
 
 // get nested column indices
@@ -414,11 +412,11 @@ cudf::ast::expression const& AstContext::addPrecomputeInstruction(
 /// @param expr The expression containing multiple inputs for AND/OR operation
 /// @return A reference to the resulting AST expression
 cudf::ast::expression const& AstContext::multipleInputsToPairWise(
-    const std::shared_ptr<velox::exec::Expr>& expr) {
+    const core::TypedExprPtr& expr) {
   using Operation = cudf::ast::operation;
 
   const auto name =
-      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
+      stripPrefix(exprName(expr), CudfConfig::getInstance().functionNamePrefix);
   auto len = expr->inputs().size();
   // Create a simple chain of operations
   auto result = &pushExprToTree(expr->inputs()[0]);
@@ -437,21 +435,17 @@ cudf::ast::expression const& AstContext::multipleInputsToPairWise(
 /// @param expr The expression to push into the AST tree
 /// @return A reference to the resulting AST expression
 cudf::ast::expression const& AstContext::pushExprToTree(
-    const std::shared_ptr<velox::exec::Expr>& expr) {
+    const core::TypedExprPtr& expr) {
   using Op = cudf::ast::ast_operator;
   using Operation = cudf::ast::operation;
-  using velox::exec::ConstantExpr;
-  using velox::exec::FieldReference;
 
   const auto name =
-      stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
+      stripPrefix(exprName(expr), CudfConfig::getInstance().functionNamePrefix);
   auto len = expr->inputs().size();
   auto& type = expr->type();
 
   if (name == "literal") {
-    auto c = dynamic_cast<ConstantExpr*>(expr.get());
-    VELOX_CHECK_NOT_NULL(c, "literal expression should be ConstantExpr");
-    auto value = c->value();
+    auto value = constantValueVector(expr);
     VELOX_CHECK(value->isConstantEncoding());
 
     // TODO: There is a scalar stream synchronization bug that causes
@@ -501,9 +495,8 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     VELOX_CHECK_EQ(len, 2);
     // actually len is 2, second input is ARRAY
     auto const& op1 = pushExprToTree(expr->inputs()[0]);
-    auto c = dynamic_cast<ConstantExpr*>(expr->inputs()[1].get());
-    VELOX_CHECK_NOT_NULL(c, "literal expression should be ConstantExpr");
-    auto value = c->value();
+    VELOX_CHECK(expr->inputs()[1]->isConstantKind(), "IN list must be a constant");
+    auto value = constantValueVector(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(value, "ConstantExpr value is null");
 
     // Use the new createLiteralsFromArray function to get literals
@@ -548,22 +541,23 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     } else {
       VELOX_FAIL("Unsupported type for cast operation");
     }
-  } else if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
+  } else if (isInputFieldReference(expr)) {
     // Refer to the appropriate side
-    const auto fieldName =
-        fieldExpr->inputs().empty() ? name : fieldExpr->inputs()[0]->name();
+    const auto fieldName = rootFieldName(expr);
+    const auto leafName = leafFieldName(expr);
+    VELOX_CHECK(fieldName.has_value() && leafName.has_value());
     for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
       auto& schema = inputRowSchema[sideIdx];
-      if (schema.get()->containsChild(fieldName)) {
-        auto columnIndex = schema.get()->getChildIdx(fieldName);
+      if (schema.get()->containsChild(*fieldName)) {
+        auto columnIndex = schema.get()->getChildIdx(*fieldName);
         // This column may be complex data type like ROW, we need to get the
         // name from row. Push fieldName.name to the tree.
         auto side = static_cast<cudf::ast::table_reference>(sideIdx);
-        if (fieldExpr->field() == fieldName) {
+        if (*leafName == *fieldName) {
           return tree.push(cudf::ast::column_reference(columnIndex, side));
         } else if (!allowPureAstOnly) {
           return addPrecomputeInstruction(
-              fieldName, "nested_column", fieldExpr->field());
+              *fieldName, "nested_column", *leafName);
         } else {
           VELOX_FAIL("Unsupported type for nested column operation");
         }
@@ -587,10 +581,10 @@ cudf::ast::expression const& AstContext::pushExprToTree(
 }
 
 int AstContext::findExpressionSide(
-    const std::shared_ptr<velox::exec::Expr>& expr) const {
-  for (const auto* field : expr->distinctFields()) {
+    const core::TypedExprPtr& expr) const {
+  for (const auto& field : referencedInputFields(expr)) {
     for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
-      if (inputRowSchema[sideIdx].get()->containsChild(field->field())) {
+      if (inputRowSchema[sideIdx].get()->containsChild(field)) {
         return static_cast<int>(sideIdx);
       }
     }

@@ -150,7 +150,7 @@ CudfHiveDataSource::CudfHiveDataSource(
     }();
 
     cudfExpressionEvaluator_ = velox::cudf_velox::createCudfExpression(
-        remainingFilterExprSet_->exprs()[0], remainingFilterType_);
+        remainingFilter, remainingFilterType_);
     // TODO(kn): Get column names and subfields from remaining filter and add to
     // readColumnNames_
   }

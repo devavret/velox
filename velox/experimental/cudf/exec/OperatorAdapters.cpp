@@ -174,7 +174,8 @@ class FilterProjectAdapter : public OperatorAdapter {
     // Check filter separately
     if (filterNode) {
       if (!canBeEvaluatedByCudf(
-              {filterNode->filter()}, ctx->task->queryCtx().get())) {
+              std::vector<core::TypedExprPtr>{filterNode->filter()},
+              ctx->task->queryCtx().get())) {
         LOG_FALLBACK(
             "FilterProject filter cannot be evaluated by cuDF, PlanNode id: {}",
             planNode->id());
@@ -339,7 +340,8 @@ class CudfHashJoinBaseAdapter : public OperatorAdapter {
 
     if (joinPlanNode->filter()) {
       if (!canBeEvaluatedByCudf(
-              {joinPlanNode->filter()}, ctx->task->queryCtx().get())) {
+              std::vector<core::TypedExprPtr>{joinPlanNode->filter()},
+              ctx->task->queryCtx().get())) {
         LOG_FALLBACK(
             "HashJoin join filter cannot be evaluated by cuDF, PlanNode id: {}",
             planNode->id());
