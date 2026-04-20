@@ -18,7 +18,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/detail/gather.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -223,11 +223,11 @@ CudfVectorPtr CudfTopNRowNumber::computeDeduplication(
 
     // Take only the first index
     auto firstIndex = cudf::split(sortedIndices->view(), {1}, stream).front();
-    result = cudf::detail::gather(
+    result = cudf::gather(
         input,
         firstIndex,
         cudf::out_of_bounds_policy::DONT_CHECK,
-        cudf::detail::negative_index_policy::NOT_ALLOWED,
+        cudf::negative_index_policy::NOT_ALLOWED,
         stream,
         mr);
   } else {
@@ -239,11 +239,11 @@ CudfVectorPtr CudfTopNRowNumber::computeDeduplication(
         allKeysView, columnOrders_, nullOrders_, stream, mr);
 
     // Step 2: Gather rows in sorted order
-    auto sortedTable = cudf::detail::gather(
+    auto sortedTable = cudf::gather(
         input,
         sortedIndices->view(),
         cudf::out_of_bounds_policy::DONT_CHECK,
-        cudf::detail::negative_index_policy::NOT_ALLOWED,
+        cudf::negative_index_policy::NOT_ALLOWED,
         stream,
         mr);
 
