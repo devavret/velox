@@ -222,7 +222,7 @@ TEST_F(CudfExpressionSelectionTest, signatureEnforcesConstantArgsLike) {
 
   // Bad: pattern is not a constant
   auto bad = compileExecExpr("like(name, name)", rowType_, execCtx_.get());
-  ASSERT_FALSE(canBeEvaluatedByCudf(bad, /*deep=*/true));
+  ASSERT_FALSE(FunctionExpression::canEvaluate(bad));
 }
 
 TEST_F(CudfExpressionSelectionTest, signatureArityAndConstantsSubstr) {
@@ -236,13 +236,41 @@ TEST_F(CudfExpressionSelectionTest, signatureArityAndConstantsSubstr) {
 
   // Bad: start must be constant
   auto badConst = compileExecExpr("substr(name, a)", rowType_, execCtx_.get());
-  ASSERT_FALSE(canBeEvaluatedByCudf(badConst, /*deep=*/true));
+  ASSERT_FALSE(FunctionExpression::canEvaluate(badConst));
 }
 
 TEST_F(CudfExpressionSelectionTest, signatureCastsInDivide) {
   // OK: numeric args are castable to double
   auto ok = compileExecExpr("divide(a, b)", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(ok, /*deep=*/true));
+}
+
+TEST_F(CudfExpressionSelectionTest, cpuFallbackRoot) {
+  FunctionExpressionOnlyEvaluatorGuard functionExpressionOnly;
+
+  auto rowType = ROW({
+      {"a", BIGINT()},
+      {"b", BIGINT()},
+      {"c", INTEGER()},
+  });
+  auto expr = compileExecExpr("bit_count(a, b)", rowType, execCtx_.get());
+  ASSERT_FALSE(FunctionExpression::canEvaluate(expr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true));
+
+  auto cudfExpr = createCudfExpression(expr, rowType);
+  auto* functionExpr = dynamic_cast<FunctionExpression*>(cudfExpr.get());
+  ASSERT_EQ(functionExpr, nullptr);
+
+  auto colA = makeFixedWidthColumn<int64_t>(cudf::type_id::INT64, {1, 3, 7});
+  auto colB = makeFixedWidthColumn<int64_t>(cudf::type_id::INT64, {64, 64, 64});
+  auto colC = makeFixedWidthColumn<int32_t>(cudf::type_id::INT32, {1, 2, 3});
+  std::vector<cudf::column_view> inputViews = {
+      colA->view(), colB->view(), colC->view()};
+
+  auto result = cudfExpr->eval(inputViews, stream_, mr(), /*finalize=*/true);
+  auto resultView = asView(result);
+  ASSERT_EQ(resultView.size(), 3);
+  ASSERT_EQ(resultView.type().id(), cudf::type_id::INT64);
 }
 
 TEST_F(
@@ -327,18 +355,17 @@ TEST_F(
 TEST_F(CudfExpressionSelectionTest, signatureVarargsHashWithSeed) {
   facebook::velox::functions::sparksql::registerFunctions();
 
-  // TODO: Assert TRUE after https://github.com/rapidsai/cudf/issues/21720.
-  // Multi-column hash_with_seed cannot be evaluated by cudf because cudf's
-  // murmurhash3_x86_32 combines columns via hash_combine(h(col0, seed),
+  // Multi-column hash_with_seed is not supported by FunctionExpression because
+  // cudf's murmurhash3_x86_32 combines columns via hash_combine(h(col0, seed),
   // h(col1, seed)), while Spark hashes iteratively: h(col1, h(col0, seed)).
-  // The cudf API only accepts a scalar seed, so per-row seeding is not
-  // possible without a custom CUDA kernel.
+  // The CPU fallback evaluator can still evaluate the expression.
   auto multiCol = compileExecExpr(
       "hash_with_seed(42, a, b)",
       rowType_,
       execCtx_.get(),
       {.parseIntegerAsBigint = false, .functionPrefix = ""});
-  ASSERT_FALSE(canBeEvaluatedByCudf(multiCol, /*deep=*/true));
+  ASSERT_FALSE(FunctionExpression::canEvaluate(multiCol));
+  ASSERT_TRUE(canBeEvaluatedByCudf(multiCol, /*deep=*/true));
 
   // Single-column hash_with_seed is supported (no column combining needed).
   auto singleCol = compileExecExpr(
@@ -356,7 +383,7 @@ TEST_F(CudfExpressionSelectionTest, signatureVarargsHashWithSeed) {
         execCtx_.get(),
         {.parseIntegerAsBigint = false, .functionPrefix = ""});
     // If compilation succeeds, the compiled check must fail.
-    ASSERT_FALSE(canBeEvaluatedByCudf(bad, /*deep=*/true));
+    ASSERT_FALSE(FunctionExpression::canEvaluate(bad));
   } catch (const VeloxUserError&) {
     // Treat compile-time validation failure as unsupported.
     SUCCEED();

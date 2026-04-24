@@ -19,12 +19,15 @@
 #include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
+#include "velox/common/memory/Memory.h"
+#include "velox/core/QueryCtx.h"
 #include "velox/expression/ConstantExpr.h"
 #include "velox/expression/FieldReference.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/expression/SignatureBinder.h"
 #include "velox/type/Type.h"
 #include "velox/vector/BaseVector.h"
+#include "velox/vector/ComplexVector.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -45,6 +48,9 @@
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
+#include <atomic>
+#include <limits>
+
 namespace facebook::velox::cudf_velox {
 namespace {
 
@@ -60,6 +66,99 @@ getCudfExpressionEvaluatorRegistry() {
   return registry;
 }
 
+uint64_t nextCpuFallbackPoolId() {
+  static std::atomic<uint64_t> next{0};
+  return next++;
+}
+
+class SingleExpressionExprSet final : public exec::ExprSet {
+ public:
+  SingleExpressionExprSet(
+      std::shared_ptr<exec::Expr> expr,
+      core::ExecCtx* execCtx)
+      : exec::ExprSet(
+            std::vector<core::TypedExprPtr>{},
+            execCtx,
+            /*enableConstantFolding=*/false) {
+    exprs_.push_back(std::move(expr));
+    exec::Expr::mergeFields(
+        distinctFields_,
+        multiplyReferencedFields_,
+        exprs_.front()->distinctFields());
+  }
+};
+
+class CpuFallbackExpression final : public CudfExpression {
+ public:
+  CpuFallbackExpression(
+      std::shared_ptr<exec::Expr> expr,
+      RowTypePtr inputRowSchema)
+      : expr_(std::move(expr)),
+        inputRowSchema_(std::move(inputRowSchema)),
+        pool_(
+            memory::memoryManager()->addLeafPool(
+                "cudf_cpu_fallback_" + std::to_string(nextCpuFallbackPoolId()),
+                false)),
+        queryCtx_(core::QueryCtx::create()),
+        execCtx_(std::make_unique<core::ExecCtx>(pool_.get(), queryCtx_.get())),
+        exprSet_(
+            std::make_unique<SingleExpressionExprSet>(expr_, execCtx_.get())) {}
+
+  ColumnOrView eval(
+      std::vector<cudf::column_view> inputColumnViews,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr,
+      bool /*finalize*/ = false) override {
+    cudf::table_view inputTable(inputColumnViews);
+    auto input = with_arrow::toVeloxColumn(
+        inputTable,
+        pool_.get(),
+        std::static_pointer_cast<const Type>(inputRowSchema_),
+        stream,
+        mr);
+
+    SelectivityVector rows(input->size());
+    exec::EvalCtx evalCtx(execCtx_.get(), exprSet_.get(), input.get());
+    std::vector<VectorPtr> results;
+    exprSet_->eval(rows, evalCtx, results);
+    VELOX_CHECK_EQ(results.size(), 1);
+    VELOX_CHECK_NOT_NULL(results[0]);
+
+    auto outputType = ROW({"c0"}, {expr_->type()});
+    auto output = std::make_shared<RowVector>(
+        pool_.get(),
+        outputType,
+        nullptr,
+        results[0]->size(),
+        std::vector<VectorPtr>{results[0]});
+    auto outputTable = with_arrow::toCudfTable(output, pool_.get(), stream, mr);
+    auto columns = outputTable->release();
+    VELOX_CHECK_EQ(columns.size(), 1);
+    return std::move(columns[0]);
+  }
+
+  void close() override {
+    exprSet_.reset();
+    execCtx_.reset();
+    queryCtx_.reset();
+    pool_.reset();
+    expr_.reset();
+    inputRowSchema_.reset();
+  }
+
+  static bool canEvaluate(std::shared_ptr<velox::exec::Expr> /*expr*/) {
+    return true;
+  }
+
+ private:
+  std::shared_ptr<exec::Expr> expr_;
+  RowTypePtr inputRowSchema_;
+  std::shared_ptr<memory::MemoryPool> pool_;
+  std::shared_ptr<core::QueryCtx> queryCtx_;
+  std::unique_ptr<core::ExecCtx> execCtx_;
+  std::unique_ptr<SingleExpressionExprSet> exprSet_;
+};
+
 static void ensureBuiltinExpressionEvaluatorsRegistered() {
   static bool registered = false;
   if (registered) {
@@ -68,6 +167,7 @@ static void ensureBuiltinExpressionEvaluatorsRegistered() {
 
   // Default priority for function evaluator
   const int kFunctionPriority = 50;
+  const int kCpuFallbackPriority = std::numeric_limits<int>::min();
 
   // Function evaluator
   registerCudfExpressionEvaluator(
@@ -78,6 +178,20 @@ static void ensureBuiltinExpressionEvaluatorsRegistered() {
       },
       [](std::shared_ptr<velox::exec::Expr> expr, const RowTypePtr& row) {
         return FunctionExpression::create(std::move(expr), row);
+      },
+      /*overwrite=*/false);
+
+  // CPU fallback evaluator. This must remain lower priority than every GPU
+  // evaluator because it intentionally claims every expression.
+  registerCudfExpressionEvaluator(
+      "cpu",
+      kCpuFallbackPriority,
+      [](std::shared_ptr<velox::exec::Expr> expr) {
+        return CpuFallbackExpression::canEvaluate(std::move(expr));
+      },
+      [](std::shared_ptr<velox::exec::Expr> expr, const RowTypePtr& row) {
+        return std::make_shared<CpuFallbackExpression>(
+            std::move(expr), std::move(row));
       },
       /*overwrite=*/false);
 
