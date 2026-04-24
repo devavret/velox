@@ -930,8 +930,7 @@ class ExchangeAdapter : public OperatorAdapter {
     auto exchangeNode =
         std::dynamic_pointer_cast<const core::ExchangeNode>(planNode);
     return CudfConfig::getInstance().exchange && exchangeNode &&
-        exchangeNode->transportType() ==
-        core::ExchangeNode::TransportType::kUcx;
+        exchangeNode->transportType() == core::TransportType::kUcx;
   }
 
   bool acceptsGpuInput() const override {
@@ -1021,8 +1020,7 @@ class MergeExchangeAdapter : public OperatorAdapter {
     auto mergeExchangeNode =
         std::dynamic_pointer_cast<const core::MergeExchangeNode>(planNode);
     return CudfConfig::getInstance().exchange && mergeExchangeNode &&
-        mergeExchangeNode->transportType() ==
-        core::ExchangeNode::TransportType::kUcx;
+        mergeExchangeNode->transportType() == core::TransportType::kUcx;
   }
 
   bool acceptsGpuInput() const override {
@@ -1076,8 +1074,7 @@ class PartitionedOutputAdapter : public OperatorAdapter {
     if (!poNode || !CudfConfig::getInstance().exchange) {
       return false;
     }
-    if (poNode->transportType() !=
-        core::PartitionedOutputNode::TransportType::kUcx) {
+    if (poNode->transportType() != core::TransportType::kUcx) {
       return false;
     }
     if (poNode->isArbitrary()) {
