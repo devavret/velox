@@ -1077,10 +1077,6 @@ class PartitionedOutputAdapter : public OperatorAdapter {
     if (poNode->transportType() != core::TransportType::kUcx) {
       return false;
     }
-    if (poNode->isArbitrary()) {
-      LOG(FATAL)
-          << "Arbitrary partitioning is not supported by cudf UCX exchange";
-    }
     return true;
   }
 
