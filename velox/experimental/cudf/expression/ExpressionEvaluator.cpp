@@ -101,6 +101,11 @@ bool registerCudfExpressionEvaluator(
   return true;
 }
 
+bool unregisterCudfExpressionEvaluator(const std::string& name) {
+  auto& registry = getCudfExpressionEvaluatorRegistry();
+  return registry.erase(name) > 0;
+}
+
 std::unordered_map<std::string, CudfFunctionSpec>& getCudfFunctionRegistry() {
   static std::unordered_map<std::string, CudfFunctionSpec> registry;
   return registry;

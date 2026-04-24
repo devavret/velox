@@ -412,29 +412,6 @@ target_link_libraries(
   velox_cudf_exec
 )
 
-# GPU SFI Integration test: bridge between CudfExpression pipeline and GPU SFI engine
-add_executable(velox_cudf_gpu_sfi_integration_test Main.cpp GpuSfiIntegrationTest.cpp)
-
-add_test(
-  NAME velox_cudf_gpu_sfi_integration_test
-  COMMAND velox_cudf_gpu_sfi_integration_test
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-set_tests_properties(velox_cudf_gpu_sfi_integration_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
-
-target_link_libraries(
-  velox_cudf_gpu_sfi_integration_test
-  velox_cudf_exec
-  velox_cudf_gpu_presto_functions
-  velox_exec
-  velox_exec_test_lib
-  velox_test_util
-  gtest
-  gtest_main
-  Folly::folly
-)
-
 add_executable(velox_cudf_gpu_types_test GpuTypesTest.cpp)
 
 add_test(
@@ -519,60 +496,6 @@ add_test(
 
 set_tests_properties(velox_cudf_gpu_adapter_all_variants_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
 
-# GPU Function Registry test: registration, lookup, cuDF column execution
-add_executable(velox_cudf_gpu_registry_test GpuRegistryTest.cu)
-
-set_target_properties(
-  velox_cudf_gpu_registry_test PROPERTIES
-  CUDA_STANDARD 20
-  CUDA_SEPARABLE_COMPILATION ON
-)
-
-target_include_directories(
-  velox_cudf_gpu_registry_test BEFORE PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../functions/gpu_shadows
-)
-
-target_compile_options(
-  velox_cudf_gpu_registry_test PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-)
-
-target_link_libraries(
-  velox_cudf_gpu_registry_test
-  velox_cudf_gpu_registry
-  cudf::cudf
-  gtest
-  gtest_main
-)
-
-add_test(
-  NAME velox_cudf_gpu_registry_test
-  COMMAND velox_cudf_gpu_registry_test
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-set_tests_properties(velox_cudf_gpu_registry_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
-
-# cuDF Fallback + Dispatch test
-add_executable(velox_cudf_gpu_fallback_test GpuFallbackTest.cpp)
-
-target_link_libraries(
-  velox_cudf_gpu_fallback_test
-  velox_cudf_gpu_registry
-  cudf::cudf
-  gtest
-  gtest_main
-)
-
-add_test(
-  NAME velox_cudf_gpu_fallback_test
-  COMMAND velox_cudf_gpu_fallback_test
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-set_tests_properties(velox_cudf_gpu_fallback_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
-
 # Bitmask operations + special forms test
 add_executable(velox_cudf_gpu_bitmask_ops_test GpuBitmaskOpsTest.cu)
 
@@ -601,45 +524,6 @@ add_test(
 )
 
 set_tests_properties(velox_cudf_gpu_bitmask_ops_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
-
-# GpuExprEvaluator test: expression tree evaluation on GPU
-add_executable(velox_cudf_gpu_expr_eval_test GpuExprEvaluatorTest.cpp)
-
-target_link_libraries(
-  velox_cudf_gpu_expr_eval_test
-  velox_cudf_gpu_registry
-  cudf::cudf
-  gtest
-  gtest_main
-)
-
-add_test(
-  NAME velox_cudf_gpu_expr_eval_test
-  COMMAND velox_cudf_gpu_expr_eval_test
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-set_tests_properties(velox_cudf_gpu_expr_eval_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
-
-# End-to-end test: Presto GPU functions + expression evaluator
-add_executable(velox_cudf_gpu_e2e_test GpuEndToEndTest.cpp)
-
-target_link_libraries(
-  velox_cudf_gpu_e2e_test
-  velox_cudf_gpu_presto_functions
-  velox_cudf_gpu_registry
-  cudf::cudf
-  gtest
-  gtest_main
-)
-
-add_test(
-  NAME velox_cudf_gpu_e2e_test
-  COMMAND velox_cudf_gpu_e2e_test
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-set_tests_properties(velox_cudf_gpu_e2e_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
 
 # GpuColumnIO device test: round-trip read/write via CUDA kernels
 add_executable(velox_cudf_gpu_column_io_test GpuColumnIOTest.cu)

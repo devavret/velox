@@ -22,6 +22,7 @@
 #include "velox/experimental/cudf/expression/SparkFunctions.h"
 #include "velox/experimental/cudf/tests/utils/ExpressionTestUtil.h"
 
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/expression/ConstantExpr.h"
@@ -29,7 +30,16 @@
 #include "velox/functions/sparksql/registration/Register.h"
 #include "velox/type/Type.h"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime.h>
+
 #include <gtest/gtest.h>
+
+#include <vector>
 
 using namespace facebook::velox;
 using namespace facebook::velox::cudf_velox;
@@ -71,10 +81,54 @@ class CudfExpressionSelectionTest : public ::testing::Test {
     pool_.reset();
   }
 
+  template <typename T>
+  std::unique_ptr<cudf::column> makeFixedWidthColumn(
+      cudf::type_id type,
+      const std::vector<T>& data) {
+    auto column = cudf::make_fixed_width_column(
+        cudf::data_type{type},
+        static_cast<cudf::size_type>(data.size()),
+        cudf::mask_state::UNALLOCATED,
+        stream_,
+        mr());
+    auto status = cudaMemcpy(
+        column->mutable_view().data<T>(),
+        data.data(),
+        data.size() * sizeof(T),
+        cudaMemcpyHostToDevice);
+    if (status != cudaSuccess) {
+      VELOX_FAIL("cudaMemcpy failed: {}", cudaGetErrorString(status));
+    }
+    return column;
+  }
+
+  rmm::device_async_resource_ref mr() {
+    return cudf::get_current_device_resource_ref();
+  }
+
   std::shared_ptr<memory::MemoryPool> pool_;
   std::shared_ptr<core::QueryCtx> queryCtx_;
   std::unique_ptr<core::ExecCtx> execCtx_;
   RowTypePtr rowType_;
+  rmm::cuda_stream_view stream_ = rmm::cuda_stream_default;
+};
+
+class FunctionExpressionOnlyEvaluatorGuard {
+ public:
+  FunctionExpressionOnlyEvaluatorGuard() {
+    unregisterCudfExpressionEvaluator(kAstEvaluatorName);
+    unregisterCudfExpressionEvaluator(kJitEvaluatorName);
+  }
+
+  ~FunctionExpressionOnlyEvaluatorGuard() {
+    auto& config = CudfConfig::getInstance();
+    if (config.astExpressionEnabled) {
+      registerAstEvaluator(config.astExpressionPriority);
+    }
+    if (config.jitExpressionEnabled) {
+      registerJitEvaluator(config.jitExpressionPriority);
+    }
+  }
 };
 
 TEST_F(CudfExpressionSelectionTest, astRoot) {
@@ -189,6 +243,85 @@ TEST_F(CudfExpressionSelectionTest, signatureCastsInDivide) {
   // OK: numeric args are castable to double
   auto ok = compileExecExpr("divide(a, b)", rowType_, execCtx_.get());
   ASSERT_TRUE(canBeEvaluatedByCudf(ok, /*deep=*/true));
+}
+
+TEST_F(
+    CudfExpressionSelectionTest,
+    prestoGpuSimpleFunctionsUseFunctionExpression) {
+  FunctionExpressionOnlyEvaluatorGuard functionExpressionOnly;
+
+  struct FunctionCase {
+    const char* name;
+    const char* sql;
+  };
+
+  const std::vector<FunctionCase> cases = {
+      {"plus", "a + b"},
+      {"minus", "a - b"},
+      {"multiply", "a * b"},
+      {"divide", "cast(a as double) / cast(b as double)"},
+      {"modulus", "mod(a, b)"},
+      {"negate", "negate(a)"},
+      {"abs", "abs(a)"},
+      {"ceil", "ceil(cast(a as double))"},
+      {"floor", "floor(cast(a as double))"},
+      {"truncate", "truncate(cast(a as double))"},
+      {"exp", "exp(cast(a as double))"},
+      {"ln", "ln(cast(a as double))"},
+      {"log2", "log2(cast(a as double))"},
+      {"log10", "log10(cast(a as double))"},
+      {"sqrt", "sqrt(cast(a as double))"},
+      {"cbrt", "cbrt(cast(a as double))"},
+      {"sin", "sin(cast(a as double))"},
+      {"cos", "cos(cast(a as double))"},
+      {"tan", "tan(cast(a as double))"},
+      {"asin", "asin(cast(a as double))"},
+      {"acos", "acos(cast(a as double))"},
+      {"atan", "atan(cast(a as double))"},
+      {"atan2", "atan2(cast(a as double), cast(b as double))"},
+      {"cosh", "cosh(cast(a as double))"},
+      {"tanh", "tanh(cast(a as double))"},
+      {"power", "power(cast(a as double), cast(b as double))"},
+      {"sign", "sign(a)"},
+      {"radians", "radians(cast(a as double))"},
+      {"degrees", "degrees(cast(a as double))"},
+      {"is_finite", "is_finite(cast(a as double))"},
+      {"is_infinite", "is_infinite(cast(a as double))"},
+      {"is_nan", "is_nan(cast(a as double))"},
+      {"clamp", "clamp(a, b, a)"},
+      {"lt", "a < b"},
+      {"gt", "a > b"},
+      {"lte", "a <= b"},
+      {"gte", "a >= b"},
+      {"between", "a between b and a"},
+      {"bitwise_and", "bitwise_and(a, b)"},
+      {"bitwise_or", "bitwise_or(a, b)"},
+      {"bitwise_xor", "bitwise_xor(a, b)"},
+      {"bitwise_not", "bitwise_not(a)"},
+      {"bitwise_left_shift", "bitwise_left_shift(a, c)"},
+      {"bitwise_right_shift", "bitwise_right_shift(a, c)"},
+      {"bitwise_arithmetic_shift_right",
+       "bitwise_right_shift_arithmetic(a, c)"},
+  };
+
+  auto colA = makeFixedWidthColumn<int64_t>(cudf::type_id::INT64, {1, 1, 1});
+  auto colB = makeFixedWidthColumn<int64_t>(cudf::type_id::INT64, {1, 2, 3});
+  auto colC = makeFixedWidthColumn<int32_t>(cudf::type_id::INT32, {1, 2, 3});
+  std::vector<cudf::column_view> inputViews = {
+      colA->view(), colB->view(), colC->view()};
+
+  for (const auto& testCase : cases) {
+    SCOPED_TRACE(testCase.name);
+    auto expr = compileExecExpr(testCase.sql, rowType_, execCtx_.get());
+    ASSERT_TRUE(canBeEvaluatedByCudf(expr, /*deep=*/true)) << testCase.sql;
+
+    auto cudfExpr = createCudfExpression(expr, rowType_);
+    auto* functionExpr = dynamic_cast<FunctionExpression*>(cudfExpr.get());
+    ASSERT_NE(functionExpr, nullptr) << testCase.sql;
+
+    auto result = cudfExpr->eval(inputViews, stream_, mr(), /*finalize=*/true);
+    ASSERT_EQ(asView(result).size(), 3) << testCase.sql;
+  }
 }
 
 TEST_F(CudfExpressionSelectionTest, signatureVarargsHashWithSeed) {

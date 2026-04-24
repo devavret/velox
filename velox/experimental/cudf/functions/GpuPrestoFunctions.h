@@ -19,6 +19,6 @@ namespace facebook::velox::gpu {
 
 void registerPrestoArithmetic();
 void registerPrestoComparisons();
-void registerAllPrestoGpuFunctions();
+void registerPrestoBitwise();
 
 } // namespace facebook::velox::gpu

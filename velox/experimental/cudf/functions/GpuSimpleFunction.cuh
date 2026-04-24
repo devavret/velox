@@ -19,7 +19,7 @@
 // returns a cuDF output column.
 #pragma once
 
-#include "velox/experimental/cudf/functions/GpuFunctionRegistry.h"
+#include "velox/experimental/cudf/functions/GpuPrestoCudfFunctions.h"
 #include "velox/experimental/cudf/functions/GpuSimpleFunctionAdapter.cuh"
 #include "velox/experimental/cudf/functions/GpuVectorFunction.h"
 
@@ -120,8 +120,7 @@ class GpuSimpleFunction : public GpuVectorFunction {
         stream,
         mr);
 
-    auto* outData =
-        outputCol->mutable_view().template data<ReturnType>();
+    auto* outData = outputCol->mutable_view().template data<ReturnType>();
     auto* outNull = outputCol->mutable_view().null_mask();
 
     GpuColumnWriter<ReturnType> writer{outData, outNull};
@@ -132,8 +131,8 @@ class GpuSimpleFunction : public GpuVectorFunction {
     const cudf::bitmask_type* combinedNull = nullptr;
     rmm::device_uvector<cudf::bitmask_type> combinedBuf(0, stream, mr);
 
-    auto hasAnyNulls = buildCombinedNullMask(
-        inputs, numRows, stream, mr, combinedBuf);
+    auto hasAnyNulls =
+        buildCombinedNullMask(inputs, numRows, stream, mr, combinedBuf);
     if (hasAnyNulls) {
       combinedNull = combinedBuf.data();
     }
@@ -168,9 +167,10 @@ class GpuSimpleFunction : public GpuVectorFunction {
       return false;
     }
     if (masks.size() == 1) {
-      buf.resize(cudf::bitmask_allocation_size_bytes(numRows) /
-                     sizeof(cudf::bitmask_type),
-                 stream);
+      buf.resize(
+          cudf::bitmask_allocation_size_bytes(numRows) /
+              sizeof(cudf::bitmask_type),
+          stream);
       cudaMemcpyAsync(
           buf.data(),
           masks[0],
@@ -183,8 +183,8 @@ class GpuSimpleFunction : public GpuVectorFunction {
     size_t words = cudf::bitmask_allocation_size_bytes(numRows) /
         sizeof(cudf::bitmask_type);
     buf.resize(words, stream);
-    cudaMemsetAsync(buf.data(), 0xFF, words * sizeof(cudf::bitmask_type),
-                    stream.value());
+    cudaMemsetAsync(
+        buf.data(), 0xFF, words * sizeof(cudf::bitmask_type), stream.value());
 
     rmm::device_uvector<const cudf::bitmask_type*> dMasks(
         masks.size(), stream, mr);
@@ -222,16 +222,18 @@ class GpuSimpleFunction : public GpuVectorFunction {
 
 template <typename FnType, typename ReturnType, typename... ArgTypes>
 void registerGpuFunction(const std::string& name) {
-  GpuFunctionKey key{
-      name,
-      detail::typeToId<ReturnType>(),
-      {detail::typeToId<ArgTypes>()...}};
-  GpuFunctionRegistry::instance().registerFunction(
-      std::move(key),
-      []() -> std::unique_ptr<GpuVectorFunction> {
-        return std::make_unique<
-            GpuSimpleFunction<FnType, ReturnType, ArgTypes...>>();
-      });
+  auto factory = []() -> std::unique_ptr<GpuVectorFunction> {
+    return std::make_unique<
+        GpuSimpleFunction<FnType, ReturnType, ArgTypes...>>();
+  };
+
+  if (&cudf_velox::registerGpuSimpleCudfFunction) {
+    cudf_velox::registerGpuSimpleCudfFunction(
+        name,
+        detail::typeToId<ReturnType>(),
+        {detail::typeToId<ArgTypes>()...},
+        std::move(factory));
+  }
 }
 
 } // namespace facebook::velox::gpu

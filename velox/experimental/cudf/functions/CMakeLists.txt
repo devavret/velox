@@ -23,22 +23,6 @@ target_include_directories(
   INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_shadows
 )
 
-# GPU function registry, dispatch, and expression evaluator (host-side)
-add_library(
-  velox_cudf_gpu_registry
-  GpuFunctionRegistry.cpp
-  CudfFallbackFunction.cpp
-  GpuFunctionDispatch.cpp
-  GpuExprEvaluator.cpp
-  CudfLibraryFunctions.cpp
-)
-
-target_link_libraries(
-  velox_cudf_gpu_registry
-  PUBLIC
-  cudf::cudf
-)
-
 # Presto function registrations (CUDA, compiled with nvcc)
 add_library(velox_cudf_gpu_presto_functions GpuPrestoFunctions.cu)
 
@@ -46,6 +30,7 @@ set_target_properties(
   velox_cudf_gpu_presto_functions PROPERTIES
   CUDA_STANDARD 20
   CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
 target_include_directories(
@@ -61,6 +46,27 @@ target_compile_options(
 target_link_libraries(
   velox_cudf_gpu_presto_functions
   PUBLIC
-  velox_cudf_gpu_registry
   cudf::cudf
+)
+
+# FunctionExpression bridge for the native GPU simple functions above.
+add_library(
+  velox_cudf_gpu_presto_cudf_functions
+  GpuPrestoCudfFunctions.cpp
+)
+
+target_link_libraries(
+  velox_cudf_gpu_presto_cudf_functions
+  PUBLIC
+  cudf::cudf
+  PRIVATE
+  velox_exception
+  velox_common_base
+  velox_cudf_expression
+  velox_cudf_gpu_presto_functions
+)
+
+target_compile_options(
+  velox_cudf_gpu_presto_cudf_functions PRIVATE
+  -Wno-missing-field-initializers
 )

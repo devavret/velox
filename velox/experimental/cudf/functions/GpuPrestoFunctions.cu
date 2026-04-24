@@ -18,8 +18,8 @@
 // Each registerGpuFunction instantiates the GpuSimpleFunction bridge
 // for that specific function+type combo.
 
-#include "velox/experimental/cudf/functions/CudfLibraryFunctions.h"
 #include "velox/experimental/cudf/functions/GpuSimpleFunction.cuh"
+
 #include "velox/common/base/BitUtil.h"
 #include "velox/functions/prestosql/Arithmetic.h"
 #include "velox/functions/prestosql/Bitwise.h"
@@ -138,16 +138,24 @@ void registerPrestoArithmetic() {
   registerGpuFunction<ClampFunction<GpuExec>, float, float, float, float>(
       "clamp");
   registerGpuFunction<
-      ClampFunction<GpuExec>, int64_t, int64_t, int64_t, int64_t>("clamp");
+      ClampFunction<GpuExec>,
+      int64_t,
+      int64_t,
+      int64_t,
+      int64_t>("clamp");
   registerGpuFunction<
-      ClampFunction<GpuExec>, int32_t, int32_t, int32_t, int32_t>("clamp");
+      ClampFunction<GpuExec>,
+      int32_t,
+      int32_t,
+      int32_t,
+      int32_t>("clamp");
 }
 
 void registerPrestoComparisons() {
   using namespace facebook::velox::functions;
 
-  // eq/neq: handled by CudfFallbackRegistry (cudf::binary_operator::EQUAL /
-  // NOT_EQUAL) since EqFunction/NeqFunction lack FOLLY_ALWAYS_INLINE.
+  // eq/neq are not compiled here because EqFunction/NeqFunction lack
+  // FOLLY_ALWAYS_INLINE.
 
   // Lt, Gt, Lte, Gte
   registerGpuFunction<LtFunction<GpuExec>, bool, double, double>("lt");
@@ -184,72 +192,82 @@ void registerPrestoComparisons() {
   registerGpuFunction<BetweenFunction<GpuExec>, bool, float, float, float>(
       "between");
   registerGpuFunction<
-      BetweenFunction<GpuExec>, bool, int64_t, int64_t, int64_t>("between");
+      BetweenFunction<GpuExec>,
+      bool,
+      int64_t,
+      int64_t,
+      int64_t>("between");
   registerGpuFunction<
-      BetweenFunction<GpuExec>, bool, int32_t, int32_t, int32_t>("between");
+      BetweenFunction<GpuExec>,
+      bool,
+      int32_t,
+      int32_t,
+      int32_t>("between");
 }
 
 void registerPrestoBitwise() {
   using namespace facebook::velox::functions;
 
-  registerGpuFunction<
-      BitwiseAndFunction<GpuExec>, int64_t, int64_t, int64_t>("bitwise_and");
-  registerGpuFunction<
-      BitwiseAndFunction<GpuExec>, int64_t, int32_t, int32_t>("bitwise_and");
-  registerGpuFunction<
-      BitwiseAndFunction<GpuExec>, int64_t, int16_t, int16_t>("bitwise_and");
-  registerGpuFunction<
-      BitwiseAndFunction<GpuExec>, int64_t, int8_t, int8_t>("bitwise_and");
+  registerGpuFunction<BitwiseAndFunction<GpuExec>, int64_t, int64_t, int64_t>(
+      "bitwise_and");
+  registerGpuFunction<BitwiseAndFunction<GpuExec>, int64_t, int32_t, int32_t>(
+      "bitwise_and");
+  registerGpuFunction<BitwiseAndFunction<GpuExec>, int64_t, int16_t, int16_t>(
+      "bitwise_and");
+  registerGpuFunction<BitwiseAndFunction<GpuExec>, int64_t, int8_t, int8_t>(
+      "bitwise_and");
+
+  registerGpuFunction<BitwiseOrFunction<GpuExec>, int64_t, int64_t, int64_t>(
+      "bitwise_or");
+  registerGpuFunction<BitwiseOrFunction<GpuExec>, int64_t, int32_t, int32_t>(
+      "bitwise_or");
+  registerGpuFunction<BitwiseOrFunction<GpuExec>, int64_t, int16_t, int16_t>(
+      "bitwise_or");
+  registerGpuFunction<BitwiseOrFunction<GpuExec>, int64_t, int8_t, int8_t>(
+      "bitwise_or");
+
+  registerGpuFunction<BitwiseXorFunction<GpuExec>, int64_t, int64_t, int64_t>(
+      "bitwise_xor");
+  registerGpuFunction<BitwiseXorFunction<GpuExec>, int64_t, int32_t, int32_t>(
+      "bitwise_xor");
+
+  registerGpuFunction<BitwiseNotFunction<GpuExec>, int64_t, int64_t>(
+      "bitwise_not");
+  registerGpuFunction<BitwiseNotFunction<GpuExec>, int64_t, int32_t>(
+      "bitwise_not");
 
   registerGpuFunction<
-      BitwiseOrFunction<GpuExec>, int64_t, int64_t, int64_t>("bitwise_or");
+      BitwiseLeftShiftFunction<GpuExec>,
+      int64_t,
+      int64_t,
+      int32_t>("bitwise_left_shift");
   registerGpuFunction<
-      BitwiseOrFunction<GpuExec>, int64_t, int32_t, int32_t>("bitwise_or");
-  registerGpuFunction<
-      BitwiseOrFunction<GpuExec>, int64_t, int16_t, int16_t>("bitwise_or");
-  registerGpuFunction<
-      BitwiseOrFunction<GpuExec>, int64_t, int8_t, int8_t>("bitwise_or");
+      BitwiseLeftShiftFunction<GpuExec>,
+      int32_t,
+      int32_t,
+      int32_t>("bitwise_left_shift");
 
   registerGpuFunction<
-      BitwiseXorFunction<GpuExec>, int64_t, int64_t, int64_t>("bitwise_xor");
+      BitwiseRightShiftFunction<GpuExec>,
+      int64_t,
+      int64_t,
+      int32_t>("bitwise_right_shift");
   registerGpuFunction<
-      BitwiseXorFunction<GpuExec>, int64_t, int32_t, int32_t>("bitwise_xor");
-
-  registerGpuFunction<
-      BitwiseNotFunction<GpuExec>, int64_t, int64_t>("bitwise_not");
-  registerGpuFunction<
-      BitwiseNotFunction<GpuExec>, int64_t, int32_t>("bitwise_not");
-
-  registerGpuFunction<
-      BitwiseLeftShiftFunction<GpuExec>, int64_t, int64_t, int32_t>(
-      "bitwise_left_shift");
-  registerGpuFunction<
-      BitwiseLeftShiftFunction<GpuExec>, int32_t, int32_t, int32_t>(
-      "bitwise_left_shift");
-
-  registerGpuFunction<
-      BitwiseRightShiftFunction<GpuExec>, int64_t, int64_t, int32_t>(
-      "bitwise_right_shift");
-  registerGpuFunction<
-      BitwiseRightShiftFunction<GpuExec>, int32_t, int32_t, int32_t>(
-      "bitwise_right_shift");
+      BitwiseRightShiftFunction<GpuExec>,
+      int32_t,
+      int32_t,
+      int32_t>("bitwise_right_shift");
 
   registerGpuFunction<
       BitwiseRightShiftArithmeticFunction<GpuExec>,
-      int64_t, int64_t, int32_t>("bitwise_arithmetic_shift_right");
+      int64_t,
+      int64_t,
+      int32_t>("bitwise_arithmetic_shift_right");
   registerGpuFunction<
       BitwiseRightShiftArithmeticFunction<GpuExec>,
-      int32_t, int32_t, int32_t>("bitwise_arithmetic_shift_right");
-}
-
-void registerAllPrestoGpuFunctions() {
-  registerPrestoArithmetic();
-  registerPrestoComparisons();
-  registerPrestoBitwise();
-  registerCudfStringFunctions();
-  registerCudfDateTimeFunctions();
-  registerCudfHashFunctions();
-  registerCudfStatefulFunctions();
+      int32_t,
+      int32_t,
+      int32_t>("bitwise_arithmetic_shift_right");
 }
 
 } // namespace facebook::velox::gpu

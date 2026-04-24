@@ -129,6 +129,10 @@ bool registerCudfExpressionEvaluator(
     CudfExpressionEvaluatorCreate create,
     bool overwrite = true);
 
+// Remove a registered evaluator by name. Returns true if an evaluator was
+// removed.
+bool unregisterCudfExpressionEvaluator(const std::string& name);
+
 class FunctionExpression : public CudfExpression {
  public:
   static std::shared_ptr<FunctionExpression> create(
