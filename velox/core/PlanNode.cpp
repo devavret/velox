@@ -1695,11 +1695,15 @@ void HashJoinNode::addDetails(std::stringstream& stream) const {
   if (nullAware_) {
     stream << ", null aware";
   }
+  if (nullAsValue_) {
+    stream << ", null as value";
+  }
 }
 
 folly::dynamic HashJoinNode::serialize() const {
   auto obj = serializeBase();
   obj["nullAware"] = nullAware_;
+  obj["nullAsValue"] = nullAsValue_;
   obj["useHashTableCache"] = useHashTableCache_;
   return obj;
 }
@@ -1716,6 +1720,7 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
   VELOX_CHECK_EQ(2, sources.size());
 
   auto nullAware = obj["nullAware"].asBool();
+  auto nullAsValue = obj.getDefault("nullAsValue", false).asBool();
   auto useHashTableCache = obj.getDefault("useHashTableCache", false).asBool();
   auto leftKeys = deserializeFields(obj["leftKeys"], context);
   auto rightKeys = deserializeFields(obj["rightKeys"], context);
@@ -1737,7 +1742,8 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
       sources[0],
       sources[1],
       outputType,
-      useHashTableCache);
+      useHashTableCache,
+      nullAsValue);
 }
 
 MergeJoinNode::MergeJoinNode(

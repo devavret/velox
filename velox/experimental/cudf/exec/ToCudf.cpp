@@ -16,10 +16,12 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
-#include "velox/experimental/cudf/exec/CudfHashAggregation.h"
+#include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
+#include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
+#include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/CudfTopNRowNumber.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
@@ -316,7 +318,7 @@ void registerCudf() {
 
   auto prefix = CudfConfig::getInstance().functionNamePrefix;
   registerBuiltinFunctions(prefix);
-  registerStepAwareBuiltinAggregationFunctions(prefix);
+  registerPrestoAggregateFunctions(prefix);
 
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
@@ -424,8 +426,20 @@ void CudfConfig::initialize(
   if (config.find(kCudfTopNBatchSize) != config.end()) {
     topNBatchSize = folly::to<int32_t>(config[kCudfTopNBatchSize]);
   }
-  if (config.find(kCudfFunctionEngine) != config.end()) {
-    functionEngine = config[kCudfFunctionEngine];
+  if (config.find(kCudfTimestampUnit) != config.end()) {
+    const auto& unit = config[kCudfTimestampUnit];
+    if (unit == "s") {
+      timestampUnit = cudf::type_id::TIMESTAMP_SECONDS;
+    } else if (unit == "ms") {
+      timestampUnit = cudf::type_id::TIMESTAMP_MILLISECONDS;
+    } else if (unit == "us") {
+      timestampUnit = cudf::type_id::TIMESTAMP_MICROSECONDS;
+    } else if (unit == "ns") {
+      timestampUnit = cudf::type_id::TIMESTAMP_NANOSECONDS;
+    } else {
+      VELOX_FAIL(
+          "Invalid timestamp unit: {}. Valid values are: s, ms, us, ns", unit);
+    }
   }
 
   if (config.find(kUcxExchange) != config.end()) {

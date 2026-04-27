@@ -53,6 +53,7 @@ enum class FileFormat {
   ORC = 9,
   SST = 10, // rocksdb sst format
   FLUX = 11,
+  AVRO = 12,
 };
 
 FileFormat toFileFormat(std::string_view s);
@@ -475,13 +476,18 @@ class RowReaderOptions {
     passStringBuffersFromDecoder_ = passStringBuffersFromDecoder;
   }
 
-  bool collectColumnStats() const {
-    return collectColumnStats_;
+  bool collectColumnCpuMetrics() const {
+    return collectColumnCpuMetrics_;
   }
 
-  RowReaderOptions& setCollectColumnStats(bool collect) {
-    collectColumnStats_ = collect;
+  RowReaderOptions& setCollectColumnCpuMetrics(bool collect) {
+    collectColumnCpuMetrics_ = collect;
     return *this;
+  }
+
+  // Legacy alias — remove after Nimble OSS bumps Velox.
+  RowReaderOptions& setCollectColumnStats(bool collect) {
+    return setCollectColumnCpuMetrics(collect);
   }
 
  private:
@@ -548,7 +554,7 @@ class RowReaderOptions {
   // NOTE: we will control this option with a session property
   // for prod. Tests are parameterized on both branches.
   bool passStringBuffersFromDecoder_{false};
-  bool collectColumnStats_{false};
+  bool collectColumnCpuMetrics_{false};
 };
 
 /// Options for creating a Reader.
@@ -788,6 +794,20 @@ class ReaderOptions : public io::ReaderOptions {
     allowEmptyFile_ = value;
   }
 
+  /// Allows reading INT32 physical type columns as a narrower integer type
+  /// (e.g., INT32 -> TINYINT/SMALLINT). Some Parquet writers store INT_8 and
+  /// INT_16 values as plain INT32 without a converted type annotation. When
+  /// enabled, the value is silently truncated on overflow. When disabled
+  /// (default), only annotated type-matching reads are allowed (e.g.,
+  /// INT_8 -> TINYINT, INT_16 -> SMALLINT, INT_32 -> INTEGER).
+  bool allowInt32Narrowing() const {
+    return allowInt32Narrowing_;
+  }
+
+  void setAllowInt32Narrowing(bool value) {
+    allowInt32Narrowing_ = value;
+  }
+
  private:
   uint64_t tailLocation_;
   FileFormat fileFormat_;
@@ -810,6 +830,7 @@ class ReaderOptions : public io::ReaderOptions {
   bool loadClusterIndex_{true};
   bool loadChunkIndex_{true};
   bool allowEmptyFile_{false};
+  bool allowInt32Narrowing_{false};
 };
 
 struct WriterOptions {
