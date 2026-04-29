@@ -30,7 +30,7 @@ CudfOrderBy::CudfOrderBy(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     const std::shared_ptr<const core::PlanNode>& planNode)
-    : exec::CudfOperatorBase(
+    : CudfOperatorBase(
           operatorId,
           driverCtx,
           planNode->outputType(),
