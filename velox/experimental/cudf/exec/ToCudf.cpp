@@ -443,6 +443,10 @@ void CudfConfig::initialize(
   if (config.find(kUcxExchangeLogLevel) != config.end()) {
     exchangeLogLevel = folly::to<int32_t>(config[kUcxExchangeLogLevel]);
   }
+  if (config.find(kUcxPartitionedOutputBatchRows) != config.end()) {
+    ucxPartitionedOutputBatchRows =
+        folly::to<int64_t>(config[kUcxPartitionedOutputBatchRows]);
+  }
 }
 
 } // namespace facebook::velox::cudf_velox
