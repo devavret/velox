@@ -70,7 +70,7 @@ CudfPartitionedOutput::CudfPartitionedOutput(
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
       targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
-          core::QueryConfig::kUcxPartitionedOutputBatchRows,
+          core::QueryConfig::kCudfPartitionedOutputBatchRows,
           CudfConfig::getInstance().ucxPartitionedOutputBatchRows)) {
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
