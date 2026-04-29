@@ -227,7 +227,7 @@ CudfVectorPtr CudfTopNRowNumber::computeDeduplication(
         input,
         firstIndex,
         cudf::out_of_bounds_policy::DONT_CHECK,
-        cudf::detail::negative_index_policy::NOT_ALLOWED,
+        cudf::negative_index_policy::NOT_ALLOWED,
         stream,
         mr);
   } else {
@@ -243,7 +243,7 @@ CudfVectorPtr CudfTopNRowNumber::computeDeduplication(
         input,
         sortedIndices->view(),
         cudf::out_of_bounds_policy::DONT_CHECK,
-        cudf::detail::negative_index_policy::NOT_ALLOWED,
+        cudf::negative_index_policy::NOT_ALLOWED,
         stream,
         mr);
 
