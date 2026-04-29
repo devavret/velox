@@ -354,8 +354,9 @@ class QueryConfig {
   static constexpr const char* kUcxPartitionedOutputBatchRows =
       "cudf.partitioned_output_batch_rows";
 
-  static constexpr const char* kMaxPartialAggregationMemory =
-      "max_partial_aggregation_memory";
+  int64_t ucxPartitionedOutputBatchRows() const {
+    return get<int64_t>(kUcxPartitionedOutputBatchRows, 10'000);
+  }
 
   VELOX_QUERY_CONFIG(
       kMaxExtendedPartialAggregationMemory,
@@ -1506,140 +1507,6 @@ class QueryConfig {
     return config::toCapacity(
         get<std::string>(kQueryMaxMemoryPerNode, "0B"),
         config::CapacityUnit::BYTE);
-  }
-
-  uint64_t maxPartialAggregationMemoryUsage() const {
-    static constexpr uint64_t kDefault = 1L << 24;
-    return get<uint64_t>(kMaxPartialAggregationMemory, kDefault);
-  }
-
-  uint64_t maxExtendedPartialAggregationMemoryUsage() const {
-    static constexpr uint64_t kDefault = 1L << 26;
-    return get<uint64_t>(kMaxExtendedPartialAggregationMemory, kDefault);
-  }
-
-  int32_t abandonPartialAggregationMinRows() const {
-    return get<int32_t>(kAbandonPartialAggregationMinRows, 100'000);
-  }
-
-  int32_t abandonPartialAggregationMinPct() const {
-    return get<int32_t>(kAbandonPartialAggregationMinPct, 80);
-  }
-
-  uint64_t aggregationCompactionBytesThreshold() const {
-    return get<uint64_t>(kAggregationCompactionBytesThreshold, 0);
-  }
-
-  double aggregationCompactionUnusedMemoryRatio() const {
-    return get<double>(kAggregationCompactionUnusedMemoryRatio, 0.25);
-  }
-
-  bool aggregationMemoryCompactionReclaimEnabled() const {
-    return get<bool>(kAggregationMemoryCompactionReclaimEnabled, false);
-  }
-
-  int32_t abandonPartialTopNRowNumberMinRows() const {
-    return get<int32_t>(kAbandonPartialTopNRowNumberMinRows, 100'000);
-  }
-
-  int32_t abandonPartialTopNRowNumberMinPct() const {
-    return get<int32_t>(kAbandonPartialTopNRowNumberMinPct, 80);
-  }
-
-  int32_t abandonHashBuildDedupMinRows() const {
-    return get<int32_t>(kAbandonDedupHashMapMinRows, 100'000);
-  }
-
-  int32_t abandonHashBuildDedupMinPct() const {
-    return get<int32_t>(kAbandonDedupHashMapMinPct, 0);
-  }
-
-  int32_t maxElementsSizeInRepeatAndSequence() const {
-    return get<int32_t>(kMaxElementsSizeInRepeatAndSequence, 10'000);
-  }
-
-  uint64_t maxSpillRunRows() const {
-    static constexpr uint64_t kDefault = 12UL << 20;
-    return get<uint64_t>(kMaxSpillRunRows, kDefault);
-  }
-
-  uint64_t maxSpillBytes() const {
-    static constexpr uint64_t kDefault = 100UL << 30;
-    return get<uint64_t>(kMaxSpillBytes, kDefault);
-  }
-
-  bool partitionedOutputEagerFlush() const {
-    return get<bool>(kPartitionedOutputEagerFlush, false);
-  }
-
-  uint64_t maxPartitionedOutputBufferSize() const {
-    static constexpr uint64_t kDefault = 32UL << 20;
-    return get<uint64_t>(kMaxPartitionedOutputBufferSize, kDefault);
-  }
-
-  uint64_t maxOutputBufferSize() const {
-    static constexpr uint64_t kDefault = 32UL << 20;
-    return get<uint64_t>(kMaxOutputBufferSize, kDefault);
-  }
-
-  uint64_t maxLocalExchangeBufferSize() const {
-    static constexpr uint64_t kDefault = 32UL << 20;
-    return get<uint64_t>(kMaxLocalExchangeBufferSize, kDefault);
-  }
-
-  uint32_t maxLocalExchangePartitionCount() const {
-    // defaults to unlimited
-    static constexpr uint32_t kDefault = std::numeric_limits<uint32_t>::max();
-    return get<uint32_t>(kMaxLocalExchangePartitionCount, kDefault);
-  }
-
-  uint32_t minLocalExchangePartitionCountToUsePartitionBuffer() const {
-    // Use non buffering mode if the partition count 32 or less
-    // The default value is 32 is chosen rather conservatively. A
-    // significant performance degradation of a non-buffered approach is
-    // observed after 16 partitions.
-    static constexpr uint64_t kDefault = 33;
-    return get<uint32_t>(
-        kMinLocalExchangePartitionCountToUsePartitionBuffer, kDefault);
-  }
-
-  uint64_t maxLocalExchangePartitionBufferSize() const {
-    /// The default partition buffer size is 64KB.
-    static constexpr uint64_t kDefault = 64UL * 1024;
-    return get<uint64_t>(kMaxLocalExchangePartitionBufferSize, kDefault);
-  }
-
-  bool localExchangePartitionBufferPreserveEncoding() const {
-    /// Trying to preserve encoding can be expensive. Disabled by default.
-    return get<bool>(kLocalExchangePartitionBufferPreserveEncoding, false);
-  }
-
-  uint32_t localMergeSourceQueueSize() const {
-    return get<uint32_t>(kLocalMergeSourceQueueSize, 2);
-  }
-
-  uint64_t maxExchangeBufferSize() const {
-    static constexpr uint64_t kDefault = 32UL << 20;
-    return get<uint64_t>(kMaxExchangeBufferSize, kDefault);
-  }
-
-  uint64_t maxMergeExchangeBufferSize() const {
-    static constexpr uint64_t kDefault = 128UL << 20;
-    return get<uint64_t>(kMaxMergeExchangeBufferSize, kDefault);
-  }
-
-  uint64_t minExchangeOutputBatchBytes() const {
-    static constexpr uint64_t kDefault = 2UL << 20;
-    return get<uint64_t>(kMinExchangeOutputBatchBytes, kDefault);
-  }
-
-  int64_t ucxPartitionedOutputBatchRows() const {
-    return get<int64_t>(kUcxPartitionedOutputBatchRows, 10'000);
-  }
-
-  uint64_t preferredOutputBatchBytes() const {
-    static constexpr uint64_t kDefault = 10UL << 20;
-    return get<uint64_t>(kPreferredOutputBatchBytes, kDefault);
   }
 
   vector_size_t preferredOutputBatchRows() const {
