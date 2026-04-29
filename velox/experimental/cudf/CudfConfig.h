@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -60,6 +61,8 @@ struct CudfConfig {
   static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
   static constexpr const char* kCudfExchangeLogLevel{
       "cudf.exchange_log_level"};
+  static constexpr const char* kUcxPartitionedOutputBatchRows{
+      "cudf.partitioned_output_batch_rows"};
 
   /// Singleton CudfConfig instance.
   /// Clients must set the configs below before invoking registerCudf().
@@ -154,6 +157,10 @@ struct CudfConfig {
   /// VLOG level for cudf-exchange source files (0 = silent, 1-3 = increasing
   /// verbosity). Applied via google::SetVLOGLevel when Communicator starts.
   int32_t exchangeLogLevel{0};
+
+  /// Minimum rows to accumulate in UCX partitioned output before flushing.
+  /// Set to 0 to disable accumulation.
+  int64_t ucxPartitionedOutputBatchRows{10'000};
 };
 
 } // namespace facebook::velox::cudf_velox

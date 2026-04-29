@@ -29,9 +29,8 @@ namespace facebook::velox::cudf_exchange {
 class CudfPartitionedOutput : public exec::Operator,
                               public cudf_velox::NvtxHelper {
  public:
-  // Default minimum rows to accumulate before flushing. Matches HTTP
-  // PartitionedOutput's ~10,000 row target. Overridable via
-  // QueryConfig::kCudfPartitionedOutputBatchRows.
+  // Default minimum rows to accumulate before flushing. Matches the
+  // CudfConfig default and remains overridable via QueryConfig in tests.
   static constexpr int64_t kDefaultTargetRowsPerChunk = 10'000;
 
   CudfPartitionedOutput(
@@ -111,7 +110,7 @@ class CudfPartitionedOutput : public exec::Operator,
   std::vector<cudf_velox::CudfVectorPtr> pendingInputs_;
   /// Total rows across pendingInputs_.
   int64_t pendingRows_{0};
-  /// Configured row threshold for flushing (from QueryConfig).
+  /// Configured row threshold for flushing.
   const int64_t targetRowsPerChunk_;
 };
 
