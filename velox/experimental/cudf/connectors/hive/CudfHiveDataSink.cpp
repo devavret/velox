@@ -38,6 +38,9 @@
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
+#include <string_view>
+#include <system_error>
+
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::cudf_velox::connector::hive {
@@ -47,6 +50,7 @@ namespace {
 std::unordered_map<LocationHandle::TableType, std::string> tableTypeNames() {
   return {
       {LocationHandle::TableType::kNew, "kNew"},
+      {LocationHandle::TableType::kExisting, "kExisting"},
   };
 }
 
@@ -73,6 +77,41 @@ uint64_t getFinishTimeSliceLimitMsFromCudfHiveConfig(
 
 std::string makeUuid() {
   return boost::lexical_cast<std::string>(boost::uuids::random_generator()());
+}
+
+std::string toCudfIoPath(std::string path) {
+  constexpr std::string_view kFilePrefix = "file:";
+  constexpr std::string_view kS3APrefix = "s3a:";
+  if (path.compare(0, kFilePrefix.size(), kFilePrefix) == 0) {
+    std::string_view localPath(path);
+    localPath.remove_prefix(kFilePrefix.size());
+    if (localPath.compare(0, 2, "//") == 0) {
+      localPath.remove_prefix(2);
+      if (localPath.empty() || localPath.front() == '/') {
+        return std::string(localPath);
+      }
+      const auto slash = localPath.find('/');
+      VELOX_CHECK(
+          slash != std::string_view::npos,
+          "Unsupported cuDF Hive file URI without a path: {}",
+          path);
+      const auto authority = localPath.substr(0, slash);
+      VELOX_CHECK(
+          authority == "localhost",
+          "Unsupported cuDF Hive file URI authority: {}",
+          authority);
+      return std::string(localPath.substr(slash));
+    }
+    return std::string(localPath);
+  }
+  if (path.compare(0, kS3APrefix.size(), kS3APrefix) == 0) {
+    path.erase(kS3APrefix.size() - 2, 1);
+  }
+  return path;
+}
+
+bool isLocalIoPath(std::string_view path) {
+  return path.find(':') == std::string_view::npos;
 }
 
 cudf::io::compression_type getCompressionType(
@@ -107,6 +146,18 @@ std::shared_ptr<memory::MemoryPool> createSinkPool(
 std::shared_ptr<memory::MemoryPool> createSortPool(
     const std::shared_ptr<memory::MemoryPool>& writerPool) {
   return writerPool->addLeafChild(fmt::format("{}.sort", writerPool->name()));
+}
+
+CudfHiveWriterParameters::UpdateMode toUpdateMode(
+    LocationHandle::TableType tableType) {
+  switch (tableType) {
+    case LocationHandle::TableType::kNew:
+      return CudfHiveWriterParameters::UpdateMode::kNew;
+    case LocationHandle::TableType::kExisting:
+      return CudfHiveWriterParameters::UpdateMode::kAppend;
+    default:
+      VELOX_UNSUPPORTED("Unsupported table type.");
+  }
 }
 
 } // namespace
@@ -193,18 +244,31 @@ CudfHiveDataSink::createCudfWriter(
       : locationHandle->targetFileName();
 
   auto writerParameters = CudfHiveWriterParameters(
-      CudfHiveWriterParameters::UpdateMode::kNew,
+      toUpdateMode(locationHandle->tableType()),
       targetFileName,
-      locationHandle->targetPath());
-
-  const auto writePath = fs::path(writerParameters.writeDirectory()) /
-      writerParameters.writeFileName();
+      locationHandle->targetPath(),
+      std::nullopt,
+      locationHandle->writePath());
 
   makeWriterOptions(writerParameters);
 
+  const auto writeDirectory =
+      toCudfIoPath(writerInfo_->writerParameters.writeDirectory());
+  if (isLocalIoPath(writeDirectory)) {
+    std::error_code error;
+    fs::create_directories(writeDirectory, error);
+    VELOX_CHECK(
+        !error || fs::exists(writeDirectory),
+        "Failed to create cuDF Hive write directory {}: {}",
+        writeDirectory,
+        error.message());
+  }
+  const auto writePath =
+      (fs::path(writeDirectory) / writerInfo_->writerParameters.writeFileName())
+          .string();
+
   // Create writer options for the given sink
-  const auto sinkInfo = cudf::io::sink_info(
-      fmt::format("{}/{}", locationHandle->targetPath(), targetFileName));
+  const auto sinkInfo = cudf::io::sink_info(writePath);
   auto cudfWriterOptions =
       cudf::io::chunked_parquet_writer_options::builder(sinkInfo)
           .metadata(tableInputMetadata)
@@ -256,7 +320,7 @@ CudfHiveDataSink::createCudfWriter(
           writerOptions->compressionStats);
     }
     // Write sorting columns if available
-    if (sortingColumns_.empty()) {
+    if (!sortingColumns_.empty()) {
       cudfWriterOptions.set_sorting_columns(sortingColumns_);
     }
   }
@@ -332,6 +396,10 @@ DataSink::Stats CudfHiveDataSink::stats() const {
     return stats;
   }
 
+  if (ioStatistics_ == nullptr) {
+    return stats;
+  }
+
   int64_t numWrittenBytes{0};
   int64_t writeIOTimeUs{0};
 
@@ -345,8 +413,11 @@ DataSink::Stats CudfHiveDataSink::stats() const {
     return stats;
   }
 
+  if (writerInfo_ == nullptr) {
+    return stats;
+  }
+
   stats.numWrittenFiles = 1;
-  VELOX_CHECK_NOT_NULL(writerInfo_);
   if (!writerInfo_->spillStats->empty()) {
     stats.spillStats += *writerInfo_->spillStats;
   }
@@ -384,8 +455,6 @@ void CudfHiveDataSink::checkStateTransition(State oldState, State newState) {
 }
 
 bool CudfHiveDataSink::finish() {
-  VELOX_CHECK_NOT_NULL(writer_, "CudfHiveDataSink has no writer");
-
   setState(State::kFinishing);
   return true;
 }
@@ -395,12 +464,17 @@ std::vector<std::string> CudfHiveDataSink::close() {
   closeInternal();
 
   std::vector<std::string> partitionUpdates{};
+  if (writerInfo_ == nullptr) {
+    return partitionUpdates;
+  }
 
   partitionUpdates.reserve(1);
-  VELOX_CHECK_NOT_NULL(writerInfo_);
   // clang-format off
     auto partitionUpdateJson = folly::toJson(
      folly::dynamic::object
+        ("name", "")
+        ("updateMode", CudfHiveWriterParameters::updateModeToString(
+          writerInfo_->writerParameters.updateMode()))
         ("writePath", writerInfo_->writerParameters.writeDirectory())
         ("targetPath", writerInfo_->writerParameters.targetDirectory())
         ("fileWriteInfos", folly::dynamic::array(
@@ -426,14 +500,33 @@ void CudfHiveDataSink::abort() {
 void CudfHiveDataSink::closeInternal() {
   VELOX_CHECK_NE(state_, State::kRunning);
   VELOX_CHECK_NE(state_, State::kFinishing);
-  VELOX_CHECK_NOT_NULL(writer_, "CudfHiveDataSink has no writer");
 
   TestValue::adjust(
       "facebook::velox::connector::hive::CudfHiveDataSink::closeInternal",
       this);
 
-  // Close cudf writer
+  if (writer_ == nullptr) {
+    return;
+  }
+
   writer_->close();
+  if (ioStatistics_ != nullptr && writerInfo_ != nullptr) {
+    const auto writeDirectory =
+        toCudfIoPath(writerInfo_->writerParameters.writeDirectory());
+    if (isLocalIoPath(writeDirectory)) {
+      std::error_code error;
+      const auto writePath = fs::path(writeDirectory) /
+          writerInfo_->writerParameters.writeFileName();
+      const auto fileSize = fs::file_size(writePath, error);
+      if (!error) {
+        const auto rawBytesWritten = ioStatistics_->rawBytesWritten();
+        if (fileSize > rawBytesWritten) {
+          ioStatistics_->incRawBytesWritten(
+              static_cast<int64_t>(fileSize - rawBytesWritten));
+        }
+      }
+    }
+  }
 
   // Reset the unique pointers to Cudf writer and options
   writer_.reset();
@@ -504,6 +597,12 @@ folly::dynamic CudfHiveInsertTableHandle::serialize() const {
     obj["compressionKind"] = common::compressionKindToString(*compressionKind_);
   }
 
+  folly::dynamic params = folly::dynamic::object;
+  for (const auto& [key, value] : serdeParameters_) {
+    params[key] = value;
+  }
+  obj["serdeParameters"] = params;
+
   return obj;
 }
 
@@ -520,8 +619,10 @@ CudfHiveInsertTableHandlePtr CudfHiveInsertTableHandle::create(
         common::stringToCompressionKind(obj["compressionKind"].asString());
   }
   std::unordered_map<std::string, std::string> serdeParameters;
-  for (const auto& pair : obj["serdeParameters"].items()) {
-    serdeParameters.emplace(pair.first.asString(), pair.second.asString());
+  if (obj.count("serdeParameters") > 0) {
+    for (const auto& pair : obj["serdeParameters"].items()) {
+      serdeParameters.emplace(pair.first.asString(), pair.second.asString());
+    }
   }
   return std::make_shared<CudfHiveInsertTableHandle>(
       inputColumns, locationHandle, compressionKind, serdeParameters);
@@ -549,12 +650,15 @@ std::string CudfHiveInsertTableHandle::toString() const {
 void CudfHiveInsertTableHandle::registerSerDe() {
   auto& registry = DeserializationRegistryForSharedPtr();
   registry.Register("HiveInsertTableHandle", CudfHiveInsertTableHandle::create);
+  registry.Register(
+      "CudfHiveInsertTableHandle", CudfHiveInsertTableHandle::create);
 }
 
 std::string LocationHandle::toString() const {
   return fmt::format(
-      "LocationHandle [targetPath: {}, tableType: {},",
+      "LocationHandle [targetPath: {}, writePath: {}, tableType: {},",
       targetPath_,
+      writePath_,
       tableTypeName(tableType_));
 }
 
@@ -562,14 +666,21 @@ folly::dynamic LocationHandle::serialize() const {
   folly::dynamic obj = folly::dynamic::object;
   obj["name"] = "LocationHandle";
   obj["targetPath"] = targetPath_;
+  obj["writePath"] = writePath_;
   obj["tableType"] = tableTypeName(tableType_);
+  obj["targetFileName"] = targetFileName_;
   return obj;
 }
 
 LocationHandlePtr LocationHandle::create(const folly::dynamic& obj) {
   auto targetPath = obj["targetPath"].asString();
+  auto writePath =
+      obj.count("writePath") > 0 ? obj["writePath"].asString() : targetPath;
   auto tableType = tableTypeFromName(obj["tableType"].asString());
-  return std::make_shared<LocationHandle>(targetPath, tableType);
+  auto targetFileName =
+      obj.count("targetFileName") > 0 ? obj["targetFileName"].asString() : "";
+  return std::make_shared<LocationHandle>(
+      targetPath, writePath, tableType, targetFileName);
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive

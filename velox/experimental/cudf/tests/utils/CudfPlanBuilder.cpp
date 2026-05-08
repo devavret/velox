@@ -71,6 +71,10 @@ std::function<PlanNodePtr(std::string, PlanNodePtr)> cudfTableWrite(
     const RowTypePtr& schema) {
   return [=](core::PlanNodeId nodeId,
              core::PlanNodePtr source) -> core::PlanNodePtr {
+    VELOX_CHECK(
+        fileFormat == dwio::common::FileFormat::PARQUET,
+        "CudfHive table writer only supports Parquet output, got {}",
+        dwio::common::toString(fileFormat));
     auto rowType = schema ? schema : source->outputType();
 
     auto locationHandle = CudfHiveConnectorTestBase::makeLocationHandle(
@@ -79,7 +83,12 @@ std::function<PlanNodePtr(std::string, PlanNodePtr)> cudfTableWrite(
         outputFileName);
     auto parquetHandle =
         CudfHiveConnectorTestBase::makeCudfHiveInsertTableHandle(
-            rowType->names(), rowType->children(), locationHandle, compression);
+            rowType->names(),
+            rowType->children(),
+            locationHandle,
+            compression,
+            serdeParameters,
+            options);
     auto insertHandle = std::make_shared<core::InsertTableHandle>(
         std::string(connectorId), parquetHandle);
 

@@ -168,6 +168,7 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
   }
 
   void SetUp() override {
+    CudfConfig::getInstance().allowCpuFallback = false;
     CudfHiveConnectorTestBase::SetUp();
   }
 
@@ -191,6 +192,8 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
           .splits(splits)
           .assertResults(duckDbSql);
     }
+    VELOX_UNSUPPORTED("Spill-enabled CudfHive writer tests are not supported");
+    return nullptr;
   }
 
   std::shared_ptr<Task> assertQueryWithWriterConfigs(
@@ -216,6 +219,8 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
               "0")
           .assertResults(duckDbSql);
     }
+    VELOX_UNSUPPORTED("Spill-enabled CudfHive writer tests are not supported");
+    return nullptr;
   }
 
   RowVectorPtr runQueryWithWriterConfigs(
@@ -237,6 +242,8 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
               "0")
           .copyResults(pool());
     }
+    VELOX_UNSUPPORTED("Spill-enabled CudfHive writer tests are not supported");
+    return nullptr;
   }
 
   void setCommitStrategy(CommitStrategy commitStrategy) {
@@ -285,7 +292,7 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
     std::vector<std::string> files;
     for (auto& path : fs::recursive_directory_iterator(directoryPath)) {
       if (path.is_regular_file()) {
-        files.push_back(path.path().filename());
+        files.push_back(path.path().filename().string());
       }
     }
     return files;
@@ -595,7 +602,13 @@ class TableWriteTest : public CudfHiveConnectorTestBase {
   core::PlanNodeId tableWriteNodeId_;
 };
 
-class BasicTableWriteTest : public CudfHiveConnectorTestBase {};
+class BasicTableWriteTest : public CudfHiveConnectorTestBase {
+ protected:
+  void SetUp() override {
+    CudfConfig::getInstance().allowCpuFallback = false;
+    CudfHiveConnectorTestBase::SetUp();
+  }
+};
 
 TEST_F(BasicTableWriteTest, roundTrip) {
   vector_size_t size = 1'000;
@@ -638,7 +651,7 @@ TEST_F(BasicTableWriteTest, roundTrip) {
                      ->as<FlatVector<StringView>>();
   ASSERT_TRUE(details->isNullAt(0));
   ASSERT_FALSE(details->isNullAt(1));
-  folly::dynamic obj = folly::parseJson(details->valueAt(1));
+  folly::dynamic obj = folly::parseJson(std::string_view(details->valueAt(1)));
 
   ASSERT_EQ(size, obj["rowCount"].asInt());
   auto fileWriteInfos = obj["fileWriteInfos"];
@@ -679,7 +692,7 @@ TEST_F(BasicTableWriteTest, targetFileName) {
   auto results = AssertQueryBuilder(plan).copyResults(pool());
   auto* details = results->childAt(TableWriteTraits::kFragmentChannel)
                       ->asUnchecked<SimpleVector<StringView>>();
-  auto detail = folly::parseJson(details->valueAt(1));
+  auto detail = folly::parseJson(std::string_view(details->valueAt(1)));
   auto fileWriteInfos = detail["fileWriteInfos"];
   ASSERT_EQ(1, fileWriteInfos.size());
   ASSERT_EQ(fileWriteInfos[0]["writeFileName"].asString(), kFileName);

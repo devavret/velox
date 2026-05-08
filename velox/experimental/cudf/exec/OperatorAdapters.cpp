@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
@@ -56,6 +57,7 @@
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
+#include "velox/exec/TableWriter.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/TopNRowNumber.h"
@@ -118,9 +120,9 @@ class TableScanAdapter : public OperatorAdapter {
     }
     auto const& connector = velox::connector::ConnectorRegistry::tryGet(
         tableScanNode->tableHandle()->connectorId());
-    auto cudfHiveConnector = std::dynamic_pointer_cast<
-        facebook::velox::cudf_velox::connector::hive::CudfHiveConnector>(
-        connector);
+    auto cudfHiveConnector =
+        std::dynamic_pointer_cast<connector::hive::CudfHiveConnector>(
+            connector);
     if (!cudfHiveConnector) {
       LOG_FALLBACK(
           "TableScan connector is not CudfHiveConnector, PlanNode id: {}",
@@ -143,6 +145,77 @@ class TableScanAdapter : public OperatorAdapter {
       exec::DriverCtx* /*ctx*/,
       int32_t /*operatorId*/) const override {
     return {}; // Keep original operator
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+/// TableWriterAdapter - Keeps original operator, but allows CudfHiveDataSink.
+class TableWriterAdapter : public OperatorAdapter {
+ public:
+  TableWriterAdapter() : OperatorAdapter("TableWriter") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::TableWriter*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* op,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto tableWriteNode =
+        std::dynamic_pointer_cast<const core::TableWriteNode>(planNode);
+    if (!canHandle(op) || !tableWriteNode) {
+      LOG_FALLBACK(
+          "TableWriterAdapter {} PlanNode id: {}",
+          !canHandle(op) ? "operator is not TableWriter,"
+                         : "planNode is not TableWriteNode,",
+          planNode->id());
+      return false;
+    }
+
+    auto const& connector = velox::connector::ConnectorRegistry::tryGet(
+        tableWriteNode->insertTableHandle()->connectorId());
+    auto cudfHiveConnector = std::dynamic_pointer_cast<
+        facebook::velox::cudf_velox::connector::hive::CudfHiveConnector>(
+        connector);
+    if (cudfHiveConnector == nullptr) {
+      LOG_FALLBACK(
+          "TableWriter connector is not CudfHiveConnector, PlanNode id: {}",
+          planNode->id());
+      return false;
+    }
+
+    auto cudfInsertHandle = std::dynamic_pointer_cast<
+        const connector::hive::CudfHiveInsertTableHandle>(
+        tableWriteNode->insertTableHandle()->connectorInsertTableHandle());
+    if (cudfInsertHandle == nullptr) {
+      LOG_FALLBACK(
+          "TableWriter insert handle is not CudfHiveInsertTableHandle, PlanNode "
+          "id: {}",
+          planNode->id());
+      return false;
+    }
+
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return false;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
   }
 
   bool keepOperator() const override {
@@ -1118,6 +1191,7 @@ void registerAllOperatorAdapters() {
 
   // Register all adapters
   registry.registerAdapter(std::make_unique<TableScanAdapter>());
+  registry.registerAdapter(std::make_unique<TableWriterAdapter>());
   registry.registerAdapter(std::make_unique<FilterProjectAdapter>());
   registry.registerAdapter(std::make_unique<AggregationAdapter>());
   registry.registerAdapter(std::make_unique<HashJoinBuildAdapter>());

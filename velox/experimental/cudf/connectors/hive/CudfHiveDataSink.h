@@ -44,18 +44,36 @@ class LocationHandle : public ISerializable {
   enum class TableType {
     /// Write to a new table to be created.
     kNew,
+    /// Write new files to an existing table directory.
+    kExisting,
   };
 
   LocationHandle(
       std::string targetPath,
       TableType tableType,
       std::string targetFileName = "")
+      : LocationHandle(
+            targetPath,
+            targetPath,
+            tableType,
+            std::move(targetFileName)) {}
+
+  LocationHandle(
+      std::string targetPath,
+      std::string writePath,
+      TableType tableType,
+      std::string targetFileName = "")
       : targetPath_(std::move(targetPath)),
+        writePath_(std::move(writePath)),
         targetFileName_(std::move(targetFileName)),
         tableType_(tableType) {}
 
   const std::string& targetPath() const {
     return targetPath_;
+  }
+
+  const std::string& writePath() const {
+    return writePath_;
   }
 
   const std::string& targetFileName() const {
@@ -81,6 +99,8 @@ class LocationHandle : public ISerializable {
  private:
   // Target directory path.
   const std::string targetPath_;
+  // Directory where the writer should create files before commit.
+  const std::string writePath_;
   // If non-empty, use this name instead of generating our own.
   const std::string targetFileName_;
   // Whether the table to be written is new, already existing or temporary.
@@ -92,6 +112,7 @@ class CudfHiveWriterParameters {
  public:
   enum class UpdateMode {
     kNew, // Write files to a new directory.
+    kAppend, // Write new files to an existing directory.
   };
 
   /// @param updateMode Write the files to a new directory, or append to an
@@ -125,6 +146,8 @@ class CudfHiveWriterParameters {
     switch (updateMode) {
       case UpdateMode::kNew:
         return "NEW";
+      case UpdateMode::kAppend:
+        return "APPEND";
       default:
         VELOX_UNSUPPORTED("Unsupported update mode.");
     }

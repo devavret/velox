@@ -36,9 +36,7 @@ add_executable(
   Main.cpp
   StepAwareAggregationRegistryTest.cpp
 )
-
-# Disabling writer tests until we re-add writing ability to CudfHiveConnector
-# add_executable(velox_cudf_table_write_test Main.cpp TableWriteTest.cpp)
+add_executable(velox_cudf_table_write_test Main.cpp TableWriteTest.cpp)
 add_executable(velox_cudf_mark_distinct_test Main.cpp MarkDistinctTest.cpp)
 add_executable(velox_cudf_topn_test Main.cpp TopNTest.cpp)
 add_executable(velox_cudf_topn_row_number_test Main.cpp TopNRowNumberTest.cpp)
@@ -136,11 +134,11 @@ add_test(
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# add_test(
-#   NAME velox_cudf_table_write_test
-#   COMMAND velox_cudf_table_write_test
-#   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-# )
+add_test(
+  NAME velox_cudf_table_write_test
+  COMMAND velox_cudf_table_write_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 add_test(
   NAME velox_cudf_mark_distinct_test
@@ -205,7 +203,7 @@ if(VELOX_ENABLE_S3)
 endif()
 set_tests_properties(velox_cudf_subfield_filter_ast_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_table_scan_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
-# set_tests_properties(velox_cudf_table_write_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
+set_tests_properties(velox_cudf_table_write_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_mark_distinct_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(velox_cudf_topn_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 set_tests_properties(
@@ -380,17 +378,17 @@ target_link_libraries(
   fmt::fmt
 )
 
-# target_link_libraries(
-#   velox_cudf_table_write_test
-#   velox_cudf_exec_test_lib
-#   velox_cudf_hive_connector
-#   velox_exec
-#   velox_exec_test_lib
-#   velox_test_util
-#   gtest
-#   gtest_main
-#   fmt::fmt
-# )
+target_link_libraries(
+  velox_cudf_table_write_test
+  velox_cudf_exec_test_lib
+  velox_cudf_hive_connector
+  velox_exec
+  velox_exec_test_lib
+  velox_test_util
+  gtest
+  gtest_main
+  fmt::fmt
+)
 
 target_link_libraries(
   velox_cudf_mark_distinct_test

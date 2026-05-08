@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 
@@ -65,7 +66,33 @@ std::unique_ptr<DataSource> CudfHiveConnector::createDataSource(
       hiveConfig_);
 }
 
-// TODO (dm): Re-add data sink
+std::unique_ptr<DataSink> CudfHiveConnector::createDataSink(
+    RowTypePtr inputType,
+    ConnectorInsertTableHandlePtr connectorInsertTableHandle,
+    ConnectorQueryCtx* connectorQueryCtx,
+    CommitStrategy commitStrategy) {
+  auto cudfInsertHandle =
+      std::dynamic_pointer_cast<const CudfHiveInsertTableHandle>(
+          connectorInsertTableHandle);
+  if (cudfInsertHandle == nullptr) {
+    return ::facebook::velox::connector::hive::HiveConnector::createDataSink(
+        std::move(inputType),
+        std::move(connectorInsertTableHandle),
+        connectorQueryCtx,
+        commitStrategy);
+  }
+
+  VELOX_CHECK(
+      cudfIsRegistered(),
+      "CudfHiveConnector requires cuDF to be registered before creating a "
+      "CudfHiveDataSink");
+  return std::make_unique<CudfHiveDataSink>(
+      std::move(inputType),
+      std::move(cudfInsertHandle),
+      connectorQueryCtx,
+      commitStrategy,
+      cudfHiveConfig_);
+}
 
 std::shared_ptr<Connector> CudfHiveConnectorFactory::newConnector(
     const std::string& id,
