@@ -43,6 +43,7 @@
 ///       --preload=gpu
 
 #include "velox/experimental/cudf/benchmarks/CudfBenchmarkHelpers.h"
+#include "velox/experimental/cudf/benchmarks/CudfPiecewiseSpillHashJoinAdapter.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchBenchmark.h"
 
 #include "velox/common/base/SuccinctPrinter.h"
@@ -56,16 +57,19 @@ DECLARE_string(data_path);
 DECLARE_string(data_format);
 DECLARE_string(preload);
 
-DEFINE_int32(
-    repeat,
-    1,
-    "Number of times to replay preloaded data through the ValuesNode. "
-    "Only used when --preload=true. Increase to simulate larger datasets.");
+DEFINE_bool(
+    use_piecewise_spill_join,
+    false,
+    "If true, replace the default cuDF hash-join operators with the "
+    "piecewise host-spill variant that walks all spilled build pieces per "
+    "probe batch. Only inner equi-join with no filter is supported.");
 
-DEFINE_int32(
-    batch_size,
-    1024 * 1024 * 1024,
-    "Number of bytes per batch when reading parquet files during preload.");
+DEFINE_int64(
+    piecewise_spill_piece_rows,
+    5'000'000,
+    "Target rows per spilled build piece for --use_piecewise_spill_join.");
+
+DECLARE_int32(num_drivers);
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec::test;
@@ -79,6 +83,19 @@ using namespace facebook::velox::exec::test;
 class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
  public:
   void runMain(std::ostream& out, RunStats& runStats) override {
+    if (FLAGS_use_piecewise_spill_join) {
+      // The piecewise host-spill study deliberately runs with a single
+      // probe driver so multiple drivers don't compete for the build
+      // pieces. Override num_drivers here; users can still set
+      // --num_drivers explicitly for the baseline runs.
+      if (FLAGS_num_drivers != 1) {
+        out << "[piecewise] forcing --num_drivers=1 (was "
+            << FLAGS_num_drivers << ")" << std::endl;
+        FLAGS_num_drivers = 1;
+      }
+      cudf_velox::registerPiecewiseSpillHashJoinAdapter(
+          static_cast<cudf::size_type>(FLAGS_piecewise_spill_piece_rows));
+    }
     auto pool = memory::memoryManager()->addLeafPool();
     auto format = dwio::common::toFileFormat(FLAGS_data_format);
 

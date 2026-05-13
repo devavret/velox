@@ -36,7 +36,9 @@ target_link_libraries(
 )
 
 add_executable(
-  velox_cudf_hashjoin_spill_benchmark CudfHashJoinSpillBenchmark.cpp)
+  velox_cudf_hashjoin_spill_benchmark
+  CudfHashJoinSpillBenchmark.cpp
+  CudfPiecewiseSpillHashJoinAdapter.cpp)
 
 target_link_libraries(
   velox_cudf_hashjoin_spill_benchmark
