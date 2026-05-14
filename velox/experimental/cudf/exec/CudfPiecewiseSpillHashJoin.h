@@ -17,7 +17,6 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
-#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -33,10 +32,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -67,6 +64,26 @@ class PinnedHostBuffer {
  private:
   void* data_{nullptr};
   std::size_t size_{0};
+};
+
+/// A build piece kept resident on device — used to hand piece 0 from
+/// the build operator to the probe operator so the very first join
+/// doesn't pay an unspill stall.
+struct InitialResidentPiece {
+  /// Device-resident packed payload bytes (the
+  /// `packed_columns::gpu_data` of `cudf::pack(buildTable)`).
+  rmm::device_buffer payloadDevice;
+  /// Host-side metadata for `payloadDevice`, kept so the view can
+  /// outlive the original `packed_columns`.
+  std::vector<std::uint8_t> packedMetadata;
+  /// View over `payloadDevice`, built via `cudf::unpack(metadata,
+  /// payloadDevice.data())`. Valid as long as `payloadDevice` is
+  /// alive.
+  cudf::table_view buildTableView;
+  /// `cudf::hash_join` constructed over `buildTableView.select(...)`.
+  std::unique_ptr<cudf::hash_join> hj;
+  /// Index of this piece (always 0 in the current design).
+  std::size_t pieceIdx{0};
 };
 
 /// One spilled build piece, fully resident in host memory.
@@ -111,16 +128,26 @@ class PiecewiseSpillStore {
   /// Publishes pieces for `planNodeId`. May be called once per task per
   /// plan-node id (multiple build drivers cooperate to publish exactly
   /// once — see the last-driver barrier in
-  /// `CudfPiecewiseSpillHashJoinBuild::doNoMoreInput`).
+  /// `CudfPiecewiseSpillHashJoinBuild::doNoMoreInput`). The
+  /// `initialResident` (piece 0's device state) is moved in if
+  /// present; the probe operator consumes it via `takeInitialResident`.
   void put(
       const core::PlanNodeId& planNodeId,
       std::shared_ptr<std::vector<HostBuildPiece>> pieces,
-      RowTypePtr buildRowType);
+      RowTypePtr buildRowType,
+      InitialResidentPiece initialResident);
 
   /// Returns the pieces for `planNodeId` without removing them. Safe to
   /// call from multiple probe drivers concurrently. Returns
   /// (nullptr, nullptr) if nothing was published for that id.
   std::pair<std::shared_ptr<std::vector<HostBuildPiece>>, RowTypePtr> get(
+      const core::PlanNodeId& planNodeId);
+
+  /// Moves out the initial resident piece for `planNodeId`. Only the
+  /// first caller gets a populated `InitialResidentPiece`; subsequent
+  /// callers get an empty (default-constructed) one. Single-driver
+  /// configuration of the piecewise study guarantees only one caller.
+  InitialResidentPiece takeInitialResident(
       const core::PlanNodeId& planNodeId);
 
   /// Removes the entry for `planNodeId`. Called once per task at probe
@@ -132,6 +159,8 @@ class PiecewiseSpillStore {
   struct Entry {
     std::shared_ptr<std::vector<HostBuildPiece>> pieces;
     RowTypePtr buildRowType;
+    InitialResidentPiece initialResident;
+    bool initialResidentTaken{false};
   };
   std::mutex mutex_;
   std::unordered_map<std::string, Entry> entries_;
@@ -205,27 +234,39 @@ class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  /// Pops the front of the prefetched-piece queue (which must be the
-  /// next piece to process), waits on its ready event, runs
-  /// inner_join + gather on `joinStream_`, and returns the gathered
-  /// output as a `CudfVector` (or nullptr if the join produced zero
-  /// rows). Tops up the prefetch queue after submitting the current
-  /// join so the next H-to-D copy runs on `loadStream_` while
-  /// `joinStream_` is still busy.
-  RowVectorPtr joinAgainstNextPiece();
+  /// One depth-1 slot — the device-resident state for a single build
+  /// piece plus its permanently-bound CUDA stream. Successive pieces
+  /// alternate between two slots so that piece N+1's H-to-D unspill on
+  /// `slotB_.stream` runs concurrently with piece N's inner_join +
+  /// gather on `slotA_.stream`.
+  struct PieceSlot {
+    rmm::device_buffer payloadDevice;
+    cudf::table_view buildTableView;
+    std::unique_ptr<cudf::hash_join> hj;
+    std::size_t pieceIdx{0};
+    /// Permanently bound at first-input time. Both this slot's loads
+    /// and joins use this stream so its full lifecycle stays
+    /// in-order on one stream while the other slot's stream runs
+    /// independently. Default-constructed (legacy default stream)
+    /// here; replaced in `isBlocked` with a pooled stream before
+    /// any work is queued on it.
+    rmm::cuda_stream_view stream{};
+    /// True once the slot has been populated (by either the initial
+    /// resident piece handed off from build, or a `loadPieceInto`
+    /// call).
+    bool valid{false};
+  };
 
-  /// Schedules an asynchronous H-to-D unspill of piece `pieceIdx` on
-  /// `loadStream_` and pushes the resulting in-flight piece onto the
-  /// back of the prefetch queue. The piece carries its own device
-  /// buffers and its own ready event, so prefetches are gated only by
-  /// `loadStream_`'s natural in-order execution (not by any join's
-  /// completion).
-  void prefetchPiece(std::size_t pieceIdx);
+  /// Schedules an asynchronous H-to-D unspill of `pieces_[pieceIdx]`
+  /// into `target` on `target.stream`. Replaces the slot's previous
+  /// contents — the prior buffers' destruction is stream-ordered on
+  /// the same stream.
+  void loadPieceInto(PieceSlot& target, std::size_t pieceIdx);
 
-  /// Issues prefetches until the in-flight queue is full or all
-  /// remaining pieces in the current probe batch have been
-  /// prefetched.
-  void topUpPrefetches();
+  /// Submits inner_join + gather of `slot`'s piece against `probe_` on
+  /// `slot.stream`. Returns the gathered table or nullptr if there
+  /// were no matches.
+  std::unique_ptr<cudf::table> runJoinOnSlot(PieceSlot const& slot);
 
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   RowTypePtr probeType_;
@@ -254,41 +295,20 @@ class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
   /// Cached current probe batch. Set in addInput, cleared after the
   /// last piece is joined.
   CudfVectorPtr probe_;
-  /// Index of the next piece to join against the current probe batch.
-  std::size_t pieceIdx_{0};
 
-  // Pipelining state: a FIFO of prefetched pieces, each with its own
-  // device buffers and ready event. The next piece is scheduled only after
-  // the current piece's join has been submitted, which keeps H-to-D copies
-  // from completing in the host-side setup gap before the join kernels.
+  /// Depth-1 pipeline: two slots, each on its own stream. The
+  /// "resident" slot holds the piece currently being joined; the
+  /// other holds the next piece being loaded. After each
+  /// `doGetOutput`, the roles swap.
+  PieceSlot slotA_;
+  PieceSlot slotB_;
+  bool residentIsA_{true};
+  /// True after slotA_ / slotB_ streams have been allocated.
+  bool slotsInitialized_{false};
 
-  /// Number of build pieces kept loaded ahead of the current piece.
-  static constexpr std::size_t kPrefetchDepth = 1;
-
-  /// A piece whose H-to-D copy + `from_storage` have been scheduled
-  /// on `loadStream_`. Owns its own device buffers, so its lifetime
-  /// is independent of any other in-flight piece.
-  struct PrefetchedPiece {
-    rmm::device_buffer payloadDevice;
-    cudf::table_view buildTableView;
-    std::unique_ptr<cudf::hash_join> hj;
-    std::size_t pieceIdx{0};
-    std::unique_ptr<CudaEvent> ready;
-  };
-
-  /// CUDA stream that runs every join + gather. Set lazily on first
-  /// probe input.
-  std::optional<rmm::cuda_stream_view> joinStream_;
-  /// CUDA stream that runs every H-to-D copy + `from_storage`.
-  std::optional<rmm::cuda_stream_view> loadStream_;
-
-  /// FIFO of in-flight prefetched pieces in increasing pieceIdx
-  /// order. Front is the next piece to be joined.
-  std::deque<PrefetchedPiece> inFlight_;
-
-  /// Index of the next piece to schedule a prefetch for. Resets to 0
-  /// on every new probe batch.
-  std::size_t nextPrefetchIdx_{0};
+  /// Number of pieces processed for the current probe batch. Resets
+  /// to 0 when a new probe batch arrives.
+  std::size_t piecesProcessedThisBatch_{0};
 
   ContinueFuture future_{ContinueFuture::makeEmpty()};
   bool finished_{false};
