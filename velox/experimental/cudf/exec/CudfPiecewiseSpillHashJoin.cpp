@@ -424,6 +424,40 @@ void CudfPiecewiseSpillHashJoinProbe::doAddInput(RowVectorPtr input) {
   VELOX_CHECK_NOT_NULL(cudfInput);
   probe_ = std::move(cudfInput);
   pieceIdx_ = 0;
+
+  // Lazily allocate the two pipeline streams and the four events on
+  // the very first probe input. Doing this here (rather than in the
+  // constructor) keeps CUDA-context-touching code off the velox
+  // operator construction path, which can run before cuDF
+  // initialization on some setups.
+  if (!joinStream_.has_value()) {
+    joinStream_ = cudfGlobalStreamPool().get_stream();
+    loadStream_ = cudfGlobalStreamPool().get_stream();
+    for (auto& e : pieceReady_) {
+      e = std::make_unique<CudaEvent>(cudaEventDisableTiming);
+    }
+    for (auto& e : slotFree_) {
+      e = std::make_unique<CudaEvent>(cudaEventDisableTiming);
+    }
+  }
+
+  // Pre-record slotFree on each slot so the first prefetch's
+  // `loadStream_.waitOn(slotFree_)` returns immediately.
+  if (!slotEventsPrimed_) {
+    for (auto& e : slotFree_) {
+      e->recordFrom(joinStream_.value());
+    }
+    slotEventsPrimed_ = true;
+  }
+
+  // Kick off the prefetch of piece 0 and piece 1 immediately so the
+  // first getOutput() call doesn't pay the full unspill latency.
+  if (pieces_ != nullptr && !pieces_->empty()) {
+    prefetchPiece(0);
+    if (pieces_->size() > 1) {
+      prefetchPiece(1);
+    }
+  }
 }
 
 exec::BlockingReason CudfPiecewiseSpillHashJoinProbe::isBlocked(
@@ -470,12 +504,11 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::doGetOutput() {
     pieceIdx_ = 0;
     return nullptr;
   }
-  auto stream = probe_->stream();
   // Walk pieces until we find one that produces rows, or exhaust them.
   // Pieces with no matching keys produce empty join output; velox requires
   // getOutput() to return nullptr or a non-empty vector.
   while (pieceIdx_ < pieces_->size()) {
-    auto out = joinAgainstPiece(pieceIdx_, stream);
+    auto out = joinAgainstPiece(pieceIdx_);
     ++pieceIdx_;
     if (out != nullptr) {
       return out;
@@ -486,20 +519,30 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::doGetOutput() {
   return nullptr;
 }
 
-RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstPiece(
-    std::size_t pieceIdx,
-    rmm::cuda_stream_view stream) {
+void CudfPiecewiseSpillHashJoinProbe::prefetchPiece(std::size_t pieceIdx) {
+  VELOX_CHECK_LT(pieceIdx, pieces_->size());
+  auto const slotIdx = pieceIdx % 2;
+  auto& slot = slots_[slotIdx];
   auto& piece = (*pieces_)[pieceIdx];
+  auto loadStream = loadStream_.value();
 
-  // Unspill: H-to-D copies of the packed payload and the hash table.
-  auto payloadDevice = rmm::device_buffer{piece.payloadBytes.size(), stream};
+  // The slot's previous tenant (if any) must have been consumed by the
+  // join before we reuse its device buffers. slotFree_ was either
+  // pre-recorded at primeSlotEvents() or recorded by a previous
+  // joinAgainstPiece on this slot.
+  slotFree_[slotIdx]->waitOn(loadStream);
+
+  // Reset slot state under the wait so the rmm::device_buffer
+  // destructor is stream-ordered against the joinStream's last use.
+  slot.hj.reset();
+  slot.payloadDevice = rmm::device_buffer{piece.payloadBytes.size(), loadStream};
   {
     auto const err = cudaMemcpyAsync(
-        payloadDevice.data(),
+        slot.payloadDevice.data(),
         piece.payloadBytes.data(),
         piece.payloadBytes.size(),
         cudaMemcpyHostToDevice,
-        stream.value());
+        loadStream.value());
     VELOX_CHECK(
         err == cudaSuccess,
         "cudaMemcpyAsync H2D of packed payload failed: {}",
@@ -507,7 +550,7 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstPiece(
   }
 
   cudf::hash_join_storage storage;
-  storage.slots = rmm::device_buffer{piece.hashTableBytes.size(), stream};
+  storage.slots = rmm::device_buffer{piece.hashTableBytes.size(), loadStream};
   storage.slot_count = piece.hashSlotCount;
   storage.slot_bytes = piece.hashSlotBytes;
   storage.compare_nulls = piece.hashCompareNulls;
@@ -519,26 +562,53 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstPiece(
         piece.hashTableBytes.data(),
         piece.hashTableBytes.size(),
         cudaMemcpyHostToDevice,
-        stream.value());
+        loadStream.value());
     VELOX_CHECK(
         err == cudaSuccess,
         "cudaMemcpyAsync H2D of hash slots failed: {}",
         cudaGetErrorString(err));
   }
 
-  // Reconstruct the build table view from the packed bytes.
-  auto buildTableView = cudf::unpack(
+  // unpack is a pure CPU operation that builds column_views over the
+  // device-resident packed bytes; safe to invoke before the H-to-D
+  // copy has completed because the views only reference the address.
+  slot.buildTableView = cudf::unpack(
       piece.packedMetadata.data(),
-      reinterpret_cast<std::uint8_t const*>(payloadDevice.data()));
+      reinterpret_cast<std::uint8_t const*>(slot.payloadDevice.data()));
 
-  // Restore the cudf::hash_join over the same key columns.
-  auto hj = cudf::hash_join::from_storage(
-      std::move(storage), buildTableView.select(rightKeyIndices_), stream);
+  // from_storage does one stream-ordered D-to-D copy of the slots
+  // bytes into a freshly-allocated cuco multiset on `loadStream`.
+  slot.hj = cudf::hash_join::from_storage(
+      std::move(storage),
+      slot.buildTableView.select(rightKeyIndices_),
+      loadStream);
+  slot.pieceIdx = pieceIdx;
 
-  // Inner join against the current probe batch.
+  pieceReady_[slotIdx]->recordFrom(loadStream);
+}
+
+RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstPiece(
+    std::size_t pieceIdx) {
+  auto const slotIdx = pieceIdx % 2;
+  auto& slot = slots_[slotIdx];
+  VELOX_CHECK_EQ(
+      slot.pieceIdx,
+      pieceIdx,
+      "Slot {} contains piece {}, not the requested piece",
+      slotIdx,
+      slot.pieceIdx);
+
+  auto joinStream = joinStream_.value();
+
+  // Make the join wait for slot's H-to-D + from_storage to complete.
+  pieceReady_[slotIdx]->waitOn(joinStream);
+
   auto probeView = probe_->getTableView();
-  auto [leftIdx, rightIdx] = hj->inner_join(
-      probeView.select(leftKeyIndices_), std::nullopt, stream, get_temp_mr());
+  auto [leftIdx, rightIdx] = slot.hj->inner_join(
+      probeView.select(leftKeyIndices_),
+      std::nullopt,
+      joinStream,
+      get_temp_mr());
 
   cudf::column_view leftIdxCol{
       cudf::device_span<cudf::size_type const>{*leftIdx}};
@@ -566,7 +636,7 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstPiece(
         probeView.select(leftGather),
         leftIdxCol,
         kOobPolicy,
-        stream,
+        joinStream,
         get_output_mr());
     auto cols = gathered->release();
     for (size_t i = 0; i < cols.size(); ++i) {
@@ -575,10 +645,10 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstPiece(
   }
   if (!rightGather.empty()) {
     auto gathered = cudf::gather(
-        buildTableView.select(rightGather),
+        slot.buildTableView.select(rightGather),
         rightIdxCol,
         kOobPolicy,
-        stream,
+        joinStream,
         get_output_mr());
     auto cols = gathered->release();
     for (size_t i = 0; i < cols.size(); ++i) {
@@ -586,12 +656,23 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstPiece(
     }
   }
 
-  // Drop the device-side build piece state. Everything is stream-ordered.
-  hj.reset();
-  // payloadDevice is freed when it falls out of scope on the stream.
+  // Mark this slot's GPU buffers free for the next prefetch. We must
+  // record AFTER the inner_join and gather have been issued on
+  // joinStream, since they hold references into slot.hj /
+  // slot.buildTableView.
+  slotFree_[slotIdx]->recordFrom(joinStream);
 
-  // Synchronize on this stream so the table is safe to wrap and pass on.
-  stream.synchronize();
+  // Pipeline: while this batch's downstream is consuming the output,
+  // start unspilling piece (pieceIdx + 2) into the now-free slot.
+  auto const prefetchIdx = pieceIdx + 2;
+  if (prefetchIdx < pieces_->size()) {
+    prefetchPiece(prefetchIdx);
+  }
+
+  // Sync the join stream so the returned table is safe to wrap into a
+  // CudfVector and hand to downstream. The load stream continues to
+  // run in parallel — it isn't gated by this sync.
+  joinStream.synchronize();
 
   auto outputTable = std::make_unique<cudf::table>(std::move(joined));
   auto const numRows = static_cast<vector_size_t>(outputTable->num_rows());
@@ -601,7 +682,7 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstPiece(
 
   auto pool = operatorCtx_->pool();
   return std::make_shared<CudfVector>(
-      pool, outputType_, numRows, std::move(outputTable), stream);
+      pool, outputType_, numRows, std::move(outputTable), joinStream);
 }
 
 void CudfPiecewiseSpillHashJoinProbe::doNoMoreInput() {
@@ -610,6 +691,20 @@ void CudfPiecewiseSpillHashJoinProbe::doNoMoreInput() {
 
 void CudfPiecewiseSpillHashJoinProbe::doClose() {
   Operator::close();
+  // Drop any in-flight slot state on the join stream so the
+  // rmm::device_buffer deletions are ordered after the last join.
+  if (joinStream_.has_value()) {
+    joinStream_->synchronize();
+  }
+  if (loadStream_.has_value()) {
+    loadStream_->synchronize();
+  }
+  for (auto& slot : slots_) {
+    slot.hj.reset();
+    slot.payloadDevice = rmm::device_buffer{};
+    slot.buildTableView = cudf::table_view{};
+    slot.pieceIdx = ProbeSlot::kNoPiece;
+  }
   pieces_.reset();
   probe_.reset();
 }
