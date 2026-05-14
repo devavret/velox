@@ -674,21 +674,15 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::doGetOutput() {
         resident.valid,
         "Resident slot is empty in piecewise probe");
 
-    auto const joinStreamUsed = resident.stream;
-    auto outputTable = runJoinOnSlot(resident);
-
-    // Schedule the next piece's H-to-D unspill AFTER the current
-    // piece's join kernel has been launched on resident.stream. This
-    // ensures the join kernel appears on the GPU schedule before the
-    // unspill kernels (including cuco's storage-init cub::DeviceFor::
-    // Bulk), so the unspill work overlaps with — rather than precedes
-    // — the current join.
     bool prefetched = false;
     if (numPieces > 1) {
       auto const nextIdx = (resident.pieceIdx + 1) % numPieces;
       loadPieceInto(next, nextIdx);
       prefetched = true;
     }
+
+    auto const joinStreamUsed = resident.stream;
+    auto outputTable = runJoinOnSlot(resident);
 
     // Sync the resident's stream so the output table is safe to wrap.
     // The other slot's stream keeps running its H-to-D in parallel.

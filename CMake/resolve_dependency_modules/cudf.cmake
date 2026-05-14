@@ -53,12 +53,12 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf commit beb08ee from 2026-05-13
+# cudf commit f4a7d1b from 2026-05-14
 set(VELOX_cudf_VERSION 26.06 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT beb08ee7c1945388b03b5f52f75629b5c2566461)
+set(VELOX_cudf_COMMIT f4a7d1be5af12da185a04bff0a7d71db8af6b7ad)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  7eb193bb777dc75e8f05d2b2ad685f196ffc5e38072bd7125b42c1f9062039e8
+  7bfe32d39fd19b597d86685915bbfbc425e42c1464f3b307f2519f75e6b89064
 )
 set(VELOX_cudf_SOURCE_URL "https://github.com/devavret/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
