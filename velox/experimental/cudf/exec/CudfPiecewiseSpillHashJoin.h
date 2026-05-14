@@ -182,7 +182,9 @@ class CudfPiecewiseSpillHashJoinBuild : public CudfOperatorBase {
 /// For each incoming probe batch, iterates over all build pieces. Each
 /// piece is unspilled to device just-in-time, used to construct a fresh
 /// `cudf::hash_join` via `cudf::hash_join::from_storage`, then joined and
-/// emitted. v1 is sequential — no double-buffer pipelining yet.
+/// emitted. The next build piece is prefetched after the current probe
+/// has launched its join work, so host-to-device restore copies can overlap
+/// the previous piece's join/gather kernels.
 class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
  public:
   CudfPiecewiseSpillHashJoinProbe(
@@ -207,8 +209,9 @@ class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
   /// next piece to process), waits on its ready event, runs
   /// inner_join + gather on `joinStream_`, and returns the gathered
   /// output as a `CudfVector` (or nullptr if the join produced zero
-  /// rows). Tops up the prefetch queue before returning so the next
-  /// H-to-D copy is queued behind the current load on `loadStream_`.
+  /// rows). Tops up the prefetch queue after submitting the current
+  /// join so the next H-to-D copy runs on `loadStream_` while
+  /// `joinStream_` is still busy.
   RowVectorPtr joinAgainstNextPiece();
 
   /// Schedules an asynchronous H-to-D unspill of piece `pieceIdx` on
@@ -255,15 +258,12 @@ class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
   std::size_t pieceIdx_{0};
 
   // Pipelining state: a FIFO of prefetched pieces, each with its own
-  // device buffers and ready event. Up to `kPrefetchDepth` pieces are
-  // in flight at any time so the H-to-D copy of piece (K + depth)
-  // overlaps with the join of piece K on a separate stream.
+  // device buffers and ready event. The next piece is scheduled only after
+  // the current piece's join has been submitted, which keeps H-to-D copies
+  // from completing in the host-side setup gap before the join kernels.
 
   /// Number of build pieces kept loaded ahead of the current piece.
-  /// 2 is enough to keep both streams busy: while piece K's join
-  /// runs on joinStream_, piece K+1 (still loading) and piece K+2
-  /// (just queued behind K+1) progress on loadStream_.
-  static constexpr std::size_t kPrefetchDepth = 2;
+  static constexpr std::size_t kPrefetchDepth = 1;
 
   /// A piece whose H-to-D copy + `from_storage` have been scheduled
   /// on `loadStream_`. Owns its own device buffers, so its lifetime

@@ -435,8 +435,9 @@ void CudfPiecewiseSpillHashJoinProbe::doAddInput(RowVectorPtr input) {
     loadStream_ = cudfGlobalStreamPool().get_stream();
   }
 
-  // Queue the first round of prefetches so the first getOutput()
-  // call doesn't pay the full unspill latency.
+  // Queue only the first piece here. Later pieces are queued after the
+  // current piece's join is launched so their H-to-D copies overlap with
+  // join/gather kernels instead of running during host-side join setup.
   topUpPrefetches();
 }
 
@@ -582,12 +583,6 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstNextPiece() {
   auto piece = std::move(inFlight_.front());
   inFlight_.pop_front();
 
-  // Top up the prefetch queue BEFORE we submit the join so the next
-  // H-to-D copy is queued on loadStream ahead of the join's wait on
-  // the current piece's `ready` event. That way the H-to-D copy and
-  // the next inner_join can overlap on their respective streams.
-  topUpPrefetches();
-
   auto joinStream = joinStream_.value();
 
   // Wait for the current piece's H-to-D + from_storage to complete.
@@ -599,6 +594,14 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::joinAgainstNextPiece() {
       std::nullopt,
       joinStream,
       get_temp_mr());
+
+  // Queue the next piece after inner_join has submitted its retrieve work.
+  // cudf::hash_join::inner_join performs a host-visible output-size phase
+  // before launching the retrieve kernel; prefetching before the call lets
+  // H-to-D copies finish in that setup gap. Scheduling here puts the next
+  // unspill on loadStream_ while the current join/gather work is still
+  // running on joinStream_.
+  topUpPrefetches();
 
   cudf::column_view leftIdxCol{
       cudf::device_span<cudf::size_type const>{*leftIdx}};
