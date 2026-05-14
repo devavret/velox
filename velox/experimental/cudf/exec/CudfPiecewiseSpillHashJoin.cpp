@@ -440,12 +440,17 @@ exec::BlockingReason CudfPiecewiseSpillHashJoinProbe::isBlocked(
     return exec::BlockingReason::kWaitForJoinBuild;
   }
   // Build has signaled completion via the bridge; pull the real pieces
-  // from the spill store.
+  // from the spill store and immediately erase the store entry. The
+  // probe holds its own shared_ptr to the pieces vector, so the data
+  // stays alive for the lifetime of this operator while freeing the
+  // store slot for future benchmark repetitions that reuse plan-node
+  // ids.
   auto entry = PiecewiseSpillStore::getInstance().get(planNodeId());
   VELOX_CHECK_NOT_NULL(
       entry.first, "PiecewiseSpillStore has no entry for {}", planNodeId());
   pieces_ = std::move(entry.first);
   unpackedBuildType_ = std::move(entry.second);
+  PiecewiseSpillStore::getInstance().erase(planNodeId());
   return exec::BlockingReason::kNotBlocked;
 }
 
