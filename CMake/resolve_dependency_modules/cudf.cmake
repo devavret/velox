@@ -53,14 +53,14 @@ set(
 )
 velox_resolve_dependency_url(kvikio)
 
-# cudf commit d09d10d from 2026-05-04
+# cudf commit beb08ee from 2026-05-13
 set(VELOX_cudf_VERSION 26.06 CACHE STRING "cudf version")
-set(VELOX_cudf_COMMIT d09d10d14d3ed932b8de93638809101af5c7fec3)
+set(VELOX_cudf_COMMIT beb08ee7c1945388b03b5f52f75629b5c2566461)
 set(
   VELOX_cudf_BUILD_SHA256_CHECKSUM
-  5042ec46beb8260eb60d13b9cd44f26357b9756628f7d58659c77e88c67e15d5
+  7eb193bb777dc75e8f05d2b2ad685f196ffc5e38072bd7125b42c1f9062039e8
 )
-set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
+set(VELOX_cudf_SOURCE_URL "https://github.com/devavret/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
 # Use block so we don't leak variables
