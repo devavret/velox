@@ -20,6 +20,11 @@
 
 #include "velox/exec/Task.h"
 
+#include <folly/Unit.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
+#include <folly/futures/Future.h>
+
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -29,12 +34,30 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
 
 constexpr auto kOobPolicy = cudf::out_of_bounds_policy::NULLIFY;
+
+folly::CPUThreadPoolExecutor* piecewiseUnspillExecutor() {
+  static auto pool = std::make_unique<folly::CPUThreadPoolExecutor>(
+      1, std::make_shared<folly::NamedThreadFactory>("CudfUnspill"));
+  return pool.get();
+}
+
+void checkCuda(cudaError_t err, const char* op) {
+  VELOX_CHECK(
+      err == cudaSuccess, "{} failed: {}", op, cudaGetErrorString(err));
+}
+
+int currentCudaDevice() {
+  int device = 0;
+  checkCuda(cudaGetDevice(&device), "cudaGetDevice");
+  return device;
+}
 
 /// Returns true if the join key has been validated as a simple inner equi
 /// join with no filter. The piecewise variant only supports this case.
@@ -661,11 +684,14 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::doGetOutput() {
   }
 
   // Walk pieces until we find one that produces rows, or exhaust them.
-  // Each iteration: (1) launch H-to-D + from_storage of the next piece
-  // into the OTHER slot on its stream; (2) launch inner_join + gather
-  // on the resident slot's stream; (3) sync resident stream then next
-  // stream; (4) swap slots so the freshly-loaded piece becomes
-  // resident.
+  // Each iteration: (1) ask a single worker thread to launch H-to-D +
+  // from_storage of the next piece into the OTHER slot on its stream;
+  // (2) immediately launch inner_join + gather on the resident slot's
+  // stream from this driver thread; (3) sync the resident stream and
+  // wait for the worker; (4) swap slots so the freshly-loaded piece
+  // becomes resident. The worker absorbs cuDF's hidden stream sync in
+  // table_device_view construction, so it cannot block submission of
+  // the resident join.
   auto const numPieces = pieces_->size();
   while (piecesProcessedThisBatch_ < numPieces) {
     auto& resident = residentIsA_ ? slotA_ : slotB_;
@@ -674,39 +700,58 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::doGetOutput() {
         resident.valid,
         "Resident slot is empty in piecewise probe");
 
-    bool prefetched = false;
+    std::optional<folly::Future<folly::Unit>> prefetchFuture;
     if (numPieces > 1) {
       auto const nextIdx = (resident.pieceIdx + 1) % numPieces;
-      loadPieceInto(next, nextIdx);
-      prefetched = true;
+      auto* nextSlot = &next;
+      auto const device = currentCudaDevice();
+      prefetchFuture = folly::via(
+          piecewiseUnspillExecutor(),
+          [this, nextSlot, nextIdx, device]() -> folly::Unit {
+            checkCuda(cudaSetDevice(device), "cudaSetDevice");
+            loadPieceInto(*nextSlot, nextIdx);
+            return folly::Unit{};
+          });
     }
 
-    auto const joinStreamUsed = resident.stream;
-    auto outputTable = runJoinOnSlot(resident);
+    try {
+      auto const joinStreamUsed = resident.stream;
+      auto outputTable = runJoinOnSlot(resident);
 
-    // Sync the resident's stream so the output table is safe to wrap.
-    // The other slot's stream keeps running its H-to-D in parallel.
-    resident.stream.synchronize();
+      // Sync the resident's stream so the output table is safe to wrap.
+      // The other slot's worker can remain blocked on its own stream
+      // without delaying join submission on this thread.
+      resident.stream.synchronize();
 
-    if (prefetched) {
-      // Wait for the prefetch to finish before promoting it; usually
-      // near-instant because it overlapped the join.
-      next.stream.synchronize();
-      residentIsA_ = !residentIsA_;
-    }
+      if (prefetchFuture.has_value()) {
+        std::move(*prefetchFuture).get();
+        prefetchFuture.reset();
+        residentIsA_ = !residentIsA_;
+      }
 
-    ++piecesProcessedThisBatch_;
+      ++piecesProcessedThisBatch_;
 
-    if (outputTable != nullptr) {
-      auto const numRows =
-          static_cast<vector_size_t>(outputTable->num_rows());
-      auto pool = operatorCtx_->pool();
-      return std::make_shared<CudfVector>(
-          pool,
-          outputType_,
-          numRows,
-          std::move(outputTable),
-          joinStreamUsed);
+      if (outputTable != nullptr) {
+        auto const numRows =
+            static_cast<vector_size_t>(outputTable->num_rows());
+        auto pool = operatorCtx_->pool();
+        return std::make_shared<CudfVector>(
+            pool,
+            outputType_,
+            numRows,
+            std::move(outputTable),
+            joinStreamUsed);
+      }
+    } catch (...) {
+      if (prefetchFuture.has_value()) {
+        try {
+          std::move(*prefetchFuture).get();
+        } catch (...) {
+          // Preserve the exception from the resident join path. The
+          // worker is joined here only to keep slot ownership sane.
+        }
+      }
+      throw;
     }
   }
   probe_.reset();
