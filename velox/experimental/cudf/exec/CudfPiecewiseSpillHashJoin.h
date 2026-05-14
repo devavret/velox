@@ -21,7 +21,6 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
-#include "velox/exec/Operator.h"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/join/hash_join.hpp>
@@ -32,10 +31,9 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -205,25 +203,26 @@ class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
   void doClose() override;
 
  private:
-  /// Joins the current probe batch against piece `pieceIdx`, returning
-  /// the gathered output as a `CudfVector` (or nullptr if the join
-  /// produced zero rows). Internally:
-  ///   1. Waits on `pieceReady_[pieceIdx % 2]` so the H-to-D copies
-  ///      and `cudf::hash_join::from_storage` for that slot have
-  ///      completed.
-  ///   2. Runs the inner join + gather on `joinStream_`.
-  ///   3. Records `slotFree_[pieceIdx % 2]` so the next prefetch into
-  ///      this slot waits for the join to release the slot's device
-  ///      buffers.
-  ///   4. Schedules a prefetch of piece `pieceIdx + 2` (if it exists)
-  ///      into the same slot on `loadStream_`.
-  RowVectorPtr joinAgainstPiece(std::size_t pieceIdx);
+  /// Pops the front of the prefetched-piece queue (which must be the
+  /// next piece to process), waits on its ready event, runs
+  /// inner_join + gather on `joinStream_`, and returns the gathered
+  /// output as a `CudfVector` (or nullptr if the join produced zero
+  /// rows). Tops up the prefetch queue before returning so the next
+  /// H-to-D copy is queued behind the current load on `loadStream_`.
+  RowVectorPtr joinAgainstNextPiece();
 
-  /// Schedules an asynchronous H-to-D unspill of piece `pieceIdx` into
-  /// slot `pieceIdx % 2` on `loadStream_`. Waits on the slot's
-  /// `slotFree_` event before reusing the slot's storage, and records
-  /// `pieceReady_` for the slot when the load is complete.
+  /// Schedules an asynchronous H-to-D unspill of piece `pieceIdx` on
+  /// `loadStream_` and pushes the resulting in-flight piece onto the
+  /// back of the prefetch queue. The piece carries its own device
+  /// buffers and its own ready event, so prefetches are gated only by
+  /// `loadStream_`'s natural in-order execution (not by any join's
+  /// completion).
   void prefetchPiece(std::size_t pieceIdx);
+
+  /// Issues prefetches until the in-flight queue is full or all
+  /// remaining pieces in the current probe batch have been
+  /// prefetched.
+  void topUpPrefetches();
 
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   RowTypePtr probeType_;
@@ -255,23 +254,26 @@ class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
   /// Index of the next piece to join against the current probe batch.
   std::size_t pieceIdx_{0};
 
-  // Pipelining state: a 2-slot double buffer. While the join on the
-  // current piece (slot `pieceIdx_ % 2`) runs on `joinStream_`, the
-  // next piece is unspilled into the other slot on `loadStream_`.
+  // Pipelining state: a FIFO of prefetched pieces, each with its own
+  // device buffers and ready event. Up to `kPrefetchDepth` pieces are
+  // in flight at any time so the H-to-D copy of piece (K + depth)
+  // overlaps with the join of piece K on a separate stream.
 
-  /// One slot of the double buffer. Holds the device-resident state
-  /// for a single in-flight build piece: the packed payload bytes
-  /// (D-resident), the unpacked `table_view` over those bytes, and
-  /// the reconstructed `cudf::hash_join`. `pieceIdx` is the index of
-  /// the piece currently loaded into the slot (or `kNoPiece` if the
-  /// slot has never been loaded).
-  struct ProbeSlot {
-    static constexpr std::size_t kNoPiece =
-        std::numeric_limits<std::size_t>::max();
+  /// Number of build pieces kept loaded ahead of the current piece.
+  /// 2 is enough to keep both streams busy: while piece K's join
+  /// runs on joinStream_, piece K+1 (still loading) and piece K+2
+  /// (just queued behind K+1) progress on loadStream_.
+  static constexpr std::size_t kPrefetchDepth = 2;
+
+  /// A piece whose H-to-D copy + `from_storage` have been scheduled
+  /// on `loadStream_`. Owns its own device buffers, so its lifetime
+  /// is independent of any other in-flight piece.
+  struct PrefetchedPiece {
     rmm::device_buffer payloadDevice;
     cudf::table_view buildTableView;
     std::unique_ptr<cudf::hash_join> hj;
-    std::size_t pieceIdx{kNoPiece};
+    std::size_t pieceIdx{0};
+    std::unique_ptr<CudaEvent> ready;
   };
 
   /// CUDA stream that runs every join + gather. Set lazily on first
@@ -280,18 +282,13 @@ class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
   /// CUDA stream that runs every H-to-D copy + `from_storage`.
   std::optional<rmm::cuda_stream_view> loadStream_;
 
-  /// `pieceReady_[s]` is signalled when slot s's load + from_storage
-  /// have completed on `loadStream_`.
-  std::array<std::unique_ptr<CudaEvent>, 2> pieceReady_;
-  /// `slotFree_[s]` is signalled after the join on slot s completes,
-  /// gating the next prefetch into the same slot.
-  std::array<std::unique_ptr<CudaEvent>, 2> slotFree_;
+  /// FIFO of in-flight prefetched pieces in increasing pieceIdx
+  /// order. Front is the next piece to be joined.
+  std::deque<PrefetchedPiece> inFlight_;
 
-  std::array<ProbeSlot, 2> slots_;
-
-  /// True after `primeSlotEvents()` has been called on the first
-  /// probe input.
-  bool slotEventsPrimed_{false};
+  /// Index of the next piece to schedule a prefetch for. Resets to 0
+  /// on every new probe batch.
+  std::size_t nextPrefetchIdx_{0};
 
   ContinueFuture future_{ContinueFuture::makeEmpty()};
   bool finished_{false};
