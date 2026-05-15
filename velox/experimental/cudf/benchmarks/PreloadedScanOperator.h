@@ -33,9 +33,7 @@ class PreloadedTableStore {
  public:
   static PreloadedTableStore& getInstance();
 
-  void store(
-      const std::string& tableName,
-      std::vector<RowVectorPtr> batches);
+  void store(const std::string& tableName, std::vector<RowVectorPtr> batches);
 
   const std::vector<RowVectorPtr>* getBatches(
       const std::string& tableName) const;
@@ -84,7 +82,8 @@ class PreloadedScanOperator : public exec::SourceOperator {
   const std::string tableName_;
   const std::vector<RowVectorPtr>* batches_;
   std::vector<column_index_t> columnMapping_;
-  size_t currentBatch_ = 0;
+  size_t currentBatch_{0};
+  size_t batchStride_{1};
   bool finished_ = false;
 };
 

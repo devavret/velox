@@ -41,8 +41,15 @@
 ///   ./velox_cudf_hashjoin_spill_benchmark \
 ///       --data_path=/data/tpch/pq_sf10_f64 --include_results \
 ///       --preload=gpu
+///
+///   # Partitioned join experiment:
+///   ./velox_cudf_hashjoin_spill_benchmark \
+///       --data_path=/data/tpch/pq_sf10_f64 --include_results \
+///       --spill_join_strategy=partitioned \
+///       --partitioned_join_num_partitions=16
 
 #include "velox/experimental/cudf/benchmarks/CudfBenchmarkHelpers.h"
+#include "velox/experimental/cudf/benchmarks/CudfPartitionedHashJoinAdapter.h"
 #include "velox/experimental/cudf/benchmarks/CudfPiecewiseSpillHashJoinAdapter.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchBenchmark.h"
 
@@ -57,17 +64,22 @@ DECLARE_string(data_path);
 DECLARE_string(data_format);
 DECLARE_string(preload);
 
-DEFINE_bool(
-    use_piecewise_spill_join,
-    false,
-    "If true, replace the default cuDF hash-join operators with the "
-    "piecewise host-spill variant that walks all spilled build pieces per "
-    "probe batch. Only inner equi-join with no filter is supported.");
+DEFINE_string(
+    spill_join_strategy,
+    "baseline",
+    "Hash join strategy for this benchmark: baseline, piecewise, or "
+    "partitioned. Only the custom strategies support inner equi-join with no "
+    "filter.");
 
 DEFINE_int64(
     piecewise_spill_piece_rows,
     5'000'000,
-    "Target rows per spilled build piece for --use_piecewise_spill_join.");
+    "Target rows per spilled build piece for --spill_join_strategy=piecewise.");
+
+DEFINE_int32(
+    partitioned_join_num_partitions,
+    16,
+    "Number of hash partitions for --spill_join_strategy=partitioned.");
 
 DECLARE_int32(num_drivers);
 
@@ -83,18 +95,36 @@ using namespace facebook::velox::exec::test;
 class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
  public:
   void runMain(std::ostream& out, RunStats& runStats) override {
-    if (FLAGS_use_piecewise_spill_join) {
+    if (FLAGS_spill_join_strategy == "piecewise") {
+      VELOX_CHECK_GT(
+          FLAGS_piecewise_spill_piece_rows,
+          0,
+          "--piecewise_spill_piece_rows must be positive");
       // The piecewise host-spill study deliberately runs with a single
       // probe driver so multiple drivers don't compete for the build
       // pieces. Override num_drivers here; users can still set
       // --num_drivers explicitly for the baseline runs.
       if (FLAGS_num_drivers != 1) {
-        out << "[piecewise] forcing --num_drivers=1 (was "
-            << FLAGS_num_drivers << ")" << std::endl;
+        out << "[piecewise] forcing --num_drivers=1 (was " << FLAGS_num_drivers
+            << ")" << std::endl;
         FLAGS_num_drivers = 1;
       }
       cudf_velox::registerPiecewiseSpillHashJoinAdapter(
           static_cast<cudf::size_type>(FLAGS_piecewise_spill_piece_rows));
+    } else if (FLAGS_spill_join_strategy == "partitioned") {
+      VELOX_CHECK_GT(
+          FLAGS_partitioned_join_num_partitions,
+          0,
+          "--partitioned_join_num_partitions must be positive");
+      cudf_velox::registerPartitionedHashJoinAdapter(
+          FLAGS_partitioned_join_num_partitions);
+    } else {
+      VELOX_CHECK_EQ(
+          FLAGS_spill_join_strategy,
+          "baseline",
+          "Unsupported --spill_join_strategy: {}. Expected baseline, "
+          "piecewise, or partitioned.",
+          FLAGS_spill_join_strategy);
     }
     auto pool = memory::memoryManager()->addLeafPool();
     auto format = dwio::common::toFileFormat(FLAGS_data_format);
@@ -130,6 +160,11 @@ class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
     out << "=== cuDF Hash Join Spill Benchmark ===" << std::endl;
     out << "Data path: " << FLAGS_data_path << std::endl;
     out << "Preload mode: " << FLAGS_preload << std::endl;
+    out << "Join strategy: " << FLAGS_spill_join_strategy << std::endl;
+    if (FLAGS_spill_join_strategy == "partitioned") {
+      out << "Partitioned join partitions: "
+          << FLAGS_partitioned_join_num_partitions << std::endl;
+    }
     out << "Lineitem files: " << lineitemInfo.dataFiles.size() << std::endl;
     out << "Orders files: " << ordersInfo.dataFiles.size() << std::endl;
 

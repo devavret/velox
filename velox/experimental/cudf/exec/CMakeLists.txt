@@ -24,6 +24,7 @@ add_library(
   CudfGroupby.cpp
   CudfAggregation.cpp
   CudfHashJoin.cpp
+  CudfPartitionedHashJoin.cpp
   CudfPiecewiseSpillHashJoin.cpp
   CudfReduce.cpp
   CudfLimit.cpp

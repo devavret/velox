@@ -15,13 +15,14 @@
  */
 
 #include "velox/experimental/cudf/benchmarks/PreloadedScanOperator.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/exec/TableScan.h"
-#include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/exec/Task.h"
 
 #include <cudf/copying.hpp>
 
@@ -76,13 +77,17 @@ PreloadedScanOperator::PreloadedScanOperator(
           dynamic_cast<const velox::connector::hive::HiveTableHandle*>(
               scanNode->tableHandle().get())
               ->tableName()) {
+  auto const numDrivers = ctx->task->numDrivers(ctx->driver);
+  VELOX_CHECK_GT(numDrivers, 0);
+  batchStride_ = static_cast<size_t>(numDrivers);
+  currentBatch_ = static_cast<size_t>(ctx->partitionId);
+
   auto& store = PreloadedTableStore::getInstance();
   batches_ = store.getBatches(tableName_);
   VELOX_CHECK_NOT_NULL(
-      batches_,
-      "Preloaded data not found for table: {}",
-      tableName_);
-  VELOX_CHECK(!batches_->empty(), "Preloaded batches empty for: {}", tableName_);
+      batches_, "Preloaded data not found for table: {}", tableName_);
+  VELOX_CHECK(
+      !batches_->empty(), "Preloaded batches empty for: {}", tableName_);
 
   const auto& storeType = batches_->front()->type()->asRow();
   for (auto i = 0; i < scanOutputType_->size(); ++i) {
@@ -134,7 +139,9 @@ RowVectorPtr PreloadedScanOperator::getOutput() {
     finished_ = true;
     return nullptr;
   }
-  return selectColumns((*batches_)[currentBatch_++]);
+  auto output = selectColumns((*batches_)[currentBatch_]);
+  currentBatch_ += batchStride_;
+  return output;
 }
 
 // --- PreloadedTableScanAdapter ---
@@ -200,8 +207,7 @@ class PreloadedTableScanAdapter : public OperatorAdapter {
     auto const& conn = velox::connector::ConnectorRegistry::tryGet(
         tableScanNode->tableHandle()->connectorId());
     return std::dynamic_pointer_cast<
-               cudf_velox::connector::hive::CudfHiveConnector>(conn) !=
-        nullptr;
+               cudf_velox::connector::hive::CudfHiveConnector>(conn) != nullptr;
   }
 };
 
