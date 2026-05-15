@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/CudfPiecewiseSpillHashJoin.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -27,9 +28,9 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include <memory>
-#include <optional>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -37,9 +38,9 @@ namespace facebook::velox::cudf_velox {
 /// Benchmark-only partitioned hash join build operator.
 ///
 /// The build side is hash partitioned by the join key using cuDF's
-/// HASH_MURMUR3 and DEFAULT_HASH_SEED. Each partition stays resident on GPU and
-/// gets its own cudf::hash_join. The partition tables and hash joins are
-/// published via the existing CudfHashJoinBridge.
+/// HASH_MURMUR3 and DEFAULT_HASH_SEED. Each partition gets a cudf::hash_join,
+/// then its payload and hash table are copied into pinned host memory and the
+/// GPU-resident state is released.
 class CudfPartitionedHashJoinBuild : public CudfOperatorBase {
  public:
   CudfPartitionedHashJoinBuild(
@@ -72,8 +73,6 @@ class CudfPartitionedHashJoinBuild : public CudfOperatorBase {
 /// side, then partition i is joined only with build partition i.
 class CudfPartitionedHashJoinProbe : public CudfOperatorBase {
  public:
-  using hash_type = CudfHashJoinBridge::hash_type;
-
   CudfPartitionedHashJoinProbe(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
@@ -98,22 +97,39 @@ class CudfPartitionedHashJoinProbe : public CudfOperatorBase {
     cudf::size_type sourceIndex;
   };
 
+  struct PartitionSlot {
+    rmm::device_buffer payloadDevice;
+    cudf::table_view buildTableView;
+    std::unique_ptr<cudf::hash_join> hj;
+    std::size_t partitionIdx{0};
+    rmm::cuda_stream_view stream{};
+    bool valid{false};
+  };
+
+  void loadPartitionInto(PartitionSlot& target, std::size_t partitionIdx);
+
   std::unique_ptr<cudf::table> joinPartition(
       cudf::table_view probePartition,
-      const std::shared_ptr<cudf::table>& buildPartition,
-      const std::shared_ptr<cudf::hash_join>& hashJoin,
-      rmm::cuda_stream_view stream);
+      const PartitionSlot& buildSlot,
+      rmm::cuda_stream_view probeStream);
+
+  void releaseSpillStore();
 
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   RowTypePtr probeType_;
   RowTypePtr buildType_;
   int32_t const numPartitions_;
 
-  std::optional<hash_type> hashObject_;
-
   std::vector<cudf::size_type> leftKeyIndices_;
   std::vector<cudf::size_type> rightKeyIndices_;
   std::vector<OutputColumnSource> outputColumns_;
+
+  std::shared_ptr<std::vector<HostBuildPiece>> pieces_;
+  bool spillStoreAcquired_{false};
+
+  PartitionSlot slotA_;
+  PartitionSlot slotB_;
+  bool slotsInitialized_{false};
 
   CudfVectorPtr probe_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
