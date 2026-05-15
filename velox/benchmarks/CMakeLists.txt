@@ -63,6 +63,14 @@ if(${VELOX_BUILD_TEST_UTILS})
     Folly::follybenchmark
     fmt::fmt
   )
+
+  # When cuDF is enabled, QueryBenchmarkBase emits NVTX ranges around
+  # each `--num_repeats` iteration so nsys profiles can be sliced by
+  # iteration. nvtx3-cpp is a header-only INTERFACE target, so this
+  # only adds the include path — no link cost.
+  if(${VELOX_ENABLE_CUDF} AND TARGET nvtx3::nvtx3-cpp)
+    target_link_libraries(velox_query_benchmark nvtx3::nvtx3-cpp)
+  endif()
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS_BASIC})

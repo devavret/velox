@@ -16,6 +16,14 @@
 
 #include "velox/benchmarks/QueryBenchmarkBase.h"
 #include <iostream>
+
+// NVTX is only available in CUDA-aware velox builds (it's vendored by
+// the cuDF dependency tree). Guard the include with `__has_include` so
+// non-CUDA benchmark builds still compile.
+#if __has_include(<nvtx3/nvtx3.hpp>)
+#include <nvtx3/nvtx3.hpp>
+#endif
+
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/connectors/ConnectorRegistry.h"
@@ -29,6 +37,12 @@
 #include "velox/parse/TypeResolver.h"
 
 namespace {
+
+#if __has_include(<nvtx3/nvtx3.hpp>)
+struct QueryBenchmarkNvtxDomain {
+  static constexpr char const* name{"velox_query_benchmark"};
+};
+#endif
 
 bool validateDataFormat(const char* flagname, const std::string& value) {
   if ((value.compare("parquet") == 0) || (value.compare("dwrf") == 0)) {
@@ -258,6 +272,20 @@ QueryBenchmarkBase::run(
   int32_t repeat = 0;
   try {
     for (;;) {
+#if __has_include(<nvtx3/nvtx3.hpp>)
+      // One NVTX start/end range per `--num_repeats` iteration so nsys
+      // profiles can be sliced by iteration. A start/end range is used
+      // instead of a thread-local push/pop range because Velox query work
+      // is submitted to driver threads while this thread waits for the task.
+      auto const iterationLabel =
+          fmt::format("QueryBenchmarkBase iteration {}", repeat + 1);
+      auto const iterationAttributes = nvtx3::event_attributes{
+          iterationLabel,
+          nvtx3::rgb{70, 130, 180},
+          nvtx3::payload{static_cast<int64_t>(repeat + 1)}};
+      nvtx3::unique_range_in<QueryBenchmarkNvtxDomain> iterationRange{
+          iterationAttributes};
+#endif
       CursorParameters params;
       params.maxDrivers = FLAGS_num_drivers;
       params.planNode = tpchPlan.plan;
