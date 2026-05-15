@@ -30,7 +30,11 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <folly/Unit.h>
+#include <folly/futures/Future.h>
+
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
@@ -108,11 +112,19 @@ class CudfPartitionedHashJoinProbe : public CudfOperatorBase {
 
   void loadPartitionInto(PartitionSlot& target, std::size_t partitionIdx);
 
+  folly::Future<folly::Unit> makeLoadFuture(
+      PartitionSlot& slot,
+      std::size_t partitionIdx);
+
   std::unique_ptr<cudf::table> joinPartition(
       cudf::table_view probePartition,
       const PartitionSlot& buildSlot,
       rmm::cuda_stream_view probeStream);
 
+  std::optional<std::size_t> nextBuildPartition(std::size_t start) const;
+  bool hasActiveProbe() const;
+  void initializeProbeBatch();
+  void resetProbeBatch();
   void releaseSpillStore();
 
   std::shared_ptr<const core::HashJoinNode> joinNode_;
@@ -132,6 +144,12 @@ class CudfPartitionedHashJoinProbe : public CudfOperatorBase {
   bool slotsInitialized_{false};
 
   CudfVectorPtr probe_;
+  std::unique_ptr<cudf::table> partitionedProbe_;
+  std::vector<cudf::table_view> probePartitions_;
+  rmm::cuda_stream_view probeStream_{};
+  std::optional<std::size_t> currentPartition_;
+  std::optional<folly::Future<folly::Unit>> loadFuture_;
+  bool residentIsA_{true};
   ContinueFuture future_{ContinueFuture::makeEmpty()};
   bool finished_{false};
 };

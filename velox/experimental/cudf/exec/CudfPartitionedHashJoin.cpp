@@ -225,7 +225,10 @@ void CudfPartitionedHashJoinBuild::doNoMoreInput() {
     auto* op = peer->findOperator(planNodeId());
     auto* build = dynamic_cast<CudfPartitionedHashJoinBuild*>(op);
     VELOX_CHECK_NOT_NULL(build);
-    inputs_.insert(inputs_.end(), build->inputs_.begin(), build->inputs_.end());
+    for (auto& input : build->inputs_) {
+      inputs_.push_back(std::move(input));
+    }
+    build->inputs_.clear();
   }
 
   SCOPE_EXIT {
@@ -257,12 +260,16 @@ void CudfPartitionedHashJoinBuild::doNoMoreInput() {
     auto packedView = cudf::unpack(
         metadataCopy.data(),
         reinterpret_cast<std::uint8_t const*>(packed.gpu_data->data()));
+    // The source partition is no longer needed once pack has been submitted.
+    // Its device frees are stream-ordered after the pack reads.
+    partition.reset();
 
     auto hashJoin = std::make_unique<cudf::hash_join>(
         packedView.select(buildKeyIndices),
         cudf::null_equality::UNEQUAL,
         stream);
     auto storage = hashJoin->release_storage(stream);
+    hashJoin.reset();
 
     piece.packedMetadata = std::move(metadataCopy);
     piece.payloadBytes = PinnedHostBuffer{payloadSize};
@@ -297,9 +304,10 @@ void CudfPartitionedHashJoinBuild::doNoMoreInput() {
     spillPartition(getConcatenatedTable(
         std::exchange(inputs_, {}), buildType, stream, get_output_mr()));
   } else {
+    auto buildInputs = std::exchange(inputs_, {});
     std::vector<rmm::cuda_stream_view> inputStreams;
-    inputStreams.reserve(inputs_.size());
-    for (const auto& input : inputs_) {
+    inputStreams.reserve(buildInputs.size());
+    for (const auto& input : buildInputs) {
       inputStreams.push_back(input->stream());
     }
     if (!inputStreams.empty()) {
@@ -308,7 +316,8 @@ void CudfPartitionedHashJoinBuild::doNoMoreInput() {
 
     std::vector<std::vector<std::unique_ptr<cudf::table>>> partitionChunks(
         numPartitions_);
-    for (const auto& input : inputs_) {
+    for (auto& input : buildInputs) {
+      auto const inputStream = input->stream();
       auto [partitionedTable, partitionOffsets] = cudf::hash_partition(
           input->getTableView(),
           buildKeyIndices,
@@ -331,7 +340,18 @@ void CudfPartitionedHashJoinBuild::doNoMoreInput() {
             std::make_unique<cudf::table>(
                 partitionView, stream, get_output_mr()));
       }
+
+      // After the partition slices have been copied into partitionChunks, the
+      // temporary partitioned table and the original input batch can be
+      // released before the rest of the build side is processed.
+      partitionViews.clear();
+      partitionedTable.reset();
+
+      CudaEvent inputReleaseEvent(cudaEventDisableTiming);
+      inputReleaseEvent.recordFrom(stream).waitOn(inputStream);
+      input.reset();
     }
+    buildInputs.clear();
 
     for (int32_t i = 0; i < numPartitions_; ++i) {
       if (partitionChunks[i].empty()) {
@@ -425,13 +445,14 @@ CudfPartitionedHashJoinProbe::CudfPartitionedHashJoinProbe(
 }
 
 bool CudfPartitionedHashJoinProbe::needsInput() const {
-  return !noMoreInput_ && probe_ == nullptr;
+  return !noMoreInput_ && !hasActiveProbe();
 }
 
 void CudfPartitionedHashJoinProbe::doAddInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
   }
+  VELOX_CHECK(!hasActiveProbe());
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
   probe_ = std::move(cudfInput);
@@ -518,6 +539,89 @@ void CudfPartitionedHashJoinProbe::loadPartitionInto(
   target.valid = true;
 }
 
+folly::Future<folly::Unit> CudfPartitionedHashJoinProbe::makeLoadFuture(
+    PartitionSlot& slot,
+    std::size_t partitionIdx) {
+  auto* slotPtr = &slot;
+  auto const device = currentCudaDevice();
+  return folly::via(
+      partitionedUnspillExecutor(),
+      [this, slotPtr, partitionIdx, device]() -> folly::Unit {
+        checkCuda(cudaSetDevice(device), "cudaSetDevice");
+        loadPartitionInto(*slotPtr, partitionIdx);
+        return folly::Unit{};
+      });
+}
+
+std::optional<std::size_t> CudfPartitionedHashJoinProbe::nextBuildPartition(
+    std::size_t start) const {
+  VELOX_CHECK_NOT_NULL(pieces_);
+  for (auto i = start; i < pieces_->size(); ++i) {
+    if ((*pieces_)[i].numRows > 0) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+bool CudfPartitionedHashJoinProbe::hasActiveProbe() const {
+  return probe_ != nullptr || partitionedProbe_ != nullptr ||
+      currentPartition_.has_value() || loadFuture_.has_value() ||
+      !probePartitions_.empty();
+}
+
+void CudfPartitionedHashJoinProbe::resetProbeBatch() {
+  VELOX_CHECK(
+      !loadFuture_.has_value(),
+      "Cannot reset partitioned probe batch while a build partition is "
+      "loading");
+  probe_.reset();
+  partitionedProbe_.reset();
+  probePartitions_.clear();
+  currentPartition_.reset();
+}
+
+void CudfPartitionedHashJoinProbe::initializeProbeBatch() {
+  VELOX_CHECK_NOT_NULL(probe_);
+  VELOX_CHECK_NOT_NULL(pieces_);
+
+  auto firstPartition = nextBuildPartition(0);
+  if (!firstPartition.has_value()) {
+    resetProbeBatch();
+    return;
+  }
+
+  VELOX_CHECK(slotsInitialized_);
+  residentIsA_ = true;
+  currentPartition_ = firstPartition;
+  loadFuture_ = makeLoadFuture(slotA_, *currentPartition_);
+
+  probeStream_ = probe_->stream();
+  auto probeView = probe_->getTableView();
+  if (numPartitions_ == 1) {
+    probePartitions_.push_back(probeView);
+    return;
+  }
+
+  auto [partitioned, partitionOffsets] = cudf::hash_partition(
+      probeView,
+      leftKeyIndices_,
+      numPartitions_,
+      kPartitionHash,
+      kPartitionSeed,
+      probeStream_,
+      get_temp_mr());
+  partitionedProbe_ = std::move(partitioned);
+  auto splitPoints =
+      splitPointsFromOffsets(std::move(partitionOffsets), numPartitions_);
+  probePartitions_ =
+      cudf::split(partitionedProbe_->view(), splitPoints, probeStream_);
+
+  // Partitioning copied the probe batch into partitionedProbe_; release the
+  // original batch before joining partitions.
+  probe_.reset();
+}
+
 std::unique_ptr<cudf::table> CudfPartitionedHashJoinProbe::joinPartition(
     cudf::table_view probePartition,
     const PartitionSlot& buildSlot,
@@ -595,77 +699,27 @@ RowVectorPtr CudfPartitionedHashJoinProbe::doGetOutput() {
     return nullptr;
   }
 
-  if (probe_ == nullptr) {
+  if (!hasActiveProbe()) {
     if (noMoreInput_) {
       finished_ = true;
     }
     return nullptr;
   }
 
-  auto stream = probe_->stream();
-  auto probeView = probe_->getTableView();
-
-  auto nextBuildPartition =
-      [&](std::size_t start) -> std::optional<std::size_t> {
-    for (auto i = start; i < pieces_->size(); ++i) {
-      if ((*pieces_)[i].numRows > 0) {
-        return i;
-      }
-    }
-    return std::nullopt;
-  };
-
-  auto makeLoadFuture = [&](PartitionSlot& slot, std::size_t partitionIdx) {
-    auto* slotPtr = &slot;
-    auto const device = currentCudaDevice();
-    return folly::via(
-        partitionedUnspillExecutor(),
-        [this, slotPtr, partitionIdx, device]() -> folly::Unit {
-          checkCuda(cudaSetDevice(device), "cudaSetDevice");
-          loadPartitionInto(*slotPtr, partitionIdx);
-          return folly::Unit{};
-        });
-  };
-
-  auto currentPartition = nextBuildPartition(0);
-  if (!currentPartition.has_value()) {
-    probe_.reset();
-    finished_ = noMoreInput_;
-    return nullptr;
+  if (!currentPartition_.has_value()) {
+    initializeProbeBatch();
   }
 
-  VELOX_CHECK(slotsInitialized_);
-  bool residentIsA = true;
-  auto loadFuture = makeLoadFuture(slotA_, *currentPartition);
+  while (currentPartition_.has_value()) {
+    VELOX_CHECK(loadFuture_.has_value());
+    std::move(*loadFuture_).get();
+    loadFuture_.reset();
 
-  std::vector<std::unique_ptr<cudf::table>> outputs;
-  std::unique_ptr<cudf::table> partitionedProbe;
-  std::vector<cudf::table_view> probePartitions;
-  if (numPartitions_ == 1) {
-    probePartitions.push_back(probeView);
-  } else {
-    auto [partitioned, partitionOffsets] = cudf::hash_partition(
-        probeView,
-        leftKeyIndices_,
-        numPartitions_,
-        kPartitionHash,
-        kPartitionSeed,
-        stream,
-        get_temp_mr());
-    partitionedProbe = std::move(partitioned);
-    auto splitPoints =
-        splitPointsFromOffsets(std::move(partitionOffsets), numPartitions_);
-    probePartitions =
-        cudf::split(partitionedProbe->view(), splitPoints, stream);
-  }
+    auto& resident = residentIsA_ ? slotA_ : slotB_;
+    auto& next = residentIsA_ ? slotB_ : slotA_;
+    VELOX_CHECK_EQ(resident.partitionIdx, *currentPartition_);
 
-  while (currentPartition.has_value()) {
-    std::move(loadFuture).get();
-    auto& resident = residentIsA ? slotA_ : slotB_;
-    auto& next = residentIsA ? slotB_ : slotA_;
-    VELOX_CHECK_EQ(resident.partitionIdx, *currentPartition);
-
-    auto nextPartition = nextBuildPartition(*currentPartition + 1);
+    auto nextPartition = nextBuildPartition(*currentPartition_ + 1);
     std::optional<folly::Future<folly::Unit>> prefetchFuture;
     if (nextPartition.has_value()) {
       prefetchFuture = makeLoadFuture(next, *nextPartition);
@@ -673,9 +727,21 @@ RowVectorPtr CudfPartitionedHashJoinProbe::doGetOutput() {
 
     try {
       if (auto output = joinPartition(
-              probePartitions[*currentPartition], resident, stream)) {
+              probePartitions_[*currentPartition_], resident, probeStream_)) {
+        auto const joinStreamUsed = resident.stream;
         resident.stream.synchronize();
-        outputs.push_back(std::move(output));
+        if (prefetchFuture.has_value()) {
+          loadFuture_ = std::move(*prefetchFuture);
+          currentPartition_ = nextPartition;
+          residentIsA_ = !residentIsA_;
+        } else {
+          resetProbeBatch();
+          finished_ = noMoreInput_;
+        }
+
+        auto const numRows = static_cast<vector_size_t>(output->num_rows());
+        return std::make_shared<CudfVector>(
+            pool(), outputType_, numRows, std::move(output), joinStreamUsed);
       } else {
         resident.stream.synchronize();
       }
@@ -690,33 +756,16 @@ RowVectorPtr CudfPartitionedHashJoinProbe::doGetOutput() {
     }
 
     if (prefetchFuture.has_value()) {
-      loadFuture = std::move(*prefetchFuture);
-      currentPartition = nextPartition;
-      residentIsA = !residentIsA;
+      loadFuture_ = std::move(*prefetchFuture);
+      currentPartition_ = nextPartition;
+      residentIsA_ = !residentIsA_;
     } else {
-      currentPartition = std::nullopt;
+      resetProbeBatch();
+      finished_ = noMoreInput_;
     }
   }
 
-  RowVectorPtr result;
-  if (!outputs.empty()) {
-    auto outputTable =
-        concatenateTables(std::move(outputs), stream, get_output_mr());
-    auto const numRows = static_cast<vector_size_t>(outputTable->num_rows());
-    if (outputTable->num_columns() > 0 && numRows > 0) {
-      stream.synchronize();
-      result = std::make_shared<CudfVector>(
-          pool(), outputType_, numRows, std::move(outputTable), stream);
-    } else {
-      stream.synchronize();
-    }
-  } else {
-    stream.synchronize();
-  }
-
-  probe_.reset();
-  finished_ = noMoreInput_;
-  return result;
+  return nullptr;
 }
 
 void CudfPartitionedHashJoinProbe::doNoMoreInput() {
@@ -733,6 +782,10 @@ void CudfPartitionedHashJoinProbe::releaseSpillStore() {
 
 void CudfPartitionedHashJoinProbe::doClose() {
   Operator::close();
+  if (loadFuture_.has_value()) {
+    std::move(*loadFuture_).get();
+    loadFuture_.reset();
+  }
   if (slotsInitialized_) {
     slotA_.stream.synchronize();
     slotB_.stream.synchronize();
@@ -745,10 +798,13 @@ void CudfPartitionedHashJoinProbe::doClose() {
   slotB_.valid = false;
   releaseSpillStore();
   probe_.reset();
+  partitionedProbe_.reset();
+  probePartitions_.clear();
+  currentPartition_.reset();
 }
 
 bool CudfPartitionedHashJoinProbe::isFinished() {
-  auto const isFinished = finished_ || (noMoreInput_ && probe_ == nullptr);
+  auto const isFinished = finished_ || (noMoreInput_ && !hasActiveProbe());
   if (isFinished) {
     releaseSpillStore();
   }
