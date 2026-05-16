@@ -43,7 +43,7 @@ namespace facebook::velox::cudf_velox {
 ///
 /// The build side is hash partitioned by the join key using cuDF's
 /// HASH_MURMUR3 and DEFAULT_HASH_SEED. Each partition gets a cudf::hash_join,
-/// then its payload and hash table are copied into pinned host memory and the
+/// then its payload and hash table are copied into host memory and the
 /// GPU-resident state is released.
 class CudfPartitionedHashJoinBuild : public CudfOperatorBase {
  public:
@@ -51,7 +51,8 @@ class CudfPartitionedHashJoinBuild : public CudfOperatorBase {
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode,
-      int32_t numPartitions);
+      int32_t numPartitions,
+      bool usePinnedHostMemory);
 
   bool needsInput() const override;
 
@@ -67,6 +68,7 @@ class CudfPartitionedHashJoinBuild : public CudfOperatorBase {
  private:
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   int32_t const numPartitions_;
+  SpillHostMemoryKind const spillHostMemoryKind_;
   std::vector<CudfVectorPtr> inputs_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };

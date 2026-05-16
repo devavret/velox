@@ -46,7 +46,8 @@
 ///   ./velox_cudf_hashjoin_spill_benchmark \
 ///       --data_path=/data/tpch/pq_sf10_f64 --include_results \
 ///       --spill_join_strategy=partitioned \
-///       --partitioned_join_num_partitions=16
+///       --partitioned_join_num_partitions=16 \
+///       --spill_join_host_memory=regular
 
 #include "velox/experimental/cudf/benchmarks/CudfBenchmarkHelpers.h"
 #include "velox/experimental/cudf/benchmarks/CudfPartitionedHashJoinAdapter.h"
@@ -81,10 +82,34 @@ DEFINE_int32(
     16,
     "Number of hash partitions for --spill_join_strategy=partitioned.");
 
+DEFINE_string(
+    spill_join_host_memory,
+    "pinned",
+    "Host memory used for spilled build payloads and hash maps. "
+    "Allowed values: pinned, regular. regular is pageable host memory and "
+    "disables cudaHostAlloc.");
+
 DECLARE_int32(num_drivers);
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec::test;
+
+namespace {
+
+bool usePinnedSpillJoinHostMemory() {
+  if (FLAGS_spill_join_host_memory == "pinned") {
+    return true;
+  }
+  if (FLAGS_spill_join_host_memory == "regular" ||
+      FLAGS_spill_join_host_memory == "pageable") {
+    return false;
+  }
+  VELOX_FAIL(
+      "Unsupported --spill_join_host_memory: {}. Expected pinned or regular.",
+      FLAGS_spill_join_host_memory);
+}
+
+} // namespace
 
 /// Extends CudfTpchBenchmark with a purpose-built join-only plan.
 ///
@@ -110,14 +135,16 @@ class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
         FLAGS_num_drivers = 1;
       }
       cudf_velox::registerPiecewiseSpillHashJoinAdapter(
-          static_cast<cudf::size_type>(FLAGS_piecewise_spill_piece_rows));
+          static_cast<cudf::size_type>(FLAGS_piecewise_spill_piece_rows),
+          usePinnedSpillJoinHostMemory());
     } else if (FLAGS_spill_join_strategy == "partitioned") {
       VELOX_CHECK_GT(
           FLAGS_partitioned_join_num_partitions,
           0,
           "--partitioned_join_num_partitions must be positive");
       cudf_velox::registerPartitionedHashJoinAdapter(
-          FLAGS_partitioned_join_num_partitions);
+          FLAGS_partitioned_join_num_partitions,
+          usePinnedSpillJoinHostMemory());
     } else {
       VELOX_CHECK_EQ(
           FLAGS_spill_join_strategy,
@@ -164,6 +191,11 @@ class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
     if (FLAGS_spill_join_strategy == "partitioned") {
       out << "Partitioned join partitions: "
           << FLAGS_partitioned_join_num_partitions << std::endl;
+    }
+    if (FLAGS_spill_join_strategy == "piecewise" ||
+        FLAGS_spill_join_strategy == "partitioned") {
+      out << "Spill join host memory: " << FLAGS_spill_join_host_memory
+          << std::endl;
     }
     out << "Lineitem files: " << lineitemInfo.dataFiles.size() << std::endl;
     out << "Orders files: " << ordersInfo.dataFiles.size() << std::endl;

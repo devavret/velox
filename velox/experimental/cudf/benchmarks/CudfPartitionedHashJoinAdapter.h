@@ -25,6 +25,8 @@ namespace facebook::velox::cudf_velox {
 ///
 /// Must be called after registerCudf() so the default cuDF hash-join adapters
 /// are present and can be overwritten.
-void registerPartitionedHashJoinAdapter(int32_t numPartitions);
+void registerPartitionedHashJoinAdapter(
+    int32_t numPartitions,
+    bool usePinnedHostMemory);
 
 } // namespace facebook::velox::cudf_velox

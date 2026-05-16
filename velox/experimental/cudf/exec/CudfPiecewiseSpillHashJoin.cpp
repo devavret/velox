@@ -20,11 +20,6 @@
 
 #include "velox/exec/Task.h"
 
-#include <folly/Unit.h>
-#include <folly/executors/CPUThreadPoolExecutor.h>
-#include <folly/executors/thread_factory/NamedThreadFactory.h>
-#include <folly/futures/Future.h>
-
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
@@ -32,7 +27,13 @@
 #include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <folly/Unit.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
+#include <folly/futures/Future.h>
+
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 
@@ -49,8 +50,51 @@ folly::CPUThreadPoolExecutor* piecewiseUnspillExecutor() {
 }
 
 void checkCuda(cudaError_t err, const char* op) {
-  VELOX_CHECK(
-      err == cudaSuccess, "{} failed: {}", op, cudaGetErrorString(err));
+  VELOX_CHECK(err == cudaSuccess, "{} failed: {}", op, cudaGetErrorString(err));
+}
+
+void copyDeviceToHost(
+    SpillHostBuffer& dst,
+    const void* src,
+    std::size_t bytes,
+    rmm::cuda_stream_view stream,
+    const char* op) {
+  if (bytes == 0) {
+    return;
+  }
+  if (dst.isPinned()) {
+    checkCuda(
+        cudaMemcpyAsync(
+            dst.data(), src, bytes, cudaMemcpyDeviceToHost, stream.value()),
+        op);
+  } else {
+    stream.synchronize();
+    checkCuda(cudaMemcpy(dst.data(), src, bytes, cudaMemcpyDeviceToHost), op);
+  }
+}
+
+void copyHostToDevice(
+    void* dst,
+    const SpillHostBuffer& src,
+    rmm::cuda_stream_view stream,
+    const char* op) {
+  if (src.size() == 0) {
+    return;
+  }
+  if (src.isPinned()) {
+    checkCuda(
+        cudaMemcpyAsync(
+            dst,
+            src.data(),
+            src.size(),
+            cudaMemcpyHostToDevice,
+            stream.value()),
+        op);
+  } else {
+    stream.synchronize();
+    checkCuda(
+        cudaMemcpy(dst, src.data(), src.size(), cudaMemcpyHostToDevice), op);
+  }
 }
 
 int currentCudaDevice() {
@@ -68,48 +112,68 @@ bool isSimpleInnerEquiJoin(const core::HashJoinNode& joinNode) {
 } // namespace
 
 // =============================================================================
-// PinnedHostBuffer
+// SpillHostBuffer
 // =============================================================================
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t bytes) {
+SpillHostBuffer::SpillHostBuffer(std::size_t bytes, SpillHostMemoryKind kind)
+    : kind_(kind) {
   if (bytes == 0) {
     return;
   }
-  void* ptr = nullptr;
-  auto const err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
-  VELOX_CHECK(
-      err == cudaSuccess,
-      "cudaHostAlloc failed for pinned host buffer of {} bytes: {}",
-      bytes,
-      cudaGetErrorString(err));
+  void* ptr;
+  if (kind_ == SpillHostMemoryKind::kPinned) {
+    ptr = nullptr;
+    auto const err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
+    VELOX_CHECK(
+        err == cudaSuccess,
+        "cudaHostAlloc failed for pinned host buffer of {} bytes: {}",
+        bytes,
+        cudaGetErrorString(err));
+  } else {
+    ptr = std::malloc(bytes);
+    VELOX_CHECK_NOT_NULL(
+        ptr, "malloc failed for regular host buffer of {} bytes", bytes);
+  }
   data_ = ptr;
   size_ = bytes;
 }
 
-PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
+SpillHostBuffer::SpillHostBuffer(SpillHostBuffer&& other) noexcept
+    : data_(other.data_), size_(other.size_), kind_(other.kind_) {
   other.data_ = nullptr;
   other.size_ = 0;
+  other.kind_ = SpillHostMemoryKind::kPinned;
 }
 
-PinnedHostBuffer& PinnedHostBuffer::operator=(
-    PinnedHostBuffer&& other) noexcept {
+SpillHostBuffer& SpillHostBuffer::operator=(SpillHostBuffer&& other) noexcept {
   if (this != &other) {
-    if (data_ != nullptr) {
-      cudaFreeHost(data_);
-    }
+    release();
     data_ = other.data_;
     size_ = other.size_;
+    kind_ = other.kind_;
     other.data_ = nullptr;
     other.size_ = 0;
+    other.kind_ = SpillHostMemoryKind::kPinned;
   }
   return *this;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() {
-  if (data_ != nullptr) {
-    cudaFreeHost(data_);
+SpillHostBuffer::~SpillHostBuffer() {
+  release();
+}
+
+void SpillHostBuffer::release() noexcept {
+  if (data_ == nullptr) {
+    return;
   }
+  if (kind_ == SpillHostMemoryKind::kPinned) {
+    cudaFreeHost(data_);
+  } else {
+    std::free(data_);
+  }
+  data_ = nullptr;
+  size_ = 0;
+  kind_ = SpillHostMemoryKind::kPinned;
 }
 
 // =============================================================================
@@ -172,7 +236,8 @@ CudfPiecewiseSpillHashJoinBuild::CudfPiecewiseSpillHashJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::HashJoinNode> joinNode,
-    cudf::size_type pieceTargetRows)
+    cudf::size_type pieceTargetRows,
+    bool usePinnedHostMemory)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -184,7 +249,10 @@ CudfPiecewiseSpillHashJoinBuild::CudfPiecewiseSpillHashJoinBuild(
           std::nullopt,
           joinNode),
       joinNode_(joinNode),
-      pieceTargetRows_(pieceTargetRows) {
+      pieceTargetRows_(pieceTargetRows),
+      spillHostMemoryKind_(
+          usePinnedHostMemory ? SpillHostMemoryKind::kPinned
+                              : SpillHostMemoryKind::kRegular) {
   VELOX_CHECK(
       isSimpleInnerEquiJoin(*joinNode_),
       "CudfPiecewiseSpillHashJoinBuild only supports inner equi-join "
@@ -254,10 +322,7 @@ void CudfPiecewiseSpillHashJoinBuild::doNoMoreInput() {
                      RowTypePtr&& schema,
                      InitialResidentPiece&& resident) {
     PiecewiseSpillStore::getInstance().put(
-        planNodeId(),
-        std::move(p),
-        std::move(schema),
-        std::move(resident));
+        planNodeId(), std::move(p), std::move(schema), std::move(resident));
     // Signal build completion via the standard CudfHashJoinBridge. The
     // probe operator ignores the payload — it pulls data from
     // PiecewiseSpillStore — but uses the bridge's promise/future for
@@ -317,39 +382,27 @@ void CudfPiecewiseSpillHashJoinBuild::doNoMoreInput() {
     piece.numRows = pieceView.num_rows();
     piece.packedMetadata = metadataCopy;
 
-    piece.payloadBytes = PinnedHostBuffer{payloadSize};
+    piece.payloadBytes = SpillHostBuffer{payloadSize, spillHostMemoryKind_};
     auto const slotsSize = storage.slots.size();
-    piece.hashTableBytes = PinnedHostBuffer{slotsSize};
+    piece.hashTableBytes = SpillHostBuffer{slotsSize, spillHostMemoryKind_};
     piece.hashSlotCount = storage.slot_count;
     piece.hashSlotBytes = storage.slot_bytes;
     piece.hashCompareNulls = storage.compare_nulls;
     piece.hashHasNulls = storage.has_nulls;
     piece.hashLoadFactor = storage.load_factor;
 
-    {
-      auto const err = cudaMemcpyAsync(
-          piece.payloadBytes.data(),
-          packed.gpu_data->data(),
-          payloadSize,
-          cudaMemcpyDeviceToHost,
-          stream.value());
-      VELOX_CHECK(
-          err == cudaSuccess,
-          "cudaMemcpyAsync D2H of packed payload failed: {}",
-          cudaGetErrorString(err));
-    }
-    {
-      auto const err = cudaMemcpyAsync(
-          piece.hashTableBytes.data(),
-          storage.slots.data(),
-          slotsSize,
-          cudaMemcpyDeviceToHost,
-          stream.value());
-      VELOX_CHECK(
-          err == cudaSuccess,
-          "cudaMemcpyAsync D2H of hash slots failed: {}",
-          cudaGetErrorString(err));
-    }
+    copyDeviceToHost(
+        piece.payloadBytes,
+        packed.gpu_data->data(),
+        payloadSize,
+        stream,
+        "D2H copy of packed payload");
+    copyDeviceToHost(
+        piece.hashTableBytes,
+        storage.slots.data(),
+        slotsSize,
+        stream,
+        "D2H copy of hash slots");
 
     bool const isFirstPiece = pieces->empty();
     if (isFirstPiece) {
@@ -403,13 +456,12 @@ void CudfPiecewiseSpillHashJoinBuild::doNoMoreInput() {
   }
   flushPending();
 
-  // Synchronize before publishing so all D-to-H copies have landed and
-  // pinned-host buffers contain the final bytes.
+  // Synchronize before publishing so all D-to-H copies have landed and host
+  // buffers contain the final bytes.
   stream.synchronize();
   inputs_.clear();
 
-  publish(
-      std::move(pieces), std::move(buildType), std::move(initialResident));
+  publish(std::move(pieces), std::move(buildType), std::move(initialResident));
 }
 
 exec::BlockingReason CudfPiecewiseSpillHashJoinBuild::isBlocked(
@@ -556,20 +608,12 @@ void CudfPiecewiseSpillHashJoinProbe::loadPieceInto(
   // stream-ordered on the destination stream's allocator, so the old
   // contents' free is queued on `stream` before the new allocation.
   target.hj.reset();
-  target.payloadDevice =
-      rmm::device_buffer{piece.payloadBytes.size(), stream};
-  {
-    auto const err = cudaMemcpyAsync(
-        target.payloadDevice.data(),
-        piece.payloadBytes.data(),
-        piece.payloadBytes.size(),
-        cudaMemcpyHostToDevice,
-        stream.value());
-    VELOX_CHECK(
-        err == cudaSuccess,
-        "cudaMemcpyAsync H2D of packed payload failed: {}",
-        cudaGetErrorString(err));
-  }
+  target.payloadDevice = rmm::device_buffer{piece.payloadBytes.size(), stream};
+  copyHostToDevice(
+      target.payloadDevice.data(),
+      piece.payloadBytes,
+      stream,
+      "H2D copy of packed payload");
 
   cudf::hash_join_storage storage;
   storage.slots = rmm::device_buffer{piece.hashTableBytes.size(), stream};
@@ -578,18 +622,11 @@ void CudfPiecewiseSpillHashJoinProbe::loadPieceInto(
   storage.compare_nulls = piece.hashCompareNulls;
   storage.has_nulls = piece.hashHasNulls;
   storage.load_factor = piece.hashLoadFactor;
-  {
-    auto const err = cudaMemcpyAsync(
-        storage.slots.data(),
-        piece.hashTableBytes.data(),
-        piece.hashTableBytes.size(),
-        cudaMemcpyHostToDevice,
-        stream.value());
-    VELOX_CHECK(
-        err == cudaSuccess,
-        "cudaMemcpyAsync H2D of hash slots failed: {}",
-        cudaGetErrorString(err));
-  }
+  copyHostToDevice(
+      storage.slots.data(),
+      piece.hashTableBytes,
+      stream,
+      "H2D copy of hash slots");
 
   // unpack is a pure CPU operation that builds column_views over the
   // device-resident packed bytes.
@@ -610,10 +647,7 @@ std::unique_ptr<cudf::table> CudfPiecewiseSpillHashJoinProbe::runJoinOnSlot(
   auto stream = slot.stream;
   auto probeView = probe_->getTableView();
   auto [leftIdx, rightIdx] = slot.hj->inner_join(
-      probeView.select(leftKeyIndices_),
-      std::nullopt,
-      stream,
-      get_temp_mr());
+      probeView.select(leftKeyIndices_), std::nullopt, stream, get_temp_mr());
 
   cudf::column_view leftIdxCol{
       cudf::device_span<cudf::size_type const>{*leftIdx}};
@@ -696,9 +730,7 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::doGetOutput() {
   while (piecesProcessedThisBatch_ < numPieces) {
     auto& resident = residentIsA_ ? slotA_ : slotB_;
     auto& next = residentIsA_ ? slotB_ : slotA_;
-    VELOX_CHECK(
-        resident.valid,
-        "Resident slot is empty in piecewise probe");
+    VELOX_CHECK(resident.valid, "Resident slot is empty in piecewise probe");
 
     std::optional<folly::Future<folly::Unit>> prefetchFuture;
     if (numPieces > 1) {
@@ -736,11 +768,7 @@ RowVectorPtr CudfPiecewiseSpillHashJoinProbe::doGetOutput() {
             static_cast<vector_size_t>(outputTable->num_rows());
         auto pool = operatorCtx_->pool();
         return std::make_shared<CudfVector>(
-            pool,
-            outputType_,
-            numRows,
-            std::move(outputTable),
-            joinStreamUsed);
+            pool, outputType_, numRows, std::move(outputTable), joinStreamUsed);
       }
     } catch (...) {
       if (prefetchFuture.has_value()) {

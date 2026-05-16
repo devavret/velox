@@ -15,7 +15,6 @@
  */
 
 #include "velox/experimental/cudf/benchmarks/CudfPiecewiseSpillHashJoinAdapter.h"
-
 #include "velox/experimental/cudf/exec/CudfPiecewiseSpillHashJoin.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 
@@ -51,9 +50,12 @@ class PiecewiseHashJoinBaseAdapter : public OperatorAdapter {
 
 class PiecewiseHashJoinBuildAdapter : public PiecewiseHashJoinBaseAdapter {
  public:
-  explicit PiecewiseHashJoinBuildAdapter(cudf::size_type pieceTargetRows)
+  PiecewiseHashJoinBuildAdapter(
+      cudf::size_type pieceTargetRows,
+      bool usePinnedHostMemory)
       : PiecewiseHashJoinBaseAdapter("HashJoinBuild"),
-        pieceTargetRows_(pieceTargetRows) {}
+        pieceTargetRows_(pieceTargetRows),
+        usePinnedHostMemory_(usePinnedHostMemory) {}
 
   bool canHandle(const exec::Operator* op) const override {
     return dynamic_cast<const exec::HashBuild*>(op) != nullptr;
@@ -75,13 +77,19 @@ class PiecewiseHashJoinBuildAdapter : public PiecewiseHashJoinBaseAdapter {
     auto joinPlanNode =
         std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(std::make_unique<CudfPiecewiseSpillHashJoinBuild>(
-        operatorId, ctx, joinPlanNode, pieceTargetRows_));
+    result.push_back(
+        std::make_unique<CudfPiecewiseSpillHashJoinBuild>(
+            operatorId,
+            ctx,
+            joinPlanNode,
+            pieceTargetRows_,
+            usePinnedHostMemory_));
     return result;
   }
 
  private:
   cudf::size_type const pieceTargetRows_;
+  bool const usePinnedHostMemory_;
 };
 
 class PiecewiseHashJoinProbeAdapter : public PiecewiseHashJoinBaseAdapter {
@@ -109,22 +117,26 @@ class PiecewiseHashJoinProbeAdapter : public PiecewiseHashJoinBaseAdapter {
     auto joinPlanNode =
         std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(std::make_unique<CudfPiecewiseSpillHashJoinProbe>(
-        operatorId, ctx, joinPlanNode));
+    result.push_back(
+        std::make_unique<CudfPiecewiseSpillHashJoinProbe>(
+            operatorId, ctx, joinPlanNode));
     return result;
   }
 };
 
-}  // namespace
+} // namespace
 
-void registerPiecewiseSpillHashJoinAdapter(cudf::size_type pieceTargetRows) {
+void registerPiecewiseSpillHashJoinAdapter(
+    cudf::size_type pieceTargetRows,
+    bool usePinnedHostMemory) {
   auto& registry = OperatorAdapterRegistry::getInstance();
   registry.registerAdapter(
-      std::make_unique<PiecewiseHashJoinBuildAdapter>(pieceTargetRows),
+      std::make_unique<PiecewiseHashJoinBuildAdapter>(
+          pieceTargetRows, usePinnedHostMemory),
       /*overwrite=*/true);
   registry.registerAdapter(
       std::make_unique<PiecewiseHashJoinProbeAdapter>(),
       /*overwrite=*/true);
 }
 
-}  // namespace facebook::velox::cudf_velox
+} // namespace facebook::velox::cudf_velox

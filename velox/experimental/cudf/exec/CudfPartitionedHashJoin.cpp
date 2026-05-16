@@ -61,6 +61,50 @@ void checkCuda(cudaError_t err, const char* op) {
   VELOX_CHECK(err == cudaSuccess, "{} failed: {}", op, cudaGetErrorString(err));
 }
 
+void copyDeviceToHost(
+    SpillHostBuffer& dst,
+    const void* src,
+    std::size_t bytes,
+    rmm::cuda_stream_view stream,
+    const char* op) {
+  if (bytes == 0) {
+    return;
+  }
+  if (dst.isPinned()) {
+    checkCuda(
+        cudaMemcpyAsync(
+            dst.data(), src, bytes, cudaMemcpyDeviceToHost, stream.value()),
+        op);
+  } else {
+    stream.synchronize();
+    checkCuda(cudaMemcpy(dst.data(), src, bytes, cudaMemcpyDeviceToHost), op);
+  }
+}
+
+void copyHostToDevice(
+    void* dst,
+    const SpillHostBuffer& src,
+    rmm::cuda_stream_view stream,
+    const char* op) {
+  if (src.size() == 0) {
+    return;
+  }
+  if (src.isPinned()) {
+    checkCuda(
+        cudaMemcpyAsync(
+            dst,
+            src.data(),
+            src.size(),
+            cudaMemcpyHostToDevice,
+            stream.value()),
+        op);
+  } else {
+    stream.synchronize();
+    checkCuda(
+        cudaMemcpy(dst, src.data(), src.size(), cudaMemcpyHostToDevice), op);
+  }
+}
+
 int currentCudaDevice() {
   int device = 0;
   checkCuda(cudaGetDevice(&device), "cudaGetDevice");
@@ -174,7 +218,8 @@ CudfPartitionedHashJoinBuild::CudfPartitionedHashJoinBuild(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::HashJoinNode> joinNode,
-    int32_t numPartitions)
+    int32_t numPartitions,
+    bool usePinnedHostMemory)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -186,7 +231,10 @@ CudfPartitionedHashJoinBuild::CudfPartitionedHashJoinBuild(
           std::nullopt,
           joinNode),
       joinNode_(std::move(joinNode)),
-      numPartitions_(numPartitions) {
+      numPartitions_(numPartitions),
+      spillHostMemoryKind_(
+          usePinnedHostMemory ? SpillHostMemoryKind::kPinned
+                              : SpillHostMemoryKind::kRegular) {
   VELOX_CHECK(
       isSimpleInnerEquiJoin(*joinNode_),
       "CudfPartitionedHashJoinBuild only supports inner equi-join with no "
@@ -272,30 +320,27 @@ void CudfPartitionedHashJoinBuild::doNoMoreInput() {
     hashJoin.reset();
 
     piece.packedMetadata = std::move(metadataCopy);
-    piece.payloadBytes = PinnedHostBuffer{payloadSize};
-    piece.hashTableBytes = PinnedHostBuffer{storage.slots.size()};
+    piece.payloadBytes = SpillHostBuffer{payloadSize, spillHostMemoryKind_};
+    piece.hashTableBytes =
+        SpillHostBuffer{storage.slots.size(), spillHostMemoryKind_};
     piece.hashSlotCount = storage.slot_count;
     piece.hashSlotBytes = storage.slot_bytes;
     piece.hashCompareNulls = storage.compare_nulls;
     piece.hashHasNulls = storage.has_nulls;
     piece.hashLoadFactor = storage.load_factor;
 
-    checkCuda(
-        cudaMemcpyAsync(
-            piece.payloadBytes.data(),
-            packed.gpu_data->data(),
-            payloadSize,
-            cudaMemcpyDeviceToHost,
-            stream.value()),
-        "cudaMemcpyAsync D2H of packed partition payload");
-    checkCuda(
-        cudaMemcpyAsync(
-            piece.hashTableBytes.data(),
-            storage.slots.data(),
-            storage.slots.size(),
-            cudaMemcpyDeviceToHost,
-            stream.value()),
-        "cudaMemcpyAsync D2H of partition hash slots");
+    copyDeviceToHost(
+        piece.payloadBytes,
+        packed.gpu_data->data(),
+        payloadSize,
+        stream,
+        "D2H copy of packed partition payload");
+    copyDeviceToHost(
+        piece.hashTableBytes,
+        storage.slots.data(),
+        storage.slots.size(),
+        stream,
+        "D2H copy of partition hash slots");
 
     pieces->push_back(std::move(piece));
   };
@@ -503,14 +548,11 @@ void CudfPartitionedHashJoinProbe::loadPartitionInto(
 
   target.hj.reset();
   target.payloadDevice = rmm::device_buffer{piece.payloadBytes.size(), stream};
-  checkCuda(
-      cudaMemcpyAsync(
-          target.payloadDevice.data(),
-          piece.payloadBytes.data(),
-          piece.payloadBytes.size(),
-          cudaMemcpyHostToDevice,
-          stream.value()),
-      "cudaMemcpyAsync H2D of packed partition payload");
+  copyHostToDevice(
+      target.payloadDevice.data(),
+      piece.payloadBytes,
+      stream,
+      "H2D copy of packed partition payload");
 
   cudf::hash_join_storage storage;
   storage.slots = rmm::device_buffer{piece.hashTableBytes.size(), stream};
@@ -519,14 +561,11 @@ void CudfPartitionedHashJoinProbe::loadPartitionInto(
   storage.compare_nulls = piece.hashCompareNulls;
   storage.has_nulls = piece.hashHasNulls;
   storage.load_factor = piece.hashLoadFactor;
-  checkCuda(
-      cudaMemcpyAsync(
-          storage.slots.data(),
-          piece.hashTableBytes.data(),
-          piece.hashTableBytes.size(),
-          cudaMemcpyHostToDevice,
-          stream.value()),
-      "cudaMemcpyAsync H2D of partition hash slots");
+  copyHostToDevice(
+      storage.slots.data(),
+      piece.hashTableBytes,
+      stream,
+      "H2D copy of partition hash slots");
 
   target.buildTableView = cudf::unpack(
       piece.packedMetadata.data(),

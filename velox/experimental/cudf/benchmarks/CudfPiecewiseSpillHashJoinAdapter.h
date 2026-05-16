@@ -30,6 +30,8 @@ namespace facebook::velox::cudf_velox {
 ///
 /// `pieceTargetRows` is captured by the build adapter and used as the
 /// target piece size when slicing the build side.
-void registerPiecewiseSpillHashJoinAdapter(cudf::size_type pieceTargetRows);
+void registerPiecewiseSpillHashJoinAdapter(
+    cudf::size_type pieceTargetRows,
+    bool usePinnedHostMemory);
 
-}  // namespace facebook::velox::cudf_velox
+} // namespace facebook::velox::cudf_velox

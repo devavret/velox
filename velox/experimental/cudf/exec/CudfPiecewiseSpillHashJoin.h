@@ -39,20 +39,27 @@
 
 namespace facebook::velox::cudf_velox {
 
-/// RAII wrapper around a pinned (page-locked) host allocation backed by
-/// `cudaHostAlloc`. Move-only.
-class PinnedHostBuffer {
+enum class SpillHostMemoryKind {
+  kPinned,
+  kRegular,
+};
+
+/// RAII wrapper around a host allocation used for spilled build payload and
+/// hash-table bytes. Move-only.
+class SpillHostBuffer {
  public:
-  PinnedHostBuffer() = default;
-  explicit PinnedHostBuffer(std::size_t bytes);
+  SpillHostBuffer() = default;
+  explicit SpillHostBuffer(
+      std::size_t bytes,
+      SpillHostMemoryKind kind = SpillHostMemoryKind::kPinned);
 
-  PinnedHostBuffer(PinnedHostBuffer const&) = delete;
-  PinnedHostBuffer& operator=(PinnedHostBuffer const&) = delete;
+  SpillHostBuffer(SpillHostBuffer const&) = delete;
+  SpillHostBuffer& operator=(SpillHostBuffer const&) = delete;
 
-  PinnedHostBuffer(PinnedHostBuffer&& other) noexcept;
-  PinnedHostBuffer& operator=(PinnedHostBuffer&& other) noexcept;
+  SpillHostBuffer(SpillHostBuffer&& other) noexcept;
+  SpillHostBuffer& operator=(SpillHostBuffer&& other) noexcept;
 
-  ~PinnedHostBuffer();
+  ~SpillHostBuffer();
 
   [[nodiscard]] void* data() const noexcept {
     return data_;
@@ -60,10 +67,19 @@ class PinnedHostBuffer {
   [[nodiscard]] std::size_t size() const noexcept {
     return size_;
   }
+  [[nodiscard]] SpillHostMemoryKind kind() const noexcept {
+    return kind_;
+  }
+  [[nodiscard]] bool isPinned() const noexcept {
+    return kind_ == SpillHostMemoryKind::kPinned;
+  }
 
  private:
+  void release() noexcept;
+
   void* data_{nullptr};
   std::size_t size_{0};
+  SpillHostMemoryKind kind_{SpillHostMemoryKind::kPinned};
 };
 
 /// A build piece kept resident on device — used to hand piece 0 from
@@ -94,11 +110,11 @@ struct InitialResidentPiece {
 struct HostBuildPiece {
   /// `cudf::pack` metadata for `payloadBytes`. Host-resident; small.
   std::vector<std::uint8_t> packedMetadata;
-  /// Pinned-host bytes for the packed build table payload (the
+  /// Host bytes for the packed build table payload (the
   /// `packed_columns::gpu_data` bytes after D-to-H).
-  PinnedHostBuffer payloadBytes;
-  /// Pinned-host bytes for the cuco hash-table slot storage.
-  PinnedHostBuffer hashTableBytes;
+  SpillHostBuffer payloadBytes;
+  /// Host bytes for the cuco hash-table slot storage.
+  SpillHostBuffer hashTableBytes;
   /// Number of slots in the hash table.
   std::size_t hashSlotCount{0};
   /// Size of one slot in bytes.
@@ -147,8 +163,7 @@ class PiecewiseSpillStore {
   /// first caller gets a populated `InitialResidentPiece`; subsequent
   /// callers get an empty (default-constructed) one. Single-driver
   /// configuration of the piecewise study guarantees only one caller.
-  InitialResidentPiece takeInitialResident(
-      const core::PlanNodeId& planNodeId);
+  InitialResidentPiece takeInitialResident(const core::PlanNodeId& planNodeId);
 
   /// Removes the entry for `planNodeId`. Called once per task at probe
   /// completion (by the last probe driver) to release host memory.
@@ -176,8 +191,8 @@ class PiecewiseSpillStore {
 ///   3. Packs the piece's full payload (key + payload columns) via
 ///      `cudf::pack` to obtain a single contiguous device buffer plus
 ///      host metadata.
-///   4. Allocates pinned-host destination buffers and `cudaMemcpyAsync`
-///      D-to-H copies the slot bytes and packed payload bytes.
+///   4. Allocates host destination buffers and D-to-H copies the slot bytes
+///      and packed payload bytes.
 ///   5. Drops the device-resident state.
 /// After all pieces are spilled, publishes the vector to the bridge.
 class CudfPiecewiseSpillHashJoinBuild : public CudfOperatorBase {
@@ -186,7 +201,8 @@ class CudfPiecewiseSpillHashJoinBuild : public CudfOperatorBase {
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode,
-      cudf::size_type pieceTargetRows);
+      cudf::size_type pieceTargetRows,
+      bool usePinnedHostMemory);
 
   bool needsInput() const override;
 
@@ -202,6 +218,7 @@ class CudfPiecewiseSpillHashJoinBuild : public CudfOperatorBase {
  private:
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   cudf::size_type const pieceTargetRows_;
+  SpillHostMemoryKind const spillHostMemoryKind_;
   std::vector<CudfVectorPtr> inputs_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
 };
@@ -314,4 +331,4 @@ class CudfPiecewiseSpillHashJoinProbe : public CudfOperatorBase {
   bool finished_{false};
 };
 
-}  // namespace facebook::velox::cudf_velox
+} // namespace facebook::velox::cudf_velox

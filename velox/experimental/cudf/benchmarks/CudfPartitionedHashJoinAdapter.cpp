@@ -49,9 +49,12 @@ class PartitionedHashJoinBaseAdapter : public OperatorAdapter {
 
 class PartitionedHashJoinBuildAdapter : public PartitionedHashJoinBaseAdapter {
  public:
-  explicit PartitionedHashJoinBuildAdapter(int32_t numPartitions)
+  PartitionedHashJoinBuildAdapter(
+      int32_t numPartitions,
+      bool usePinnedHostMemory)
       : PartitionedHashJoinBaseAdapter("HashJoinBuild"),
-        numPartitions_(numPartitions) {}
+        numPartitions_(numPartitions),
+        usePinnedHostMemory_(usePinnedHostMemory) {}
 
   bool canHandle(const exec::Operator* op) const override {
     return dynamic_cast<const exec::HashBuild*>(op) != nullptr;
@@ -75,12 +78,17 @@ class PartitionedHashJoinBuildAdapter : public PartitionedHashJoinBaseAdapter {
     std::vector<std::unique_ptr<exec::Operator>> result;
     result.push_back(
         std::make_unique<CudfPartitionedHashJoinBuild>(
-            operatorId, ctx, joinPlanNode, numPartitions_));
+            operatorId,
+            ctx,
+            joinPlanNode,
+            numPartitions_,
+            usePinnedHostMemory_));
     return result;
   }
 
  private:
   int32_t const numPartitions_;
+  bool const usePinnedHostMemory_;
 };
 
 class PartitionedHashJoinProbeAdapter : public PartitionedHashJoinBaseAdapter {
@@ -121,10 +129,13 @@ class PartitionedHashJoinProbeAdapter : public PartitionedHashJoinBaseAdapter {
 
 } // namespace
 
-void registerPartitionedHashJoinAdapter(int32_t numPartitions) {
+void registerPartitionedHashJoinAdapter(
+    int32_t numPartitions,
+    bool usePinnedHostMemory) {
   auto& registry = OperatorAdapterRegistry::getInstance();
   registry.registerAdapter(
-      std::make_unique<PartitionedHashJoinBuildAdapter>(numPartitions),
+      std::make_unique<PartitionedHashJoinBuildAdapter>(
+          numPartitions, usePinnedHostMemory),
       /*overwrite=*/true);
   registry.registerAdapter(
       std::make_unique<PartitionedHashJoinProbeAdapter>(numPartitions),
