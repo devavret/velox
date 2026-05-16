@@ -25,6 +25,7 @@ add_library(
   CudfAggregation.cpp
   CudfHashJoin.cpp
   CudfPartitionedHashJoin.cpp
+  CudfPartitionedProbeSpillHashJoin.cpp
   CudfPiecewiseSpillHashJoin.cpp
   CudfReduce.cpp
   CudfLimit.cpp

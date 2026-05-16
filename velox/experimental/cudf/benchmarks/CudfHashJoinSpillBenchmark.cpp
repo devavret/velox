@@ -48,9 +48,17 @@
 ///       --spill_join_strategy=partitioned \
 ///       --partitioned_join_num_partitions=16 \
 ///       --spill_join_host_memory=regular
+///
+///   # Partitioned probe-spill experiment:
+///   ./velox_cudf_hashjoin_spill_benchmark \
+///       --data_path=/data/tpch/pq_sf10_f64 --include_results \
+///       --spill_join_strategy=partitioned_probe_spill \
+///       --partitioned_join_num_partitions=16 \
+///       --spill_join_host_memory=regular
 
 #include "velox/experimental/cudf/benchmarks/CudfBenchmarkHelpers.h"
 #include "velox/experimental/cudf/benchmarks/CudfPartitionedHashJoinAdapter.h"
+#include "velox/experimental/cudf/benchmarks/CudfPartitionedProbeSpillHashJoinAdapter.h"
 #include "velox/experimental/cudf/benchmarks/CudfPiecewiseSpillHashJoinAdapter.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchBenchmark.h"
 
@@ -68,9 +76,9 @@ DECLARE_string(preload);
 DEFINE_string(
     spill_join_strategy,
     "baseline",
-    "Hash join strategy for this benchmark: baseline, piecewise, or "
-    "partitioned. Only the custom strategies support inner equi-join with no "
-    "filter.");
+    "Hash join strategy for this benchmark: baseline, piecewise, partitioned, "
+    "or partitioned_probe_spill. Only the custom strategies support inner "
+    "equi-join with no filter.");
 
 DEFINE_int64(
     piecewise_spill_piece_rows,
@@ -80,7 +88,8 @@ DEFINE_int64(
 DEFINE_int32(
     partitioned_join_num_partitions,
     16,
-    "Number of hash partitions for --spill_join_strategy=partitioned.");
+    "Number of hash partitions for --spill_join_strategy=partitioned or "
+    "partitioned_probe_spill.");
 
 DEFINE_string(
     spill_join_host_memory,
@@ -145,12 +154,25 @@ class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
       cudf_velox::registerPartitionedHashJoinAdapter(
           FLAGS_partitioned_join_num_partitions,
           usePinnedSpillJoinHostMemory());
+    } else if (FLAGS_spill_join_strategy == "partitioned_probe_spill") {
+      VELOX_CHECK_GT(
+          FLAGS_partitioned_join_num_partitions,
+          0,
+          "--partitioned_join_num_partitions must be positive");
+      if (FLAGS_num_drivers != 1) {
+        out << "[partitioned_probe_spill] forcing --num_drivers=1 (was "
+            << FLAGS_num_drivers << ")" << std::endl;
+        FLAGS_num_drivers = 1;
+      }
+      cudf_velox::registerPartitionedProbeSpillHashJoinAdapter(
+          FLAGS_partitioned_join_num_partitions,
+          usePinnedSpillJoinHostMemory());
     } else {
       VELOX_CHECK_EQ(
           FLAGS_spill_join_strategy,
           "baseline",
           "Unsupported --spill_join_strategy: {}. Expected baseline, "
-          "piecewise, or partitioned.",
+          "piecewise, partitioned, or partitioned_probe_spill.",
           FLAGS_spill_join_strategy);
     }
     auto pool = memory::memoryManager()->addLeafPool();
@@ -188,12 +210,14 @@ class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
     out << "Data path: " << FLAGS_data_path << std::endl;
     out << "Preload mode: " << FLAGS_preload << std::endl;
     out << "Join strategy: " << FLAGS_spill_join_strategy << std::endl;
-    if (FLAGS_spill_join_strategy == "partitioned") {
+    if (FLAGS_spill_join_strategy == "partitioned" ||
+        FLAGS_spill_join_strategy == "partitioned_probe_spill") {
       out << "Partitioned join partitions: "
           << FLAGS_partitioned_join_num_partitions << std::endl;
     }
     if (FLAGS_spill_join_strategy == "piecewise" ||
-        FLAGS_spill_join_strategy == "partitioned") {
+        FLAGS_spill_join_strategy == "partitioned" ||
+        FLAGS_spill_join_strategy == "partitioned_probe_spill") {
       out << "Spill join host memory: " << FLAGS_spill_join_host_memory
           << std::endl;
     }
