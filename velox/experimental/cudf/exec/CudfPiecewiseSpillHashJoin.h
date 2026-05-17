@@ -41,7 +41,8 @@ namespace facebook::velox::cudf_velox {
 
 enum class SpillHostMemoryKind {
   kPinned,
-  kPooledPinned,
+  kRmmPooledPinned,
+  kCudaPooledPinned,
   kRegular,
 };
 
@@ -71,10 +72,7 @@ class SpillHostBuffer {
   [[nodiscard]] SpillHostMemoryKind kind() const noexcept {
     return kind_;
   }
-  [[nodiscard]] bool isPinned() const noexcept {
-    return kind_ == SpillHostMemoryKind::kPinned ||
-        kind_ == SpillHostMemoryKind::kPooledPinned;
-  }
+  [[nodiscard]] bool isPinned() const noexcept;
 
  private:
   void release() noexcept;
@@ -83,6 +81,19 @@ class SpillHostBuffer {
   std::size_t size_{0};
   SpillHostMemoryKind kind_{SpillHostMemoryKind::kPinned};
 };
+
+void copyDeviceToSpillHost(
+    SpillHostBuffer& dst,
+    const void* src,
+    std::size_t bytes,
+    rmm::cuda_stream_view stream,
+    const char* op);
+
+void copySpillHostToDevice(
+    void* dst,
+    const SpillHostBuffer& src,
+    rmm::cuda_stream_view stream,
+    const char* op);
 
 /// A build piece kept resident on device — used to hand piece 0 from
 /// the build operator to the probe operator so the very first join

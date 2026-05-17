@@ -61,50 +61,6 @@ void checkCuda(cudaError_t err, const char* op) {
   VELOX_CHECK(err == cudaSuccess, "{} failed: {}", op, cudaGetErrorString(err));
 }
 
-void copyDeviceToHost(
-    SpillHostBuffer& dst,
-    const void* src,
-    std::size_t bytes,
-    rmm::cuda_stream_view stream,
-    const char* op) {
-  if (bytes == 0) {
-    return;
-  }
-  if (dst.isPinned()) {
-    checkCuda(
-        cudaMemcpyAsync(
-            dst.data(), src, bytes, cudaMemcpyDeviceToHost, stream.value()),
-        op);
-  } else {
-    stream.synchronize();
-    checkCuda(cudaMemcpy(dst.data(), src, bytes, cudaMemcpyDeviceToHost), op);
-  }
-}
-
-void copyHostToDevice(
-    void* dst,
-    const SpillHostBuffer& src,
-    rmm::cuda_stream_view stream,
-    const char* op) {
-  if (src.size() == 0) {
-    return;
-  }
-  if (src.isPinned()) {
-    checkCuda(
-        cudaMemcpyAsync(
-            dst,
-            src.data(),
-            src.size(),
-            cudaMemcpyHostToDevice,
-            stream.value()),
-        op);
-  } else {
-    stream.synchronize();
-    checkCuda(
-        cudaMemcpy(dst, src.data(), src.size(), cudaMemcpyHostToDevice), op);
-  }
-}
-
 int currentCudaDevice() {
   int device = 0;
   checkCuda(cudaGetDevice(&device), "cudaGetDevice");
@@ -327,13 +283,13 @@ void CudfPartitionedHashJoinBuild::doNoMoreInput() {
     piece.hashHasNulls = storage.has_nulls;
     piece.hashLoadFactor = storage.load_factor;
 
-    copyDeviceToHost(
+    copyDeviceToSpillHost(
         piece.payloadBytes,
         packed.gpu_data->data(),
         payloadSize,
         stream,
         "D2H copy of packed partition payload");
-    copyDeviceToHost(
+    copyDeviceToSpillHost(
         piece.hashTableBytes,
         storage.slots.data(),
         storage.slots.size(),
@@ -546,7 +502,7 @@ void CudfPartitionedHashJoinProbe::loadPartitionInto(
 
   target.hj.reset();
   target.payloadDevice = rmm::device_buffer{piece.payloadBytes.size(), stream};
-  copyHostToDevice(
+  copySpillHostToDevice(
       target.payloadDevice.data(),
       piece.payloadBytes,
       stream,
@@ -559,7 +515,7 @@ void CudfPartitionedHashJoinProbe::loadPartitionInto(
   storage.compare_nulls = piece.hashCompareNulls;
   storage.has_nulls = piece.hashHasNulls;
   storage.load_factor = piece.hashLoadFactor;
-  copyHostToDevice(
+  copySpillHostToDevice(
       storage.slots.data(),
       piece.hashTableBytes,
       stream,

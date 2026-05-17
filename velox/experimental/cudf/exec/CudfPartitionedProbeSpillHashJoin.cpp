@@ -60,50 +60,6 @@ void checkCuda(cudaError_t err, const char* op) {
   VELOX_CHECK(err == cudaSuccess, "{} failed: {}", op, cudaGetErrorString(err));
 }
 
-void copyDeviceToHost(
-    SpillHostBuffer& dst,
-    const void* src,
-    std::size_t bytes,
-    rmm::cuda_stream_view stream,
-    const char* op) {
-  if (bytes == 0) {
-    return;
-  }
-  if (dst.isPinned()) {
-    checkCuda(
-        cudaMemcpyAsync(
-            dst.data(), src, bytes, cudaMemcpyDeviceToHost, stream.value()),
-        op);
-  } else {
-    stream.synchronize();
-    checkCuda(cudaMemcpy(dst.data(), src, bytes, cudaMemcpyDeviceToHost), op);
-  }
-}
-
-void copyHostToDevice(
-    void* dst,
-    const SpillHostBuffer& src,
-    rmm::cuda_stream_view stream,
-    const char* op) {
-  if (src.size() == 0) {
-    return;
-  }
-  if (src.isPinned()) {
-    checkCuda(
-        cudaMemcpyAsync(
-            dst,
-            src.data(),
-            src.size(),
-            cudaMemcpyHostToDevice,
-            stream.value()),
-        op);
-  } else {
-    stream.synchronize();
-    checkCuda(
-        cudaMemcpy(dst, src.data(), src.size(), cudaMemcpyHostToDevice), op);
-  }
-}
-
 int currentCudaDevice() {
   int device = 0;
   checkCuda(cudaGetDevice(&device), "cudaGetDevice");
@@ -270,7 +226,7 @@ CudfProbeSpillTablePiece CudfPartitionedProbeSpillHashJoinBuild::spillTableView(
   auto const payloadSize = packed.gpu_data->size();
   piece.payloadBytes = SpillHostBuffer{payloadSize, spillHostMemoryKind_};
 
-  copyDeviceToHost(
+  copyDeviceToSpillHost(
       piece.payloadBytes,
       packed.gpu_data->data(),
       payloadSize,
@@ -471,7 +427,7 @@ CudfProbeSpillTablePiece CudfPartitionedProbeSpillHashJoinProbe::spillTableView(
   auto const payloadSize = packed.gpu_data->size();
   piece.payloadBytes = SpillHostBuffer{payloadSize, spillHostMemoryKind_};
 
-  copyDeviceToHost(
+  copyDeviceToSpillHost(
       piece.payloadBytes,
       packed.gpu_data->data(),
       payloadSize,
@@ -580,7 +536,7 @@ CudfPartitionedProbeSpillHashJoinProbe::loadTablePiece(
   DeviceTableView table;
   VELOX_CHECK_GT(piece.numRows, 0);
   table.payloadDevice = rmm::device_buffer{piece.payloadBytes.size(), stream};
-  copyHostToDevice(
+  copySpillHostToDevice(
       table.payloadDevice.data(),
       piece.payloadBytes,
       stream,

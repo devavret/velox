@@ -24,6 +24,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 
+#include <cuda/memory_pool>
 #include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
@@ -57,22 +58,145 @@ void checkCuda(cudaError_t err, const char* op) {
   VELOX_CHECK(err == cudaSuccess, "{} failed: {}", op, cudaGetErrorString(err));
 }
 
-struct PooledPinnedHostMemoryResource {
-  rmm::mr::pinned_host_memory_resource upstream;
-  rmm::mr::pool_memory_resource pool;
+class SpillHostMemoryProvider {
+ public:
+  virtual ~SpillHostMemoryProvider() = default;
 
-  PooledPinnedHostMemoryResource() : upstream(), pool(upstream, 0) {}
+  virtual void* allocate(std::size_t bytes) = 0;
+  virtual void deallocate(void* ptr, std::size_t bytes) noexcept = 0;
+  virtual bool isPinned() const noexcept = 0;
 };
 
-rmm::mr::pool_memory_resource& pooledPinnedHostMemoryResource() {
-  // Keep the pool alive for the process lifetime. Spill buffers can be held by
+class CudaHostAllocSpillHostMemoryProvider final
+    : public SpillHostMemoryProvider {
+ public:
+  void* allocate(std::size_t bytes) override {
+    void* ptr = nullptr;
+    auto const err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
+    VELOX_CHECK(
+        err == cudaSuccess,
+        "cudaHostAlloc failed for pinned host buffer of {} bytes: {}",
+        bytes,
+        cudaGetErrorString(err));
+    return ptr;
+  }
+
+  void deallocate(void* ptr, std::size_t /*bytes*/) noexcept override {
+    cudaFreeHost(ptr);
+  }
+
+  bool isPinned() const noexcept override {
+    return true;
+  }
+};
+
+class RmmPooledPinnedSpillHostMemoryProvider final
+    : public SpillHostMemoryProvider {
+ public:
+  RmmPooledPinnedSpillHostMemoryProvider() : upstream_(), pool_(upstream_, 0) {}
+
+  void* allocate(std::size_t bytes) override {
+    auto* ptr = pool_.allocate_sync(bytes);
+    VELOX_CHECK_NOT_NULL(
+        ptr, "RMM pooled pinned allocation failed for {} bytes", bytes);
+    return ptr;
+  }
+
+  void deallocate(void* ptr, std::size_t bytes) noexcept override {
+    pool_.deallocate_sync(ptr, bytes);
+  }
+
+  bool isPinned() const noexcept override {
+    return true;
+  }
+
+ private:
+  rmm::mr::pinned_host_memory_resource upstream_;
+  rmm::mr::pool_memory_resource pool_;
+};
+
+class CudaPooledPinnedSpillHostMemoryProvider final
+    : public SpillHostMemoryProvider {
+ public:
+  void* allocate(std::size_t bytes) override {
+    auto* ptr = cuda::pinned_default_memory_pool().allocate_sync(bytes);
+    VELOX_CHECK_NOT_NULL(
+        ptr, "CUDA pooled pinned allocation failed for {} bytes", bytes);
+    return ptr;
+  }
+
+  void deallocate(void* ptr, std::size_t bytes) noexcept override {
+    cuda::pinned_default_memory_pool().deallocate_sync(ptr, bytes);
+  }
+
+  bool isPinned() const noexcept override {
+    return true;
+  }
+};
+
+class RegularSpillHostMemoryProvider final : public SpillHostMemoryProvider {
+ public:
+  void* allocate(std::size_t bytes) override {
+    auto* ptr = std::malloc(bytes);
+    VELOX_CHECK_NOT_NULL(
+        ptr, "malloc failed for regular host buffer of {} bytes", bytes);
+    return ptr;
+  }
+
+  void deallocate(void* ptr, std::size_t /*bytes*/) noexcept override {
+    std::free(ptr);
+  }
+
+  bool isPinned() const noexcept override {
+    return false;
+  }
+};
+
+SpillHostMemoryProvider& spillHostMemoryProvider(SpillHostMemoryKind kind) {
+  // Keep providers alive for the process lifetime. Spill buffers can be held by
   // benchmark stores in other translation units, so relying on static teardown
   // order would make shutdown fragile.
-  static auto* resource = new PooledPinnedHostMemoryResource();
-  return resource->pool;
+  static auto* pinned = new CudaHostAllocSpillHostMemoryProvider();
+  static auto* rmmPooled = new RmmPooledPinnedSpillHostMemoryProvider();
+  static auto* cudaPooled = new CudaPooledPinnedSpillHostMemoryProvider();
+  static auto* regular = new RegularSpillHostMemoryProvider();
+
+  switch (kind) {
+    case SpillHostMemoryKind::kPinned:
+      return *pinned;
+    case SpillHostMemoryKind::kRmmPooledPinned:
+      return *rmmPooled;
+    case SpillHostMemoryKind::kCudaPooledPinned:
+      return *cudaPooled;
+    case SpillHostMemoryKind::kRegular:
+      return *regular;
+  }
+  VELOX_UNREACHABLE();
 }
 
-void copyDeviceToHost(
+int currentCudaDevice() {
+  int device = 0;
+  checkCuda(cudaGetDevice(&device), "cudaGetDevice");
+  return device;
+}
+
+/// Returns true if the join key has been validated as a simple inner equi
+/// join with no filter. The piecewise variant only supports this case.
+bool isSimpleInnerEquiJoin(const core::HashJoinNode& joinNode) {
+  return joinNode.isInnerJoin() && joinNode.filter() == nullptr;
+}
+
+} // namespace
+
+// =============================================================================
+// SpillHostBuffer
+// =============================================================================
+
+bool SpillHostBuffer::isPinned() const noexcept {
+  return spillHostMemoryProvider(kind_).isPinned();
+}
+
+void copyDeviceToSpillHost(
     SpillHostBuffer& dst,
     const void* src,
     std::size_t bytes,
@@ -92,7 +216,7 @@ void copyDeviceToHost(
   }
 }
 
-void copyHostToDevice(
+void copySpillHostToDevice(
     void* dst,
     const SpillHostBuffer& src,
     rmm::cuda_stream_view stream,
@@ -116,53 +240,12 @@ void copyHostToDevice(
   }
 }
 
-int currentCudaDevice() {
-  int device = 0;
-  checkCuda(cudaGetDevice(&device), "cudaGetDevice");
-  return device;
-}
-
-/// Returns true if the join key has been validated as a simple inner equi
-/// join with no filter. The piecewise variant only supports this case.
-bool isSimpleInnerEquiJoin(const core::HashJoinNode& joinNode) {
-  return joinNode.isInnerJoin() && joinNode.filter() == nullptr;
-}
-
-} // namespace
-
-// =============================================================================
-// SpillHostBuffer
-// =============================================================================
-
 SpillHostBuffer::SpillHostBuffer(std::size_t bytes, SpillHostMemoryKind kind)
     : kind_(kind) {
   if (bytes == 0) {
     return;
   }
-  void* ptr;
-  switch (kind_) {
-    case SpillHostMemoryKind::kPinned: {
-      ptr = nullptr;
-      auto const err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
-      VELOX_CHECK(
-          err == cudaSuccess,
-          "cudaHostAlloc failed for pinned host buffer of {} bytes: {}",
-          bytes,
-          cudaGetErrorString(err));
-      break;
-    }
-    case SpillHostMemoryKind::kPooledPinned:
-      ptr = pooledPinnedHostMemoryResource().allocate_sync(bytes);
-      VELOX_CHECK_NOT_NULL(
-          ptr, "RMM pooled pinned allocation failed for {} bytes", bytes);
-      break;
-    case SpillHostMemoryKind::kRegular:
-      ptr = std::malloc(bytes);
-      VELOX_CHECK_NOT_NULL(
-          ptr, "malloc failed for regular host buffer of {} bytes", bytes);
-      break;
-  }
-  data_ = ptr;
+  data_ = spillHostMemoryProvider(kind_).allocate(bytes);
   size_ = bytes;
 }
 
@@ -194,17 +277,7 @@ void SpillHostBuffer::release() noexcept {
   if (data_ == nullptr) {
     return;
   }
-  switch (kind_) {
-    case SpillHostMemoryKind::kPinned:
-      cudaFreeHost(data_);
-      break;
-    case SpillHostMemoryKind::kPooledPinned:
-      pooledPinnedHostMemoryResource().deallocate_sync(data_, size_);
-      break;
-    case SpillHostMemoryKind::kRegular:
-      std::free(data_);
-      break;
-  }
+  spillHostMemoryProvider(kind_).deallocate(data_, size_);
   data_ = nullptr;
   size_ = 0;
   kind_ = SpillHostMemoryKind::kPinned;
@@ -423,13 +496,13 @@ void CudfPiecewiseSpillHashJoinBuild::doNoMoreInput() {
     piece.hashHasNulls = storage.has_nulls;
     piece.hashLoadFactor = storage.load_factor;
 
-    copyDeviceToHost(
+    copyDeviceToSpillHost(
         piece.payloadBytes,
         packed.gpu_data->data(),
         payloadSize,
         stream,
         "D2H copy of packed payload");
-    copyDeviceToHost(
+    copyDeviceToSpillHost(
         piece.hashTableBytes,
         storage.slots.data(),
         slotsSize,
@@ -641,7 +714,7 @@ void CudfPiecewiseSpillHashJoinProbe::loadPieceInto(
   // contents' free is queued on `stream` before the new allocation.
   target.hj.reset();
   target.payloadDevice = rmm::device_buffer{piece.payloadBytes.size(), stream};
-  copyHostToDevice(
+  copySpillHostToDevice(
       target.payloadDevice.data(),
       piece.payloadBytes,
       stream,
@@ -654,7 +727,7 @@ void CudfPiecewiseSpillHashJoinProbe::loadPieceInto(
   storage.compare_nulls = piece.hashCompareNulls;
   storage.has_nulls = piece.hashHasNulls;
   storage.load_factor = piece.hashLoadFactor;
-  copyHostToDevice(
+  copySpillHostToDevice(
       storage.slots.data(),
       piece.hashTableBytes,
       stream,

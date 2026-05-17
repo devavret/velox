@@ -96,9 +96,10 @@ DEFINE_string(
     spill_join_host_memory,
     "pinned",
     "Host memory used for spilled build payloads and hash maps. "
-    "Allowed values: pinned, pooled_pinned, regular. pooled_pinned uses an "
-    "RMM pool over pinned host memory. regular is pageable host memory and "
-    "disables cudaHostAlloc.");
+    "Allowed values: pinned, pooled_pinned, cuda_pooled_pinned, regular. "
+    "pooled_pinned uses an RMM pool over pinned host memory. "
+    "cuda_pooled_pinned uses CUDA's stream-ordered pinned memory pool. "
+    "regular is pageable host memory and disables cudaHostAlloc.");
 
 DECLARE_int32(num_drivers);
 
@@ -113,7 +114,11 @@ cudf_velox::SpillHostMemoryKind spillJoinHostMemoryKind() {
   }
   if (FLAGS_spill_join_host_memory == "pooled_pinned" ||
       FLAGS_spill_join_host_memory == "rmm_pooled_pinned") {
-    return cudf_velox::SpillHostMemoryKind::kPooledPinned;
+    return cudf_velox::SpillHostMemoryKind::kRmmPooledPinned;
+  }
+  if (FLAGS_spill_join_host_memory == "cuda_pooled_pinned" ||
+      FLAGS_spill_join_host_memory == "cuda_pinned_pool") {
+    return cudf_velox::SpillHostMemoryKind::kCudaPooledPinned;
   }
   if (FLAGS_spill_join_host_memory == "regular" ||
       FLAGS_spill_join_host_memory == "pageable") {
@@ -121,7 +126,7 @@ cudf_velox::SpillHostMemoryKind spillJoinHostMemoryKind() {
   }
   VELOX_FAIL(
       "Unsupported --spill_join_host_memory: {}. Expected pinned, "
-      "pooled_pinned, or regular.",
+      "pooled_pinned, cuda_pooled_pinned, or regular.",
       FLAGS_spill_join_host_memory);
 }
 
