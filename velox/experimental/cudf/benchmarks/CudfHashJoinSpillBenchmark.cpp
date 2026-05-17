@@ -47,20 +47,21 @@
 ///       --data_path=/data/tpch/pq_sf10_f64 --include_results \
 ///       --spill_join_strategy=partitioned \
 ///       --partitioned_join_num_partitions=16 \
-///       --spill_join_host_memory=regular
+///       --spill_join_host_memory=pooled_pinned
 ///
 ///   # Partitioned probe-spill experiment:
 ///   ./velox_cudf_hashjoin_spill_benchmark \
 ///       --data_path=/data/tpch/pq_sf10_f64 --include_results \
 ///       --spill_join_strategy=partitioned_probe_spill \
 ///       --partitioned_join_num_partitions=16 \
-///       --spill_join_host_memory=regular
+///       --spill_join_host_memory=pooled_pinned
 
 #include "velox/experimental/cudf/benchmarks/CudfBenchmarkHelpers.h"
 #include "velox/experimental/cudf/benchmarks/CudfPartitionedHashJoinAdapter.h"
 #include "velox/experimental/cudf/benchmarks/CudfPartitionedProbeSpillHashJoinAdapter.h"
 #include "velox/experimental/cudf/benchmarks/CudfPiecewiseSpillHashJoinAdapter.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchBenchmark.h"
+#include "velox/experimental/cudf/exec/CudfPiecewiseSpillHashJoin.h"
 
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/dwio/common/ColumnSelector.h"
@@ -95,7 +96,8 @@ DEFINE_string(
     spill_join_host_memory,
     "pinned",
     "Host memory used for spilled build payloads and hash maps. "
-    "Allowed values: pinned, regular. regular is pageable host memory and "
+    "Allowed values: pinned, pooled_pinned, regular. pooled_pinned uses an "
+    "RMM pool over pinned host memory. regular is pageable host memory and "
     "disables cudaHostAlloc.");
 
 DECLARE_int32(num_drivers);
@@ -105,16 +107,21 @@ using namespace facebook::velox::exec::test;
 
 namespace {
 
-bool usePinnedSpillJoinHostMemory() {
+cudf_velox::SpillHostMemoryKind spillJoinHostMemoryKind() {
   if (FLAGS_spill_join_host_memory == "pinned") {
-    return true;
+    return cudf_velox::SpillHostMemoryKind::kPinned;
+  }
+  if (FLAGS_spill_join_host_memory == "pooled_pinned" ||
+      FLAGS_spill_join_host_memory == "rmm_pooled_pinned") {
+    return cudf_velox::SpillHostMemoryKind::kPooledPinned;
   }
   if (FLAGS_spill_join_host_memory == "regular" ||
       FLAGS_spill_join_host_memory == "pageable") {
-    return false;
+    return cudf_velox::SpillHostMemoryKind::kRegular;
   }
   VELOX_FAIL(
-      "Unsupported --spill_join_host_memory: {}. Expected pinned or regular.",
+      "Unsupported --spill_join_host_memory: {}. Expected pinned, "
+      "pooled_pinned, or regular.",
       FLAGS_spill_join_host_memory);
 }
 
@@ -145,7 +152,7 @@ class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
       }
       cudf_velox::registerPiecewiseSpillHashJoinAdapter(
           static_cast<cudf::size_type>(FLAGS_piecewise_spill_piece_rows),
-          usePinnedSpillJoinHostMemory());
+          spillJoinHostMemoryKind());
     } else if (FLAGS_spill_join_strategy == "partitioned") {
       VELOX_CHECK_GT(
           FLAGS_partitioned_join_num_partitions,
@@ -153,7 +160,7 @@ class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
           "--partitioned_join_num_partitions must be positive");
       cudf_velox::registerPartitionedHashJoinAdapter(
           FLAGS_partitioned_join_num_partitions,
-          usePinnedSpillJoinHostMemory());
+          spillJoinHostMemoryKind());
     } else if (FLAGS_spill_join_strategy == "partitioned_probe_spill") {
       VELOX_CHECK_GT(
           FLAGS_partitioned_join_num_partitions,
@@ -166,7 +173,7 @@ class CudfHashJoinSpillBenchmark : public CudfTpchBenchmark {
       }
       cudf_velox::registerPartitionedProbeSpillHashJoinAdapter(
           FLAGS_partitioned_join_num_partitions,
-          usePinnedSpillJoinHostMemory());
+          spillJoinHostMemoryKind());
     } else {
       VELOX_CHECK_EQ(
           FLAGS_spill_join_strategy,

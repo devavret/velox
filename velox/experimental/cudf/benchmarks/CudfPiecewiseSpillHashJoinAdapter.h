@@ -20,6 +20,8 @@
 
 namespace facebook::velox::cudf_velox {
 
+enum class SpillHostMemoryKind;
+
 /// Registers two `OperatorAdapter`s — one for `HashBuild`, one for
 /// `HashProbe` — that overwrite the default cuDF hash-join adapters and
 /// instead substitute the piecewise host-spill operators
@@ -32,6 +34,6 @@ namespace facebook::velox::cudf_velox {
 /// target piece size when slicing the build side.
 void registerPiecewiseSpillHashJoinAdapter(
     cudf::size_type pieceTargetRows,
-    bool usePinnedHostMemory);
+    SpillHostMemoryKind spillHostMemoryKind);
 
 } // namespace facebook::velox::cudf_velox

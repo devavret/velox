@@ -32,9 +32,13 @@
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/futures/Future.h>
 
+#include <rmm/mr/pinned_host_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <optional>
 
 namespace facebook::velox::cudf_velox {
@@ -51,6 +55,21 @@ folly::CPUThreadPoolExecutor* piecewiseUnspillExecutor() {
 
 void checkCuda(cudaError_t err, const char* op) {
   VELOX_CHECK(err == cudaSuccess, "{} failed: {}", op, cudaGetErrorString(err));
+}
+
+struct PooledPinnedHostMemoryResource {
+  rmm::mr::pinned_host_memory_resource upstream;
+  rmm::mr::pool_memory_resource pool;
+
+  PooledPinnedHostMemoryResource() : upstream(), pool(upstream, 0) {}
+};
+
+rmm::mr::pool_memory_resource& pooledPinnedHostMemoryResource() {
+  // Keep the pool alive for the process lifetime. Spill buffers can be held by
+  // benchmark stores in other translation units, so relying on static teardown
+  // order would make shutdown fragile.
+  static auto* resource = new PooledPinnedHostMemoryResource();
+  return resource->pool;
 }
 
 void copyDeviceToHost(
@@ -121,18 +140,27 @@ SpillHostBuffer::SpillHostBuffer(std::size_t bytes, SpillHostMemoryKind kind)
     return;
   }
   void* ptr;
-  if (kind_ == SpillHostMemoryKind::kPinned) {
-    ptr = nullptr;
-    auto const err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
-    VELOX_CHECK(
-        err == cudaSuccess,
-        "cudaHostAlloc failed for pinned host buffer of {} bytes: {}",
-        bytes,
-        cudaGetErrorString(err));
-  } else {
-    ptr = std::malloc(bytes);
-    VELOX_CHECK_NOT_NULL(
-        ptr, "malloc failed for regular host buffer of {} bytes", bytes);
+  switch (kind_) {
+    case SpillHostMemoryKind::kPinned: {
+      ptr = nullptr;
+      auto const err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
+      VELOX_CHECK(
+          err == cudaSuccess,
+          "cudaHostAlloc failed for pinned host buffer of {} bytes: {}",
+          bytes,
+          cudaGetErrorString(err));
+      break;
+    }
+    case SpillHostMemoryKind::kPooledPinned:
+      ptr = pooledPinnedHostMemoryResource().allocate_sync(bytes);
+      VELOX_CHECK_NOT_NULL(
+          ptr, "RMM pooled pinned allocation failed for {} bytes", bytes);
+      break;
+    case SpillHostMemoryKind::kRegular:
+      ptr = std::malloc(bytes);
+      VELOX_CHECK_NOT_NULL(
+          ptr, "malloc failed for regular host buffer of {} bytes", bytes);
+      break;
   }
   data_ = ptr;
   size_ = bytes;
@@ -166,10 +194,16 @@ void SpillHostBuffer::release() noexcept {
   if (data_ == nullptr) {
     return;
   }
-  if (kind_ == SpillHostMemoryKind::kPinned) {
-    cudaFreeHost(data_);
-  } else {
-    std::free(data_);
+  switch (kind_) {
+    case SpillHostMemoryKind::kPinned:
+      cudaFreeHost(data_);
+      break;
+    case SpillHostMemoryKind::kPooledPinned:
+      pooledPinnedHostMemoryResource().deallocate_sync(data_, size_);
+      break;
+    case SpillHostMemoryKind::kRegular:
+      std::free(data_);
+      break;
   }
   data_ = nullptr;
   size_ = 0;
@@ -237,7 +271,7 @@ CudfPiecewiseSpillHashJoinBuild::CudfPiecewiseSpillHashJoinBuild(
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::HashJoinNode> joinNode,
     cudf::size_type pieceTargetRows,
-    bool usePinnedHostMemory)
+    SpillHostMemoryKind spillHostMemoryKind)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -250,9 +284,7 @@ CudfPiecewiseSpillHashJoinBuild::CudfPiecewiseSpillHashJoinBuild(
           joinNode),
       joinNode_(joinNode),
       pieceTargetRows_(pieceTargetRows),
-      spillHostMemoryKind_(
-          usePinnedHostMemory ? SpillHostMemoryKind::kPinned
-                              : SpillHostMemoryKind::kRegular) {
+      spillHostMemoryKind_(spillHostMemoryKind) {
   VELOX_CHECK(
       isSimpleInnerEquiJoin(*joinNode_),
       "CudfPiecewiseSpillHashJoinBuild only supports inner equi-join "

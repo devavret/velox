@@ -20,10 +20,12 @@
 
 namespace facebook::velox::cudf_velox {
 
+enum class SpillHostMemoryKind;
+
 /// Registers benchmark-only adapters that replace HashJoinBuild/HashJoinProbe
 /// with the CPU-style partitioned probe-spill cuDF join.
 void registerPartitionedProbeSpillHashJoinAdapter(
     int32_t numPartitions,
-    bool usePinnedHostMemory);
+    SpillHostMemoryKind spillHostMemoryKind);
 
 } // namespace facebook::velox::cudf_velox

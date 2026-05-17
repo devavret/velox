@@ -20,6 +20,8 @@
 
 namespace facebook::velox::cudf_velox {
 
+enum class SpillHostMemoryKind;
+
 /// Registers benchmark-only adapters that replace the default cuDF hash join
 /// with CudfPartitionedHashJoinBuild / CudfPartitionedHashJoinProbe.
 ///
@@ -27,6 +29,6 @@ namespace facebook::velox::cudf_velox {
 /// are present and can be overwritten.
 void registerPartitionedHashJoinAdapter(
     int32_t numPartitions,
-    bool usePinnedHostMemory);
+    SpillHostMemoryKind spillHostMemoryKind);
 
 } // namespace facebook::velox::cudf_velox

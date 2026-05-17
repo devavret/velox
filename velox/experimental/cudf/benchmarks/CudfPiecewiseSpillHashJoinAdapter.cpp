@@ -52,10 +52,10 @@ class PiecewiseHashJoinBuildAdapter : public PiecewiseHashJoinBaseAdapter {
  public:
   PiecewiseHashJoinBuildAdapter(
       cudf::size_type pieceTargetRows,
-      bool usePinnedHostMemory)
+      SpillHostMemoryKind spillHostMemoryKind)
       : PiecewiseHashJoinBaseAdapter("HashJoinBuild"),
         pieceTargetRows_(pieceTargetRows),
-        usePinnedHostMemory_(usePinnedHostMemory) {}
+        spillHostMemoryKind_(spillHostMemoryKind) {}
 
   bool canHandle(const exec::Operator* op) const override {
     return dynamic_cast<const exec::HashBuild*>(op) != nullptr;
@@ -83,13 +83,13 @@ class PiecewiseHashJoinBuildAdapter : public PiecewiseHashJoinBaseAdapter {
             ctx,
             joinPlanNode,
             pieceTargetRows_,
-            usePinnedHostMemory_));
+            spillHostMemoryKind_));
     return result;
   }
 
  private:
   cudf::size_type const pieceTargetRows_;
-  bool const usePinnedHostMemory_;
+  SpillHostMemoryKind const spillHostMemoryKind_;
 };
 
 class PiecewiseHashJoinProbeAdapter : public PiecewiseHashJoinBaseAdapter {
@@ -128,11 +128,11 @@ class PiecewiseHashJoinProbeAdapter : public PiecewiseHashJoinBaseAdapter {
 
 void registerPiecewiseSpillHashJoinAdapter(
     cudf::size_type pieceTargetRows,
-    bool usePinnedHostMemory) {
+    SpillHostMemoryKind spillHostMemoryKind) {
   auto& registry = OperatorAdapterRegistry::getInstance();
   registry.registerAdapter(
       std::make_unique<PiecewiseHashJoinBuildAdapter>(
-          pieceTargetRows, usePinnedHostMemory),
+          pieceTargetRows, spillHostMemoryKind),
       /*overwrite=*/true);
   registry.registerAdapter(
       std::make_unique<PiecewiseHashJoinProbeAdapter>(),

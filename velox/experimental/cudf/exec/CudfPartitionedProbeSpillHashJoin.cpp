@@ -218,7 +218,7 @@ CudfPartitionedProbeSpillHashJoinBuild::CudfPartitionedProbeSpillHashJoinBuild(
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::HashJoinNode> joinNode,
     int32_t numPartitions,
-    bool usePinnedHostMemory)
+    SpillHostMemoryKind spillHostMemoryKind)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -231,9 +231,7 @@ CudfPartitionedProbeSpillHashJoinBuild::CudfPartitionedProbeSpillHashJoinBuild(
           joinNode),
       joinNode_(std::move(joinNode)),
       numPartitions_(numPartitions),
-      spillHostMemoryKind_(
-          usePinnedHostMemory ? SpillHostMemoryKind::kPinned
-                              : SpillHostMemoryKind::kRegular) {
+      spillHostMemoryKind_(spillHostMemoryKind) {
   VELOX_CHECK(
       isSimpleInnerEquiJoin(*joinNode_),
       "CudfPartitionedProbeSpillHashJoinBuild only supports inner equi-join "
@@ -411,7 +409,7 @@ CudfPartitionedProbeSpillHashJoinProbe::CudfPartitionedProbeSpillHashJoinProbe(
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::HashJoinNode> joinNode,
     int32_t numPartitions,
-    bool usePinnedHostMemory)
+    SpillHostMemoryKind spillHostMemoryKind)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -426,9 +424,7 @@ CudfPartitionedProbeSpillHashJoinProbe::CudfPartitionedProbeSpillHashJoinProbe(
       probeType_(joinNode_->sources()[0]->outputType()),
       buildType_(joinNode_->sources()[1]->outputType()),
       numPartitions_(numPartitions),
-      spillHostMemoryKind_(
-          usePinnedHostMemory ? SpillHostMemoryKind::kPinned
-                              : SpillHostMemoryKind::kRegular),
+      spillHostMemoryKind_(spillHostMemoryKind),
       probePartitions_(numPartitions_) {
   VELOX_CHECK(
       isSimpleInnerEquiJoin(*joinNode_),

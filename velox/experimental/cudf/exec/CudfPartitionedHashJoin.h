@@ -52,7 +52,7 @@ class CudfPartitionedHashJoinBuild : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode,
       int32_t numPartitions,
-      bool usePinnedHostMemory);
+      SpillHostMemoryKind spillHostMemoryKind);
 
   bool needsInput() const override;
 

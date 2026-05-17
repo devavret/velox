@@ -53,10 +53,10 @@ class PartitionedProbeSpillHashJoinBuildAdapter
  public:
   PartitionedProbeSpillHashJoinBuildAdapter(
       int32_t numPartitions,
-      bool usePinnedHostMemory)
+      SpillHostMemoryKind spillHostMemoryKind)
       : PartitionedProbeSpillHashJoinBaseAdapter("HashJoinBuild"),
         numPartitions_(numPartitions),
-        usePinnedHostMemory_(usePinnedHostMemory) {}
+        spillHostMemoryKind_(spillHostMemoryKind) {}
 
   bool canHandle(const exec::Operator* op) const override {
     return dynamic_cast<const exec::HashBuild*>(op) != nullptr ||
@@ -87,13 +87,13 @@ class PartitionedProbeSpillHashJoinBuildAdapter
             ctx,
             joinPlanNode,
             numPartitions_,
-            usePinnedHostMemory_));
+            spillHostMemoryKind_));
     return result;
   }
 
  private:
   int32_t const numPartitions_;
-  bool const usePinnedHostMemory_;
+  SpillHostMemoryKind const spillHostMemoryKind_;
 };
 
 class PartitionedProbeSpillHashJoinProbeAdapter
@@ -101,10 +101,10 @@ class PartitionedProbeSpillHashJoinProbeAdapter
  public:
   PartitionedProbeSpillHashJoinProbeAdapter(
       int32_t numPartitions,
-      bool usePinnedHostMemory)
+      SpillHostMemoryKind spillHostMemoryKind)
       : PartitionedProbeSpillHashJoinBaseAdapter("HashJoinProbe"),
         numPartitions_(numPartitions),
-        usePinnedHostMemory_(usePinnedHostMemory) {}
+        spillHostMemoryKind_(spillHostMemoryKind) {}
 
   bool canHandle(const exec::Operator* op) const override {
     return dynamic_cast<const exec::HashProbe*>(op) != nullptr ||
@@ -135,13 +135,13 @@ class PartitionedProbeSpillHashJoinProbeAdapter
             ctx,
             joinPlanNode,
             numPartitions_,
-            usePinnedHostMemory_));
+            spillHostMemoryKind_));
     return result;
   }
 
  private:
   int32_t const numPartitions_;
-  bool const usePinnedHostMemory_;
+  SpillHostMemoryKind const spillHostMemoryKind_;
 };
 
 class PartitionedProbeSpillHashJoinBridgeTranslator
@@ -149,9 +149,9 @@ class PartitionedProbeSpillHashJoinBridgeTranslator
  public:
   PartitionedProbeSpillHashJoinBridgeTranslator(
       int32_t numPartitions,
-      bool usePinnedHostMemory)
+      SpillHostMemoryKind spillHostMemoryKind)
       : numPartitions_(numPartitions),
-        usePinnedHostMemory_(usePinnedHostMemory) {}
+        spillHostMemoryKind_(spillHostMemoryKind) {}
 
   std::unique_ptr<exec::Operator> toOperator(
       exec::DriverCtx* ctx,
@@ -162,7 +162,7 @@ class PartitionedProbeSpillHashJoinBridgeTranslator
       return nullptr;
     }
     return std::make_unique<CudfPartitionedProbeSpillHashJoinProbe>(
-        id, ctx, joinNode, numPartitions_, usePinnedHostMemory_);
+        id, ctx, joinNode, numPartitions_, spillHostMemoryKind_);
   }
 
   std::unique_ptr<exec::JoinBridge> toJoinBridge(
@@ -182,10 +182,10 @@ class PartitionedProbeSpillHashJoinBridgeTranslator
     }
     return [joinNode,
             numPartitions = numPartitions_,
-            usePinnedHostMemory = usePinnedHostMemory_](
+            spillHostMemoryKind = spillHostMemoryKind_](
                int32_t operatorId, exec::DriverCtx* ctx) {
       return std::make_unique<CudfPartitionedProbeSpillHashJoinBuild>(
-          operatorId, ctx, joinNode, numPartitions, usePinnedHostMemory);
+          operatorId, ctx, joinNode, numPartitions, spillHostMemoryKind);
     };
   }
 
@@ -199,27 +199,27 @@ class PartitionedProbeSpillHashJoinBridgeTranslator
 
  private:
   int32_t const numPartitions_;
-  bool const usePinnedHostMemory_;
+  SpillHostMemoryKind const spillHostMemoryKind_;
 };
 
 } // namespace
 
 void registerPartitionedProbeSpillHashJoinAdapter(
     int32_t numPartitions,
-    bool usePinnedHostMemory) {
+    SpillHostMemoryKind spillHostMemoryKind) {
   exec::Operator::unregisterAllOperators();
   exec::Operator::registerOperator(
       std::make_unique<PartitionedProbeSpillHashJoinBridgeTranslator>(
-          numPartitions, usePinnedHostMemory));
+          numPartitions, spillHostMemoryKind));
 
   auto& registry = OperatorAdapterRegistry::getInstance();
   registry.registerAdapter(
       std::make_unique<PartitionedProbeSpillHashJoinBuildAdapter>(
-          numPartitions, usePinnedHostMemory),
+          numPartitions, spillHostMemoryKind),
       /*overwrite=*/true);
   registry.registerAdapter(
       std::make_unique<PartitionedProbeSpillHashJoinProbeAdapter>(
-          numPartitions, usePinnedHostMemory),
+          numPartitions, spillHostMemoryKind),
       /*overwrite=*/true);
 }
 

@@ -41,6 +41,7 @@ namespace facebook::velox::cudf_velox {
 
 enum class SpillHostMemoryKind {
   kPinned,
+  kPooledPinned,
   kRegular,
 };
 
@@ -71,7 +72,8 @@ class SpillHostBuffer {
     return kind_;
   }
   [[nodiscard]] bool isPinned() const noexcept {
-    return kind_ == SpillHostMemoryKind::kPinned;
+    return kind_ == SpillHostMemoryKind::kPinned ||
+        kind_ == SpillHostMemoryKind::kPooledPinned;
   }
 
  private:
@@ -202,7 +204,7 @@ class CudfPiecewiseSpillHashJoinBuild : public CudfOperatorBase {
       exec::DriverCtx* driverCtx,
       std::shared_ptr<const core::HashJoinNode> joinNode,
       cudf::size_type pieceTargetRows,
-      bool usePinnedHostMemory);
+      SpillHostMemoryKind spillHostMemoryKind);
 
   bool needsInput() const override;
 

@@ -219,7 +219,7 @@ CudfPartitionedHashJoinBuild::CudfPartitionedHashJoinBuild(
     exec::DriverCtx* driverCtx,
     std::shared_ptr<const core::HashJoinNode> joinNode,
     int32_t numPartitions,
-    bool usePinnedHostMemory)
+    SpillHostMemoryKind spillHostMemoryKind)
     : CudfOperatorBase(
           operatorId,
           driverCtx,
@@ -232,9 +232,7 @@ CudfPartitionedHashJoinBuild::CudfPartitionedHashJoinBuild(
           joinNode),
       joinNode_(std::move(joinNode)),
       numPartitions_(numPartitions),
-      spillHostMemoryKind_(
-          usePinnedHostMemory ? SpillHostMemoryKind::kPinned
-                              : SpillHostMemoryKind::kRegular) {
+      spillHostMemoryKind_(spillHostMemoryKind) {
   VELOX_CHECK(
       isSimpleInnerEquiJoin(*joinNode_),
       "CudfPartitionedHashJoinBuild only supports inner equi-join with no "
