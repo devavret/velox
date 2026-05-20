@@ -407,15 +407,16 @@ class Task : public std::enable_shared_from_this<Task> {
       uint32_t driverId,
       const std::string& operatorType);
 
-  /// Creates one leaf MemoryPool per registered memory tier for an operator
-  /// instance and stores them in the task to ensure lifetime. The returned
-  /// map is keyed by tier tag (matching QueryCtx::customPools()). Each leaf
-  /// lives under a 'task.{taskId}/node.{planNodeId}' aggregate subtree
-  /// rooted at the corresponding QueryCtx::customPool(tag). Returns an empty
-  /// map if no custom tiers are registered. Not thread safe, e.g. must be
-  /// called from the Operator's constructor.
-  std::unordered_map<std::string, velox::memory::MemoryPool*>
-  addOperatorTierPools(
+  /// Creates a leaf MemoryPool for an operator instance under the memory
+  /// tier identified by 'tag'. The leaf lives under a
+  /// 'task.{taskId}/node.{planNodeId}' aggregate subtree rooted at
+  /// QueryCtx::customPool(tag); the node aggregate is created on first use
+  /// and reused for subsequent operators that share the plan node. Returns
+  /// nullptr if 'tag' is not registered on the QueryCtx. Not thread safe;
+  /// must be called before driver execution starts (operator construction,
+  /// initialize(), or driver-adapter rewrites).
+  velox::memory::MemoryPool* addOperatorTierPool(
+      const std::string& tag,
       const core::PlanNodeId& planNodeId,
       uint32_t splitGroupId,
       int pipelineId,
@@ -425,6 +426,12 @@ class Task : public std::enable_shared_from_this<Task> {
   /// Returns the task-level aggregate pool for the given tier tag, or
   /// nullptr if the tag was not registered when the task was initialized.
   velox::memory::MemoryPool* tierPool(const std::string& tag) const;
+
+  /// Returns the sorted list of memory tier tags registered on this task
+  /// (one per QueryCtx::customPool(tag) at task initialization). Stable
+  /// across calls; sorted so that stats rendering / JSON output has a
+  /// deterministic order. Empty if no custom tiers were registered.
+  std::vector<std::string> tierTags() const;
 
   /// Creates new instance of MemoryPool with aggregate kind for the connector
   /// use, stores it in the task to ensure lifetime and returns a raw pointer.

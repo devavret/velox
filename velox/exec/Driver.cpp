@@ -122,12 +122,12 @@ velox::memory::MemoryPool* DriverCtx::addOperatorPool(
       planNodeId, splitGroupId, pipelineId, driverId, operatorType);
 }
 
-std::unordered_map<std::string, velox::memory::MemoryPool*>
-DriverCtx::addOperatorTierPools(
+velox::memory::MemoryPool* DriverCtx::addOperatorTierPool(
+    const std::string& tag,
     const core::PlanNodeId& planNodeId,
     const std::string& operatorType) {
-  return task->addOperatorTierPools(
-      planNodeId, splitGroupId, pipelineId, driverId, operatorType);
+  return task->addOperatorTierPool(
+      tag, planNodeId, splitGroupId, pipelineId, driverId, operatorType);
 }
 
 namespace {

@@ -65,22 +65,42 @@ class OperatorCtx {
     return pool_;
   }
 
-  /// Returns the per-operator leaf pool for the given memory tier tag, or
-  /// nullptr if the tag is not registered on the task's QueryCtx. The
-  /// returned pool lives under
+  /// Returns the per-operator leaf pool previously installed for the given
+  /// memory tier tag via requireTierPool(), or nullptr if the operator
+  /// never requested that tier. The returned pool lives under
   /// 'queryCtx_->customPool(tag)/task.{taskId}/node.{planNodeId}'. Operator
   /// stats reported via Operator::stats() automatically include the peak,
-  /// used bytes and allocation count from every tier pool in this map.
+  /// used bytes and allocation count from every tier pool installed here.
   velox::memory::MemoryPool* tierPool(const std::string& tag) const {
     auto it = tierPools_.find(tag);
     return it == tierPools_.end() ? nullptr : it->second;
   }
 
   /// Returns the full per-tier leaf pool map for this operator instance.
+  /// Empty unless the operator (or a driver adapter operating on it) has
+  /// called requireTierPool().
   const std::unordered_map<std::string, velox::memory::MemoryPool*>&
   tierPools() const {
     return tierPools_;
   }
+
+  /// Installs (or returns the existing) per-operator leaf pool under the
+  /// memory tier 'tag'. The leaf is created under
+  /// 'queryCtx_->customPool(tag)/task.{taskId}/node.{planNodeId}'; the
+  /// node-level aggregate is created on first use and shared with any
+  /// other operator that requires the same tier at the same plan node.
+  /// Idempotent: a second call for the same tag is a no-op and returns
+  /// the previously installed pool.
+  ///
+  /// Must be called before the driver starts running this operator
+  /// (operator constructor, initialize(), or from a driver adapter). The
+  /// thread-safety contract matches the legacy addOperatorPool() path.
+  ///
+  /// Throws if 'tag' is not registered as a QueryCtx::customPool(tag) on
+  /// the task. Surfacing this as an error (rather than silently returning
+  /// nullptr) prevents operators from believing they have GPU/CXL memory
+  /// when none is configured.
+  velox::memory::MemoryPool* requireTierPool(const std::string& tag);
 
   const core::PlanNodeId& planNodeId() const {
     return planNodeId_;
@@ -118,12 +138,12 @@ class OperatorCtx {
   int32_t operatorId_;
   const std::string operatorType_;
   velox::memory::MemoryPool* const pool_;
-  // Per-tier leaf pools for this operator instance. Populated at
-  // construction time from the task's per-tier subtrees, one entry per
-  // QueryCtx::customPools() tag known when the task was initialized. Empty
-  // if no custom tiers are registered.
-  const std::unordered_map<std::string, velox::memory::MemoryPool*>
-      tierPools_;
+  // Per-tier leaf pools for this operator instance, populated lazily by
+  // requireTierPool(). Operators that never opt in keep this empty and
+  // their tier subtree contains no per-operator nodes. Mutated only
+  // before the driver starts running this operator (see
+  // requireTierPool() docs), so no synchronization is required.
+  std::unordered_map<std::string, velox::memory::MemoryPool*> tierPools_;
 
   // These members are created on demand.
   mutable std::unique_ptr<core::ExecCtx> execCtx_;
@@ -397,18 +417,32 @@ class Operator : public BaseRuntimeStatWriter {
     return operatorCtx_->pool();
   }
 
-  /// Returns the per-operator leaf pool for the given memory tier, or
-  /// nullptr if no QueryCtx::customPool(tag) is registered for the task.
-  /// Allocations made through this pool are tracked separately from DRAM
-  /// and surfaced in OperatorStats::tierMemoryStats by Operator::stats().
+  /// Returns the per-operator leaf pool previously installed via
+  /// requireTierPool() for the given memory tier, or nullptr if this
+  /// operator did not request that tier. Allocations made through this
+  /// pool are tracked separately from DRAM and surfaced in
+  /// OperatorStats::tierMemoryStats by Operator::stats().
   velox::memory::MemoryPool* tierPool(const std::string& tag) const {
     return operatorCtx_->tierPool(tag);
   }
 
-  /// Returns the full per-tier leaf pool map for this operator.
+  /// Returns the full per-tier leaf pool map for this operator. Empty
+  /// unless requireTierPool() has been called.
   const std::unordered_map<std::string, velox::memory::MemoryPool*>&
   tierPools() const {
     return operatorCtx_->tierPools();
+  }
+
+  /// Installs (or returns the existing) per-operator leaf pool under the
+  /// memory tier 'tag'. The operator subclass calls this from its
+  /// constructor or initialize() when it intends to allocate from a
+  /// custom memory tier (e.g. GPU). Driver adapters that swap operators
+  /// post-construction may also call this on the new operator before
+  /// the driver starts. Throws if 'tag' is not registered as a
+  /// QueryCtx::customPool(tag). See OperatorCtx::requireTierPool() for
+  /// the full contract.
+  velox::memory::MemoryPool* requireTierPool(const std::string& tag) {
+    return operatorCtx_->requireTierPool(tag);
   }
 
   /// Returns true if the operator is reclaimable. Currently, we only support

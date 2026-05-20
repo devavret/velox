@@ -264,12 +264,13 @@ struct DriverCtx {
       const core::PlanNodeId& planNodeId,
       const std::string& operatorType);
 
-  /// Creates one tier leaf pool per registered memory tier for this driver's
-  /// operator instance. The returned map is keyed by tier tag. Returns an
-  /// empty map if no custom tiers are registered on the task's QueryCtx.
-  /// Like addOperatorPool, must be called from the Operator's constructor.
-  std::unordered_map<std::string, velox::memory::MemoryPool*>
-  addOperatorTierPools(
+  /// Creates a leaf pool under the given memory tier 'tag' for this
+  /// driver's operator instance. Returns nullptr if the tag is not
+  /// registered on the task's QueryCtx. Like addOperatorPool, must be
+  /// called before the driver loop starts (operator construction,
+  /// initialize(), or driver-adapter rewrites).
+  velox::memory::MemoryPool* addOperatorTierPool(
+      const std::string& tag,
       const core::PlanNodeId& planNodeId,
       const std::string& operatorType);
 

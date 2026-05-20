@@ -37,9 +37,24 @@ OperatorCtx::OperatorCtx(
       planNodeId_(planNodeId),
       operatorId_(operatorId),
       operatorType_(operatorType),
-      pool_(driverCtx_->addOperatorPool(planNodeId, operatorType_)),
-      tierPools_(
-          driverCtx_->addOperatorTierPools(planNodeId, operatorType_)) {}
+      pool_(driverCtx_->addOperatorPool(planNodeId, operatorType_)) {}
+
+velox::memory::MemoryPool* OperatorCtx::requireTierPool(
+    const std::string& tag) {
+  auto it = tierPools_.find(tag);
+  if (it != tierPools_.end()) {
+    return it->second;
+  }
+  auto* leaf = driverCtx_->addOperatorTierPool(tag, planNodeId_, operatorType_);
+  VELOX_CHECK_NOT_NULL(
+      leaf,
+      "Memory tier '{}' is not registered on the task's QueryCtx; "
+      "configure it via QueryCtx::Builder::customPool(tag) before the "
+      "task starts.",
+      tag);
+  tierPools_.emplace(tag, leaf);
+  return leaf;
+}
 
 core::ExecCtx* OperatorCtx::execCtx() const {
   if (!execCtx_) {
