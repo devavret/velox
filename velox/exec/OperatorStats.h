@@ -174,6 +174,18 @@ struct OperatorStats {
 
   MemoryStats memoryStats;
 
+  /// Memory stats for non-default memory tiers (e.g. GPU, CXL) used by this
+  /// operator instance. The key is the tier tag matching a
+  /// CustomMemoryResource registered on the QueryCtx via
+  /// QueryCtx::customPool(tag). Each value is populated by Operator::stats()
+  /// from the corresponding tier leaf pool owned by the Task.
+  ///
+  /// Tier memory is separate from 'memoryStats' (which always tracks the
+  /// default/DRAM operator pool) so consumers that only care about DRAM keep
+  /// working unchanged. Aggregation semantics follow MemoryStats::add():
+  /// peak is maxed across operator instances, allocation counters are summed.
+  std::unordered_map<std::string, MemoryStats> tierMemoryStats;
+
   // Total bytes in memory for spilling
   uint64_t spilledInputBytes{0};
 

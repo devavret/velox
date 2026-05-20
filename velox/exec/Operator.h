@@ -65,6 +65,23 @@ class OperatorCtx {
     return pool_;
   }
 
+  /// Returns the per-operator leaf pool for the given memory tier tag, or
+  /// nullptr if the tag is not registered on the task's QueryCtx. The
+  /// returned pool lives under
+  /// 'queryCtx_->customPool(tag)/task.{taskId}/node.{planNodeId}'. Operator
+  /// stats reported via Operator::stats() automatically include the peak,
+  /// used bytes and allocation count from every tier pool in this map.
+  velox::memory::MemoryPool* tierPool(const std::string& tag) const {
+    auto it = tierPools_.find(tag);
+    return it == tierPools_.end() ? nullptr : it->second;
+  }
+
+  /// Returns the full per-tier leaf pool map for this operator instance.
+  const std::unordered_map<std::string, velox::memory::MemoryPool*>&
+  tierPools() const {
+    return tierPools_;
+  }
+
   const core::PlanNodeId& planNodeId() const {
     return planNodeId_;
   }
@@ -101,6 +118,12 @@ class OperatorCtx {
   int32_t operatorId_;
   const std::string operatorType_;
   velox::memory::MemoryPool* const pool_;
+  // Per-tier leaf pools for this operator instance. Populated at
+  // construction time from the task's per-tier subtrees, one entry per
+  // QueryCtx::customPools() tag known when the task was initialized. Empty
+  // if no custom tiers are registered.
+  const std::unordered_map<std::string, velox::memory::MemoryPool*>
+      tierPools_;
 
   // These members are created on demand.
   mutable std::unique_ptr<core::ExecCtx> execCtx_;
@@ -372,6 +395,20 @@ class Operator : public BaseRuntimeStatWriter {
 
   velox::memory::MemoryPool* pool() const {
     return operatorCtx_->pool();
+  }
+
+  /// Returns the per-operator leaf pool for the given memory tier, or
+  /// nullptr if no QueryCtx::customPool(tag) is registered for the task.
+  /// Allocations made through this pool are tracked separately from DRAM
+  /// and surfaced in OperatorStats::tierMemoryStats by Operator::stats().
+  velox::memory::MemoryPool* tierPool(const std::string& tag) const {
+    return operatorCtx_->tierPool(tag);
+  }
+
+  /// Returns the full per-tier leaf pool map for this operator.
+  const std::unordered_map<std::string, velox::memory::MemoryPool*>&
+  tierPools() const {
+    return operatorCtx_->tierPools();
   }
 
   /// Returns true if the operator is reclaimable. Currently, we only support

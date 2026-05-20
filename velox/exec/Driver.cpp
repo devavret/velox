@@ -122,6 +122,14 @@ velox::memory::MemoryPool* DriverCtx::addOperatorPool(
       planNodeId, splitGroupId, pipelineId, driverId, operatorType);
 }
 
+std::unordered_map<std::string, velox::memory::MemoryPool*>
+DriverCtx::addOperatorTierPools(
+    const core::PlanNodeId& planNodeId,
+    const std::string& operatorType) {
+  return task->addOperatorTierPools(
+      planNodeId, splitGroupId, pipelineId, driverId, operatorType);
+}
+
 namespace {
 bool isHashJoinSpillOperator(std::string_view operatorType) {
   return operatorType == OperatorType::kHashBuild ||

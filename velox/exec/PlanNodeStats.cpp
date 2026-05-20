@@ -49,6 +49,13 @@ PlanNodeStats& PlanNodeStats::operator+=(const PlanNodeStats& another) {
   peakMemoryBytes += another.peakMemoryBytes;
   numMemoryAllocations += another.numMemoryAllocations;
 
+  for (const auto& [tag, peak] : another.peakMemoryBytesByTier) {
+    peakMemoryBytesByTier[tag] += peak;
+  }
+  for (const auto& [tag, allocs] : another.numMemoryAllocationsByTier) {
+    numMemoryAllocationsByTier[tag] += allocs;
+  }
+
   physicalWrittenBytes += another.physicalWrittenBytes;
 
   for (const auto& [name, customStats] : another.customStats) {
@@ -129,6 +136,14 @@ void PlanNodeStats::addTotals(const OperatorStats& stats) {
   peakMemoryBytes += stats.memoryStats.peakTotalMemoryReservation;
   numMemoryAllocations += stats.memoryStats.numMemoryAllocations;
 
+  // Fold per-tier memory stats from this operator instance. The plan-node
+  // peak is summed across instances (mirroring 'peakMemoryBytes' above)
+  // under the assumption that operator instances ran concurrently.
+  for (const auto& [tag, ms] : stats.tierMemoryStats) {
+    peakMemoryBytesByTier[tag] += ms.peakTotalMemoryReservation;
+    numMemoryAllocationsByTier[tag] += ms.numMemoryAllocations;
+  }
+
   physicalWrittenBytes += stats.physicalWrittenBytes;
 
   for (const auto& [name, customStats] : stats.runtimeStats) {
@@ -187,6 +202,34 @@ std::string PlanNodeStats::toString(
       << ", Blocked wall time: " << succinctNanos(blockedWallNanos)
       << ", Peak memory: " << succinctBytes(peakMemoryBytes)
       << ", Memory allocations: " << numMemoryAllocations;
+
+  // Append a per-tier breakdown only when at least one tier reports usage.
+  // Skipping tiers with zero peak keeps the line short for queries that use
+  // only the default DRAM allocator. Iterate via std::map to keep the
+  // ordering deterministic across runs.
+  if (!peakMemoryBytesByTier.empty()) {
+    std::map<std::string_view, uint64_t> orderedPeak(
+        peakMemoryBytesByTier.begin(), peakMemoryBytesByTier.end());
+    bool any = false;
+    std::stringstream tier;
+    for (const auto& [tag, peak] : orderedPeak) {
+      if (peak == 0) {
+        continue;
+      }
+      if (any) {
+        tier << ", ";
+      }
+      tier << tag << "=" << succinctBytes(peak);
+      auto it = numMemoryAllocationsByTier.find(std::string(tag));
+      if (it != numMemoryAllocationsByTier.end() && it->second > 0) {
+        tier << " (allocs: " << it->second << ")";
+      }
+      any = true;
+    }
+    if (any) {
+      out << ", Peak memory by tier: " << tier.str();
+    }
+  }
 
   if (numDrivers > 0) {
     out << ", Threads: " << numDrivers;
@@ -282,6 +325,27 @@ folly::dynamic toPlanStatsJson(const facebook::velox::exec::TaskStats& stats) {
       stat["blockedWallNanos"] = operatorStat.second->blockedWallNanos;
       stat["peakMemoryBytes"] = operatorStat.second->peakMemoryBytes;
       stat["numMemoryAllocations"] = operatorStat.second->numMemoryAllocations;
+
+      // Surface tier breakdown as nested objects keyed by tier tag so JSON
+      // consumers can attribute usage to GPU, CXL, etc. Only emit fields
+      // when at least one tier is registered.
+      if (!operatorStat.second->peakMemoryBytesByTier.empty()) {
+        folly::dynamic peakByTier = folly::dynamic::object;
+        for (const auto& [tag, peak] :
+             operatorStat.second->peakMemoryBytesByTier) {
+          peakByTier[tag] = peak;
+        }
+        stat["peakMemoryBytesByTier"] = peakByTier;
+      }
+      if (!operatorStat.second->numMemoryAllocationsByTier.empty()) {
+        folly::dynamic allocsByTier = folly::dynamic::object;
+        for (const auto& [tag, allocs] :
+             operatorStat.second->numMemoryAllocationsByTier) {
+          allocsByTier[tag] = allocs;
+        }
+        stat["numMemoryAllocationsByTier"] = allocsByTier;
+      }
+
       stat["physicalWrittenBytes"] = operatorStat.second->physicalWrittenBytes;
       stat["numDrivers"] = operatorStat.second->numDrivers;
       stat["numSplits"] = operatorStat.second->numSplits;

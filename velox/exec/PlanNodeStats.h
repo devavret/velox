@@ -114,6 +114,16 @@ struct PlanNodeStats {
 
   uint64_t numMemoryAllocations{0};
 
+  /// Peak memory usage per non-default memory tier (e.g. "gpu", "cxl") for
+  /// this plan node. Keys match the tier tags registered as
+  /// QueryCtx::customPool(tag) at task initialization time. Values are
+  /// summed across operator instances using the same semantics as
+  /// 'peakMemoryBytes' (assumed concurrent execution).
+  std::unordered_map<std::string, uint64_t> peakMemoryBytesByTier;
+
+  /// Number of allocations per non-default memory tier for this plan node.
+  std::unordered_map<std::string, uint64_t> numMemoryAllocationsByTier;
+
   uint64_t physicalWrittenBytes{0};
 
   /// Operator-specific counters.

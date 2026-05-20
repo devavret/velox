@@ -711,6 +711,22 @@ void Task::initTaskPool() {
   VELOX_CHECK_NULL(pool_);
   pool_ = queryCtx_->pool()->addAggregateChild(
       fmt::format("task.{}", taskId_.c_str()), createTaskReclaimer());
+
+  // Build a task-level aggregate under each QueryCtx::customPool(tag).
+  // Tier roots may not have a reclaimer installed; skip reclaimer wiring
+  // here since tier reclaim policies are layered on top in a follow-up
+  // step. Tiers registered on the QueryCtx after this point are not
+  // tracked by this task.
+  for (const auto& [tag, root] : queryCtx_->customPools()) {
+    childPools_.push_back(
+        root->addAggregateChild(fmt::format("task.{}", taskId_.c_str())));
+    tierTaskPools_[tag] = childPools_.back().get();
+  }
+}
+
+velox::memory::MemoryPool* Task::tierPool(const std::string& tag) const {
+  auto it = tierTaskPools_.find(tag);
+  return it == tierTaskPools_.end() ? nullptr : it->second;
 }
 
 velox::memory::MemoryPool* Task::getOrAddNodePool(
@@ -794,6 +810,41 @@ velox::memory::MemoryPool* Task::addOperatorPool(
       fmt::format(
           "op.{}.{}.{}.{}", planNodeId, pipelineId, driverId, operatorType)));
   return childPools_.back().get();
+}
+
+std::unordered_map<std::string, velox::memory::MemoryPool*>
+Task::addOperatorTierPools(
+    const core::PlanNodeId& planNodeId,
+    uint32_t /*splitGroupId*/,
+    int pipelineId,
+    uint32_t driverId,
+    const std::string& operatorType) {
+  std::unordered_map<std::string, velox::memory::MemoryPool*> result;
+  if (tierTaskPools_.empty()) {
+    return result;
+  }
+  result.reserve(tierTaskPools_.size());
+  // Iteration order over tierTaskPools_ is non-deterministic, which only
+  // affects the order in which entries are appended to childPools_; the
+  // returned map and downstream stats rendering sort by tag at print time.
+  for (const auto& [tag, tierTaskPool] : tierTaskPools_) {
+    auto& nodePoolMap = tierNodePools_[tag];
+    auto it = nodePoolMap.find(planNodeId);
+    velox::memory::MemoryPool* tierNodePool = nullptr;
+    if (it != nodePoolMap.end()) {
+      tierNodePool = it->second;
+    } else {
+      childPools_.push_back(
+          tierTaskPool->addAggregateChild(fmt::format("node.{}", planNodeId)));
+      tierNodePool = childPools_.back().get();
+      nodePoolMap.emplace(planNodeId, tierNodePool);
+    }
+    childPools_.push_back(tierNodePool->addLeafChild(
+        fmt::format(
+            "op.{}.{}.{}.{}", planNodeId, pipelineId, driverId, operatorType)));
+    result.emplace(tag, childPools_.back().get());
+  }
+  return result;
 }
 
 velox::memory::MemoryPool* Task::addConnectorPoolLocked(

@@ -407,6 +407,25 @@ class Task : public std::enable_shared_from_this<Task> {
       uint32_t driverId,
       const std::string& operatorType);
 
+  /// Creates one leaf MemoryPool per registered memory tier for an operator
+  /// instance and stores them in the task to ensure lifetime. The returned
+  /// map is keyed by tier tag (matching QueryCtx::customPools()). Each leaf
+  /// lives under a 'task.{taskId}/node.{planNodeId}' aggregate subtree
+  /// rooted at the corresponding QueryCtx::customPool(tag). Returns an empty
+  /// map if no custom tiers are registered. Not thread safe, e.g. must be
+  /// called from the Operator's constructor.
+  std::unordered_map<std::string, velox::memory::MemoryPool*>
+  addOperatorTierPools(
+      const core::PlanNodeId& planNodeId,
+      uint32_t splitGroupId,
+      int pipelineId,
+      uint32_t driverId,
+      const std::string& operatorType);
+
+  /// Returns the task-level aggregate pool for the given tier tag, or
+  /// nullptr if the tag was not registered when the task was initialized.
+  velox::memory::MemoryPool* tierPool(const std::string& tag) const;
+
   /// Creates new instance of MemoryPool with aggregate kind for the connector
   /// use, stores it in the task to ensure lifetime and returns a raw pointer.
   /// Not thread safe, e.g. must be called from the Operator's constructor.
@@ -1213,6 +1232,19 @@ class Task : public std::enable_shared_from_this<Task> {
   //
   // NOTE: 'childPools_' holds the ownerships of node memory pools.
   std::unordered_map<std::string, memory::MemoryPool*> nodePools_;
+
+  // Task-level aggregate pool per tier, created under
+  // queryCtx_->customPool(tag). Ownership is in childPools_. The keyset of
+  // this map is the canonical snapshot of tier tags registered on
+  // queryCtx_ at initTaskPool() time and is exposed via tierTags().
+  std::unordered_map<std::string, memory::MemoryPool*> tierTaskPools_;
+
+  // For each tier tag, the node-level aggregate pool per plan node id.
+  // Ownership of the pool objects is in childPools_.
+  std::unordered_map<
+      std::string,
+      std::unordered_map<std::string, memory::MemoryPool*>>
+      tierNodePools_;
 
   // Set to true by OutputBufferManager when all output is
   // acknowledged. If this happens before Drivers are at end, the last

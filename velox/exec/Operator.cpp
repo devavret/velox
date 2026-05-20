@@ -37,7 +37,9 @@ OperatorCtx::OperatorCtx(
       planNodeId_(planNodeId),
       operatorId_(operatorId),
       operatorType_(operatorType),
-      pool_(driverCtx_->addOperatorPool(planNodeId, operatorType_)) {}
+      pool_(driverCtx_->addOperatorPool(planNodeId, operatorType_)),
+      tierPools_(
+          driverCtx_->addOperatorTierPools(planNodeId, operatorType_)) {}
 
 core::ExecCtx* OperatorCtx::execCtx() const {
   if (!execCtx_) {
@@ -297,6 +299,13 @@ OperatorStats Operator::stats(bool clear) {
   }
 
   stats.memoryStats = MemoryStats::memStatsFromPool(pool());
+  // Read each tier leaf pool the operator owns and stash its memory stats
+  // under the corresponding tag. Tier pool peak/used bytes are tracked the
+  // same way as DRAM (peakBytes_ on the leaf is updated on every reserve()),
+  // so this is a cheap snapshot at stats-collection time.
+  for (const auto& [tag, tierLeaf] : operatorCtx_->tierPools()) {
+    stats.tierMemoryStats[tag] = MemoryStats::memStatsFromPool(tierLeaf);
+  }
   return stats;
 }
 
@@ -560,6 +569,14 @@ void OperatorStats::add(const OperatorStats& other) {
 
   memoryStats.add(other.memoryStats);
 
+  // Tier memory is merged using the same semantics as the DRAM
+  // 'memoryStats' field: peak is maxed across operator instances, allocation
+  // counters are summed. This matches how multiple drivers of the same
+  // operator slot get folded together into a per-pipeline OperatorStats.
+  for (const auto& [tag, ms] : other.tierMemoryStats) {
+    tierMemoryStats[tag].add(ms);
+  }
+
   for (const auto& [name, stats] : other.runtimeStats) {
     if (UNLIKELY(runtimeStats.count(name) == 0)) {
       runtimeStats.insert(std::make_pair(name, stats));
@@ -610,6 +627,7 @@ void OperatorStats::clear() {
   backgroundTiming.clear();
 
   memoryStats.clear();
+  tierMemoryStats.clear();
 
   runtimeStats.clear();
   expressionStats.clear();
