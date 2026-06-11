@@ -108,6 +108,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_vector_test
+  SOURCES Main.cpp CudfVectorTest.cpp
+  LIBS velox_cudf_vector velox_vector_test_lib cudf::cudf
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_decimal_expression_test
   SOURCES Main.cpp DecimalExpressionTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
@@ -124,6 +130,24 @@ velox_add_cudf_test(
   NAME velox_cudf_expression_selection_test
   SOURCES Main.cpp ExpressionEvaluatorSelectionTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_spark
+)
+
+velox_add_cudf_test(
+  NAME velox_cudf_adapter_operator_test
+  SOURCES Main.cpp AdapterOperatorTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
+)
+
+velox_add_cudf_test(
+  NAME velox_cudf_exchange_adapter_selection_test
+  SOURCES Main.cpp ExchangeAdapterSelectionTest.cpp
+  LIBS
+    ${CUDF_TEST_DEFAULT_LIBS}
+    velox_ucx_exchange
+    velox_vector_fuzzer
+    velox_exec_test_lib
+    velox_test_util
+  TIMEOUT 3000
 )
 
 velox_add_cudf_test(
