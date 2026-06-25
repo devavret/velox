@@ -24,6 +24,7 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/type/Timestamp.h"
 
 #include <cmath>
 
@@ -46,12 +47,21 @@ class AggregationTest : public OperatorTestBase {
   void SetUp() override {
     OperatorTestBase::SetUp();
     filesystems::registerLocalFileSystem();
+    savedBatchSizeMaxThreshold_ =
+        cudf_velox::CudfConfig::getInstance().batchSizeMaxThreshold;
+    savedStreamingGroupbyApiEnabled_ =
+        cudf_velox::CudfConfig::getInstance().streamingGroupbyApiEnabled;
+    cudf_velox::CudfConfig::getInstance().streamingGroupbyApiEnabled = false;
     cudf_velox::CudfConfig::getInstance().allowCpuFallback = false;
     cudf_velox::registerCudf();
     cudf_velox::registerPrestoAggregateFunctions("");
   }
 
   void TearDown() override {
+    cudf_velox::CudfConfig::getInstance().batchSizeMaxThreshold =
+        savedBatchSizeMaxThreshold_;
+    cudf_velox::CudfConfig::getInstance().streamingGroupbyApiEnabled =
+        savedStreamingGroupbyApiEnabled_;
     cudf_velox::unregisterCudf();
     cudf_velox::unregisterAggregateFunctions();
     OperatorTestBase::TearDown();
@@ -212,6 +222,10 @@ class AggregationTest : public OperatorTestBase {
     assertQuery(builder.planNode(), "SELECT count(*) FROM tmp WHERE c0 > 0");
   }
 
+  void setBatchSizeMaxThreshold(std::optional<int32_t> maxRows) {
+    cudf_velox::CudfConfig::getInstance().batchSizeMaxThreshold = maxRows;
+  }
+
   RowTypePtr rowType_{
       ROW({"c0", "c1", "c2", "c3", "c4", "c5", "c6"},
           {BIGINT(),
@@ -221,7 +235,40 @@ class AggregationTest : public OperatorTestBase {
            DOUBLE(), // DM: This used to be REAL() but we don't support that
            DOUBLE(),
            VARCHAR()})};
+  std::optional<int32_t> savedBatchSizeMaxThreshold_;
+  bool savedStreamingGroupbyApiEnabled_{false};
 };
+
+class StreamingGroupbyApiAggregationTest : public AggregationTest {
+ protected:
+  void SetUp() override {
+    AggregationTest::SetUp();
+    cudf_velox::CudfConfig::getInstance().streamingGroupbyApiEnabled = true;
+  }
+};
+
+bool wasStreamingGroupbyApiUsed(
+    const std::shared_ptr<exec::Task>& task,
+    const core::PlanNodeId& planNodeId) {
+  auto const planStats = toPlanStats(task->taskStats());
+  auto it = planStats.find(planNodeId);
+  if (it == planStats.end()) {
+    return false;
+  }
+  return it->second.customStats.count("streamingGroupbyApiUsed") > 0;
+}
+
+int64_t streamingGroupbyApiRebuilds(
+    const std::shared_ptr<exec::Task>& task,
+    const core::PlanNodeId& planNodeId) {
+  auto const planStats = toPlanStats(task->taskStats());
+  auto it = planStats.find(planNodeId);
+  if (it == planStats.end()) {
+    return 0;
+  }
+  auto stat = it->second.customStats.find("streamingGroupbyApiRebuilds");
+  return stat == it->second.customStats.end() ? 0 : stat->second.sum;
+}
 
 TEST_F(AggregationTest, global) {
   auto vectors = makeVectors(rowType_, 10, 100);
@@ -259,6 +306,93 @@ TEST_F(AggregationTest, global) {
       "SELECT sum(c1), sum(c2), sum(c4), sum(c5), "
       "min(c1), min(c2), min(c3), min(c4), min(c5), "
       "max(c1), max(c2), max(c3), max(c4), max(c5) FROM tmp");
+}
+
+TEST_F(AggregationTest, minMaxTimestampGlobal) {
+  std::vector<std::optional<Timestamp>> timestamps = {
+      Timestamp(1609459200, 0), // 2021-01-01 00:00:00
+      Timestamp(1609459200, 500000000), // 2021-01-01 00:00:00.500
+      Timestamp(1609545600, 0), // 2021-01-02 00:00:00
+      std::nullopt,
+      Timestamp(1609459199, 900000000) // 2020-12-31 23:59:59.900
+  };
+
+  auto data = makeRowVector(
+      {makeNullableFlatVector<Timestamp>(timestamps, TIMESTAMP())});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({}, {"min(c0)", "max(c0)"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT min(c0), max(c0) FROM tmp");
+}
+
+TEST_F(AggregationTest, minMaxTimestampGroupBy) {
+  std::vector<std::optional<Timestamp>> timestamps = {
+      Timestamp(1609459200, 0), // 2021-01-01 00:00:00
+      std::nullopt,
+      Timestamp(1609545600, 0), // 2021-01-02 00:00:00
+      Timestamp(1609459199, 0), // 2020-12-31 23:59:59
+      Timestamp(1609632000, 0) // 2021-01-03 00:00:00
+  };
+
+  auto data = makeRowVector(
+      {makeFlatVector<int32_t>({1, 1, 2, 2, 2}),
+       makeNullableFlatVector<Timestamp>(timestamps, TIMESTAMP())});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({"c0"}, {"min(c1)", "max(c1)"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0, min(c1), max(c1) FROM tmp GROUP BY c0");
+}
+
+TEST_F(AggregationTest, minMaxDateGlobal) {
+  // cuDF represents DATE as TIMESTAMP_DAYS, a distinct type from TIMESTAMP, so
+  // exercise min/max on it directly.
+  std::vector<std::optional<int32_t>> dates = {
+      DATE()->toDays("2021-01-01"),
+      DATE()->toDays("2021-01-02"),
+      std::nullopt,
+      DATE()->toDays("2020-12-31"),
+      DATE()->toDays("2021-01-03"),
+  };
+
+  auto data = makeRowVector({makeNullableFlatVector<int32_t>(dates, DATE())});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({}, {"min(c0)", "max(c0)"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT min(c0), max(c0) FROM tmp");
+}
+
+TEST_F(AggregationTest, minMaxDateGroupBy) {
+  std::vector<std::optional<int32_t>> dates = {
+      DATE()->toDays("2021-01-01"),
+      std::nullopt,
+      DATE()->toDays("2021-01-02"),
+      DATE()->toDays("2020-12-31"),
+      DATE()->toDays("2021-01-03"),
+  };
+
+  auto data = makeRowVector(
+      {makeFlatVector<int32_t>({1, 1, 2, 2, 2}),
+       makeNullableFlatVector<int32_t>(dates, DATE())});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({"c0"}, {"min(c1)", "max(c1)"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0, min(c1), max(c1) FROM tmp GROUP BY c0");
 }
 
 TEST_F(AggregationTest, singleBigintKey) {
@@ -984,6 +1118,94 @@ TEST_F(AggregationTest, finalAggregationStreamingMultiKey) {
   EXPECT_GT(planStats.at(finalAggId).outputRows, 0);
 }
 
+TEST_F(AggregationTest, finalAggregationPartitionedBufferedState) {
+  setBatchSizeMaxThreshold(4);
+  auto vectors = {
+      makeRowVector({makeFlatVector<int64_t>({0, 1}), makeFlatVector<int64_t>({1, 1})}),
+      makeRowVector({makeFlatVector<int64_t>({2, 3}), makeFlatVector<int64_t>({1, 1})}),
+      makeRowVector({makeFlatVector<int64_t>({4, 5}), makeFlatVector<int64_t>({1, 1})}),
+  };
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"count(1)"})
+                  .finalAggregation()
+                  .planNode();
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+      .plan(plan)
+      .assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
+}
+
+TEST_F(AggregationTest, singleAggregationPartitionedBufferedState) {
+  setBatchSizeMaxThreshold(4);
+  auto vectors = {
+      makeRowVector({makeFlatVector<int64_t>({0, 1}), makeFlatVector<int64_t>({1, 1})}),
+      makeRowVector({makeFlatVector<int64_t>({2, 3}), makeFlatVector<int64_t>({1, 1})}),
+      makeRowVector({makeFlatVector<int64_t>({4, 5}), makeFlatVector<int64_t>({1, 1})}),
+  };
+  createDuckDbTable(vectors);
+
+  auto plan =
+      PlanBuilder().values(vectors).singleAggregation({"c0"}, {"count(1)"}).planNode();
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .plan(plan)
+      .assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
+}
+
+TEST_F(AggregationTest, finalAggregationRecursivePartitioning) {
+  setBatchSizeMaxThreshold(3);
+  std::vector<RowVectorPtr> vectors;
+  for (int64_t key = 0; key < 6; ++key) {
+    vectors.push_back(makeRowVector(
+        {makeFlatVector<int64_t>({key}), makeFlatVector<int64_t>({1})}));
+  }
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"count(1)"})
+                  .finalAggregation()
+                  .planNode();
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+      .plan(plan)
+      .assertResults("SELECT c0, count(1) FROM tmp GROUP BY 1");
+}
+
+TEST_F(AggregationTest, companionAggregatesStayOnNonStreamingPathWithRowCap) {
+  setBatchSizeMaxThreshold(1);
+
+  std::vector<int64_t> keys0{1, 1, 1, 2, 1, 1, 2, 2};
+  std::vector<int64_t> keys1{1, 2, 1, 2, 1, 2, 1, 2};
+  std::vector<int64_t> values{1, 2, 3, 4, 5, 6, 7, 8};
+  auto rowVector = makeRowVector(
+      {makeFlatVector<int64_t>(keys0),
+       makeFlatVector<int64_t>(keys1),
+       makeFlatVector<int64_t>(values)});
+
+  createDuckDbTable({rowVector});
+
+  auto plan =
+      PlanBuilder()
+          .values({rowVector})
+          .singleAggregation({"c2", "c0"}, {"count_partial(c1)"})
+          .localPartition({"c2", "c0"})
+          .singleAggregation({"c0"}, {"count_merge(a0)", "count_partial(c2)"})
+          .localPartition({"c0"})
+          .singleAggregation({"c0"}, {"count_merge(a0)", "count_merge(a1)"})
+          .planNode();
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .plan(plan)
+      .assertResults(
+          "SELECT c0, count(c1), count(distinct c2) FROM tmp GROUP BY c0");
+}
+
 class EmptyInputAggregationTest : public AggregationTest {
  protected:
   void SetUp() override {
@@ -1289,6 +1511,128 @@ TEST_F(AggregationTest, singleAggregationStreamingIgnoreNullKeysAcrossBatches) {
   assertQuery(
       op,
       "SELECT c0, sum(c1), count(*) FROM tmp WHERE c0 IS NOT NULL GROUP BY c0");
+}
+
+TEST_F(
+    StreamingGroupbyApiAggregationTest,
+    partialFinalStreamingGroupbyApiMixedAggs) {
+  auto vectors = makeVectors(rowType_, 10, 100);
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId partialAggId;
+  core::PlanNodeId finalAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation(
+                      {"c0"},
+                      {"sum(c2)", "count(c1)", "min(c3)", "max(c5)", "avg(c4)"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .capturePlanNodeId(finalAggId)
+                  .planNode())
+          .assertResults(
+              "SELECT c0, sum(c2), count(c1), min(c3), max(c5), avg(c4) FROM tmp GROUP BY c0");
+
+  ASSERT_FALSE(wasStreamingGroupbyApiUsed(task, partialAggId));
+  ASSERT_TRUE(wasStreamingGroupbyApiUsed(task, finalAggId));
+}
+
+TEST_F(StreamingGroupbyApiAggregationTest, partialFinalStreamingGroupbyApiMultiKey) {
+  auto vectors = makeVectors(rowType_, 10, 100);
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId partialAggId;
+  core::PlanNodeId finalAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0", "c6"}, {"sum(c4)", "avg(c5)", "count(c1)"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .capturePlanNodeId(finalAggId)
+                  .planNode())
+          .assertResults(
+              "SELECT c0, c6, sum(c4), avg(c5), count(c1) FROM tmp GROUP BY c0, c6");
+
+  ASSERT_FALSE(wasStreamingGroupbyApiUsed(task, partialAggId));
+  ASSERT_TRUE(wasStreamingGroupbyApiUsed(task, finalAggId));
+}
+
+TEST_F(
+    StreamingGroupbyApiAggregationTest,
+    partialStreamingGroupbyApiHandlesUnevenInputBatches) {
+  setBatchSizeMaxThreshold(128);
+  auto batch1 = makeRowVector({
+      makeFlatVector<int64_t>({0, 1, 2, 3}),
+      makeFlatVector<int16_t>({1, 1, 1, 1}),
+      makeFlatVector<int32_t>({1, 1, 1, 1}),
+      makeFlatVector<int64_t>({10, 11, 12, 13}),
+      makeFlatVector<double>({1.0, 2.0, 3.0, 4.0}),
+      makeFlatVector<double>({5.0, 6.0, 7.0, 8.0}),
+      makeFlatVector<std::string>({"a", "b", "c", "d"}),
+  });
+  auto batch2 = makeRowVector({
+      makeFlatVector<int64_t>(
+          20, [](auto row) { return row; }),
+      makeFlatVector<int16_t>(20, [](auto /*row*/) { return 1; }),
+      makeFlatVector<int32_t>(20, [](auto /*row*/) { return 1; }),
+      makeFlatVector<int64_t>(20, [](auto row) { return row + 100; }),
+      makeFlatVector<double>(20, [](auto row) { return row + 0.5; }),
+      makeFlatVector<double>(20, [](auto row) { return row + 10.5; }),
+      makeFlatVector<std::string>(
+          20, [](auto row) { return std::to_string(row); }),
+  });
+  std::vector<RowVectorPtr> vectors{batch1, batch2};
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId partialAggId;
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(
+              PlanBuilder()
+                  .values(vectors)
+                  .partialAggregation({"c0"}, {"sum(c1)", "avg(c4)"})
+                  .capturePlanNodeId(partialAggId)
+                  .finalAggregation()
+                  .planNode())
+          .assertResults("SELECT c0, sum(c1), avg(c4) FROM tmp GROUP BY c0");
+
+  ASSERT_FALSE(wasStreamingGroupbyApiUsed(task, partialAggId));
+}
+
+TEST_F(
+    StreamingGroupbyApiAggregationTest,
+    streamingGroupbyApiFailsWhenBatchExceedsCeiling) {
+  setBatchSizeMaxThreshold(4);
+  auto vectors = {makeRowVector({
+      makeFlatVector<int64_t>({0, 1, 2, 3, 4}),
+      makeFlatVector<int16_t>({1, 1, 1, 1, 1}),
+      makeFlatVector<int32_t>({1, 1, 1, 1, 1}),
+      makeFlatVector<int64_t>({10, 11, 12, 13, 14}),
+      makeFlatVector<double>({1.0, 2.0, 3.0, 4.0, 5.0}),
+      makeFlatVector<double>({5.0, 6.0, 7.0, 8.0, 9.0}),
+      makeFlatVector<std::string>({"a", "b", "c", "d", "e"}),
+  })};
+  createDuckDbTable(vectors);
+
+  try {
+    AssertQueryBuilder(duckDbQueryRunner_)
+        .plan(
+            PlanBuilder()
+                .values(vectors)
+                .partialAggregation({"c0"}, {"sum(c1)", "avg(c4)"})
+                .finalAggregation()
+                .planNode())
+        .assertResults("SELECT c0, sum(c1), avg(c4) FROM tmp GROUP BY c0");
+    FAIL() << "Expected streaming_groupby to fail when a batch exceeds the ceiling";
+  } catch (const std::exception& e) {
+    ASSERT_NE(std::string{e.what()}.find("exceeds max_groups"), std::string::npos);
+  }
 }
 
 TEST_F(AggregationTest, globalApproxDistinct) {

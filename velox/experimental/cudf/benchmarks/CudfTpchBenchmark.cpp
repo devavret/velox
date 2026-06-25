@@ -15,19 +15,34 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/benchmarks/CudfBenchmarkHelpers.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchBenchmark.h"
+#include "velox/experimental/cudf/benchmarks/PreloadedScanOperator.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/base/SuccinctPrinter.h"
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/dwio/common/ColumnSelector.h"
+#include "velox/exec/OperatorType.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
+#include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/tpch/gen/TpchGen.h"
 
 #include <experimental/cudf/connectors/hive/CudfHiveConnector.h>
 
+#include <limits>
+
+DECLARE_string(data_path);
+DECLARE_string(data_format);
 DECLARE_int64(max_coalesced_bytes);
 DECLARE_string(max_coalesced_distance_bytes);
 DECLARE_int32(parquet_prefetch_rowgroups);
@@ -37,6 +52,67 @@ using namespace facebook::velox::common::testutil;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::dwio::common;
+
+namespace {
+
+constexpr const char* kLineitem = "lineitem";
+
+exec::test::TpchPlan makeHighCardinalityGroupByPlan(memory::MemoryPool* pool) {
+  auto format = toFileFormat(FLAGS_data_format);
+  auto lineitemStdCols =
+      tpch::getTableSchema(tpch::Table::TBL_LINEITEM)->names();
+  auto lineitemInfo = cudf_velox::readTableInfo(
+      kLineitem, FLAGS_data_path, lineitemStdCols, format, pool);
+  VELOX_CHECK(
+      !lineitemInfo.dataFiles.empty(),
+      "No lineitem data files found under {}",
+      FLAGS_data_path);
+
+  const auto lineitemRowType = ColumnSelector(
+                                   lineitemInfo.type,
+                                   std::vector<std::string>{
+                                       "l_orderkey",
+                                       "l_linenumber",
+                                       "l_quantity",
+                                       "l_extendedprice",
+                                       "l_discount"})
+                                   .buildSelectedReordered();
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemScanId;
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool)
+          .tableScan(
+              kLineitem, lineitemRowType, lineitemInfo.fileColumnNames, {})
+          .captureScanNodeId(lineitemScanId)
+          .partialAggregation(
+              {"l_orderkey", "l_linenumber"},
+              {"sum(l_extendedprice) AS sum_extendedprice",
+               "count(1) AS row_count",
+               "min(l_quantity) AS min_quantity",
+               "max(l_discount) AS max_discount"})
+          .localPartition({"l_orderkey", "l_linenumber"})
+          .finalAggregation()
+          .planNode();
+
+  exec::test::TpchPlan tpchPlan;
+  tpchPlan.plan = std::move(plan);
+  tpchPlan.dataFiles[lineitemScanId] = lineitemInfo.dataFiles;
+  tpchPlan.dataFileFormat = format;
+  return tpchPlan;
+}
+
+} // namespace
+
+DEFINE_bool(
+    cudf_use_buffered_input,
+    false,
+    "Use buffered input for CudfHive connector (kUseBufferedInput).");
+
+DEFINE_bool(
+    cudf_use_experimental_groupby_api,
+    false,
+    "Use experimental groupby API for CudfGroupby.");
 
 DEFINE_uint64(
     cudf_chunk_read_limit,
@@ -53,7 +129,15 @@ DEFINE_int32(
     100000,
     "Preferred output batch size in rows for cudf operators.");
 
+DEFINE_int32(
+    cudf_batch_size_max_threshold,
+    0,
+    "Maximum rows allowed in a concatenated cuDF batch. If 0, use cuDF's "
+    "size_type limit.");
+
 DEFINE_bool(velox_cudf_table_scan, true, "Enable cuDF table scan");
+
+DEFINE_bool(cudf_debug_enabled, false, "Enable debug printing");
 
 DEFINE_string(
     cudf_properties,
@@ -61,10 +145,22 @@ DEFINE_string(
     "Path to a properties file for CudfConfig. Each line should be key=value "
     "(e.g. cudf.memory_resource=async). See CudfConfig for available keys.");
 
+DEFINE_string(
+    preload,
+    "off",
+    "Pre-load all TPC-H tables and serve from memory instead of disk. "
+    "Values: off (default), gpu (read directly to GPU via cuDF), "
+    "cpu (read to CPU RowVectors, converted to GPU on demand).");
+
+DEFINE_int32(
+    preload_batch_size,
+    512 * 1024 * 1024,
+    "Batch size in bytes when reading parquet during preload.");
+
 void CudfTpchBenchmark::initialize() {
+  auto& config = cudf_velox::CudfConfig::getInstance();
   if (!FLAGS_cudf_properties.empty()) {
-    cudf_velox::CudfConfig::getInstance().initialize(
-        cudf_velox::loadPropertiesFile(FLAGS_cudf_properties));
+    config.initialize(cudf_velox::loadPropertiesFile(FLAGS_cudf_properties));
   }
 
   TpchBenchmark::initialize();
@@ -75,6 +171,9 @@ void CudfTpchBenchmark::initialize() {
 
     auto cudfHiveConfigurationValues =
         std::unordered_map<std::string, std::string>();
+    cudfHiveConfigurationValues
+        [cudf_velox::connector::hive::CudfHiveConfig::kUseBufferedInput] =
+            std::to_string(FLAGS_cudf_use_buffered_input);
     cudfHiveConfigurationValues
         [cudf_velox::connector::hive::CudfHiveConfig::kMaxChunkReadLimit] =
             std::to_string(FLAGS_cudf_chunk_read_limit);
@@ -96,8 +195,24 @@ void CudfTpchBenchmark::initialize() {
         cudfHiveConnector->connectorId(), cudfHiveConnector);
   }
 
+  auto& cudfConfig = cudf_velox::CudfConfig::getInstance();
+  cudfConfig.streamingGroupbyApiEnabled =
+      FLAGS_cudf_use_experimental_groupby_api;
+  if (FLAGS_cudf_batch_size_max_threshold > 0) {
+    cudfConfig.batchSizeMaxThreshold = FLAGS_cudf_batch_size_max_threshold;
+  } else {
+    cudfConfig.batchSizeMaxThreshold.reset();
+  }
+
+  cudfConfig.debugEnabled = FLAGS_cudf_debug_enabled;
+  // Enable cuDF operators
   cudf_velox::registerCudf();
 
+  if (FLAGS_preload != "off") {
+    ensurePreloaded();
+  }
+
+  // Add custom configs
   queryConfigs_[facebook::velox::cudf_velox::CudfFromVelox::kGpuBatchSizeRows] =
       std::to_string(FLAGS_cudf_gpu_batch_size_rows);
 }
@@ -142,16 +257,83 @@ CudfTpchBenchmark::listSplits(
   return TpchBenchmark::listSplits(path, numSplitsPerFile, plan);
 }
 
+void CudfTpchBenchmark::runHighCardinalityGroupBy() {
+  auto pool = memory::memoryManager()->addLeafPool();
+  auto plan = makeHighCardinalityGroupByPlan(pool.get());
+  run(plan, queryConfigs_);
+}
+
+void CudfTpchBenchmark::ensurePreloaded() {
+  if (preloaded_ || FLAGS_preload == "off") {
+    return;
+  }
+  preloadPool_ = memory::memoryManager()->addLeafPool();
+  auto* pool = preloadPool_.get();
+  auto format = toFileFormat(FLAGS_data_format);
+
+  static const std::vector<std::pair<std::string, tpch::Table>> kTables = {
+      {"lineitem", tpch::Table::TBL_LINEITEM},
+      {"orders", tpch::Table::TBL_ORDERS},
+      {"customer", tpch::Table::TBL_CUSTOMER},
+      {"part", tpch::Table::TBL_PART},
+      {"partsupp", tpch::Table::TBL_PARTSUPP},
+      {"supplier", tpch::Table::TBL_SUPPLIER},
+      {"nation", tpch::Table::TBL_NATION},
+      {"region", tpch::Table::TBL_REGION},
+  };
+
+  auto& store = cudf_velox::PreloadedTableStore::getInstance();
+  for (const auto& [tableName, table] : kTables) {
+    auto schema = tpch::getTableSchema(table);
+    auto stdCols = schema->names();
+    auto info = cudf_velox::readTableInfo(
+        tableName, FLAGS_data_path, stdCols, format, pool);
+    if (info.dataFiles.empty()) {
+      continue;
+    }
+    auto gpuVectors = cudf_velox::readParquetIntoCudfVectors(
+        info.dataFiles,
+        info.type,
+        info.fileColumnNames,
+        pool,
+        FLAGS_preload_batch_size);
+
+    if (FLAGS_preload == "cpu") {
+      auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+      auto mr = cudf_velox::get_output_mr();
+      std::vector<RowVectorPtr> cpuVectors;
+      cpuVectors.reserve(gpuVectors.size());
+      for (auto& v : gpuVectors) {
+        auto cudfVec = std::dynamic_pointer_cast<cudf_velox::CudfVector>(v);
+        auto cpuRow = cudf_velox::with_arrow::toVeloxColumn(
+            cudfVec->getTableView(), pool, info.type, stream, mr);
+        cpuVectors.push_back(std::move(cpuRow));
+      }
+      stream.synchronize();
+      store.store(tableName, std::move(cpuVectors));
+    } else {
+      store.store(tableName, std::move(gpuVectors));
+    }
+  }
+  cudf_velox::registerPreloadedTableScanAdapter();
+  preloaded_ = true;
+}
+
 void CudfTpchBenchmark::shutdown() {
+  cudf_velox::PreloadedTableStore::getInstance().clear();
+  preloadPool_.reset();
   cudf_velox::unregisterCudf();
   TpchBenchmark::shutdown();
 }
 
-int main(int argc, char** argv) {
-  std::string kUsage(
-      "This program benchmarks TPC-H queries. Run 'velox_cudf_tpch_benchmark -helpon=TpchBenchmark' for available options.\n");
-  gflags::SetUsageMessage(kUsage);
-  folly::Init init{&argc, &argv, false};
-  benchmark = std::make_unique<CudfTpchBenchmark>();
-  tpchBenchmarkMain();
+BENCHMARK(highCardinalityGroupBy) {
+  auto* cudfBenchmark = dynamic_cast<CudfTpchBenchmark*>(benchmark.get());
+  VELOX_CHECK_NOT_NULL(cudfBenchmark);
+  cudfBenchmark->runHighCardinalityGroupBy();
+}
+
+// TODO (dm): Cleanup. Either remove bogus query 23 or high cardinality group by
+// or maybe even both
+BENCHMARK(q23) {
+  benchmark->runQuery(23);
 }

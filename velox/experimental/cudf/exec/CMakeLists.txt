@@ -25,6 +25,7 @@ add_library(
   CudfGroupId.cpp
   CudfGroupby.cpp
   CudfHashJoin.cpp
+  CudfReduce.cpp
   CudfLimit.cpp
   CudfLocalPartition.cpp
   CudfMarkDistinct.cpp
@@ -35,12 +36,15 @@ add_library(
   DebugUtil.cpp
   GpuResources.cpp
   OperatorAdapters.cpp
+  PartitionedBufferedState.cpp
   PrestoAggregateFunctions.cpp
   SparkAggregateFunctions.cpp
   ToCudf.cpp
   Utilities.cpp
   VeloxCudfInterop.cpp
 )
+
+target_compile_options(velox_cudf_exec PRIVATE -g -O0)
 
 target_link_libraries(
   velox_cudf_exec

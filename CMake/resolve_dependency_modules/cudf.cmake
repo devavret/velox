@@ -30,12 +30,12 @@ set(
 )
 velox_resolve_dependency_url(rapids_cmake)
 
-# rmm commit 8718418 from 2026-06-03
+# rmm commit f3310cb from 2026-06-04
 set(VELOX_rmm_VERSION 26.06)
-set(VELOX_rmm_COMMIT 871841839b94c67a61c8ed0d31feecfd92a07156)
+set(VELOX_rmm_COMMIT f3310cb85b3fe15fd21f550adbbf7eeb1e374588)
 set(
   VELOX_rmm_BUILD_SHA256_CHECKSUM
-  a7050545e84629d51f88c17bf1ba72d4ea4e69caa0285f46b2af8cd41b1fd186
+  d2d78501e54e17119f4f0c4028e90684f356be557ee06bdb73bad75a3bb3ffeb
 )
 set(VELOX_rmm_SOURCE_URL "https://github.com/rapidsai/rmm/archive/${VELOX_rmm_COMMIT}.tar.gz")
 velox_resolve_dependency_url(rmm)
@@ -63,16 +63,21 @@ set(
 set(VELOX_cudf_SOURCE_URL "https://github.com/rapidsai/cudf/archive/${VELOX_cudf_COMMIT}.tar.gz")
 velox_resolve_dependency_url(cudf)
 
+# Probe for a system UCX install. When present, build the ucx-exchange module
+# and fetch ucxx; otherwise leave it disabled.
 find_library(UCX_LIBRARY NAMES ucp)
 find_path(UCX_INCLUDE_DIR NAMES ucp/api/ucp.h)
 if(UCX_LIBRARY AND UCX_INCLUDE_DIR)
   set(VELOX_ENABLE_UCX_EXCHANGE ON CACHE BOOL "Build ucx-exchange (UCX found)" FORCE)
-  set(VELOXX_ucxx_VERSION 0.49)
+  message(STATUS "Found UCX: ${UCX_LIBRARY} (headers: ${UCX_INCLUDE_DIR}) -- ucxx will be fetched")
+  # ucxx commit dc57333 from 2026-06-09 (release/0.50 branch)
+  set(VELOX_ucxx_VERSION 0.50)
+  set(VELOX_ucxx_COMMIT dc573338cdc651ed520bd4f3de8b350462c20bed)
   set(
     VELOX_ucxx_BUILD_SHA256_CHECKSUM
-    64c890eb501939cc05da9a005f16d354499023b388ba6f8a0994b7920cd034b9
+    0f9ab9f4124766259f3ab06dc5fad0e5fe100724390eaba17112afc75444af68
   )
-  set(VELOX_ucxx_SOURCE_URL "https://github.com/rapidsai/ucxx/archive/refs/tags/v0.49.00.tar.gz")
+  set(VELOX_ucxx_SOURCE_URL "https://github.com/rapidsai/ucxx/archive/${VELOX_ucxx_COMMIT}.tar.gz")
   velox_resolve_dependency_url(ucxx)
 else()
   set(VELOX_ENABLE_UCX_EXCHANGE OFF CACHE BOOL "Not building ucx-exchange (UCX not found)" FORCE)
@@ -89,6 +94,7 @@ block(SCOPE_FOR VARIABLES)
   set(CUDF_BUILD_TESTUTIL OFF)
   set(CUDF_BUILD_STREAMS_TEST_UTIL OFF)
   set(BUILD_SHARED_LIBS ON)
+  set(RAPIDS_LOGGER_FMT_OPTION BUNDLED CACHE STRING "Build rapids_logger spdlog with bundled fmt" FORCE)
 
   # TODO(mh,bd): Remove this once we have a permanent solution for the spdlog/fmt
   # incompatibility.
