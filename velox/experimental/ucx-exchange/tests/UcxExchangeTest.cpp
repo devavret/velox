@@ -35,6 +35,7 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
@@ -897,6 +898,133 @@ TEST_P(UcxExchangeTest, intraNodeTaskRemovalLivelock) {
            << "IntraNodeTransferRegistry for cancelled task";
   }
   // If we get here, the source correctly detected the cancelled task.
+}
+
+// A same-process consumer can connect before the producer task has initialized
+// its output queue. The handshake must wait for the real output kind instead of
+// permanently falling back to remote UCX based on the placeholder queue.
+TEST_P(UcxExchangeTest, partitionedPlaceholderUsesIntraNodePath) {
+  // This test doesn't use parameters — run only for the first param set.
+  {
+    ExchangeTestParams p = GetParam();
+    if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+        p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+        p.tableType != TableType::NARROW) {
+      GTEST_SKIP() << "partitionedPlaceholderUsesIntraNodePath: runs only once";
+    }
+  }
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string pollingSrcTaskId = taskPrefix + "pollingSrc";
+  const std::string pollingSinkTaskId = taskPrefix + "pollingSink";
+  const std::string srcTaskId = taskPrefix + "partitionedPlaceholderSrc";
+  const std::string sinkTaskId = taskPrefix + "partitionedPlaceholderSink";
+  constexpr int numChunks = 2;
+  constexpr int numRowsPerChunk = 1000;
+
+  const auto intraNodeHandshakesBefore = Acceptor::numIntraNodeHandshakes();
+  const auto remoteHandshakesBefore = Acceptor::numRemoteHandshakes();
+  auto waitForIntraNodeHandshakes = [](uint64_t target) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (Acceptor::numIntraNodeHandshakes() < target &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return Acceptor::numIntraNodeHandshakes() >= target;
+  };
+
+  // Establish one intra-node source with no data. It continuously re-enqueues
+  // itself while polling the transfer registry, keeping the communicator work
+  // queue non-empty. A later deferred handshake must still make progress.
+  auto pollingSrcTask =
+      createSourceTask(pollingSrcTaskId, pool_, UcxTestData::kTestRowType);
+  queueManager_->initializeTask(
+      pollingSrcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  core::PlanNodeId pollingExchangeNodeId;
+  auto pollingSinkTask = createExchangeTask(
+      pollingSinkTaskId,
+      UcxTestData::kTestRowType,
+      /*partitionId=*/0,
+      pollingExchangeNodeId);
+  auto pollingSinkDriver =
+      std::make_shared<SinkDriverMock>(pollingSinkTask, /*numDrivers=*/1);
+  std::vector<exec::Split> pollingSplits;
+  pollingSplits.emplace_back(remoteSplit(pollingSrcTaskId, /*partitionId=*/0));
+  pollingSinkDriver->addSplits(pollingSplits);
+  pollingSinkDriver->run();
+  EXPECT_TRUE(waitForIntraNodeHandshakes(intraNodeHandshakesBefore + 1));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  core::PlanNodeId exchangeNodeId;
+  auto sinkTask = createExchangeTask(
+      sinkTaskId, UcxTestData::kTestRowType, /*partitionId=*/0, exchangeNodeId);
+  auto sinkDriver =
+      std::make_shared<SinkDriverMock>(sinkTask, /*numDrivers=*/1);
+  std::vector<exec::Split> splits;
+  splits.emplace_back(remoteSplit(srcTaskId, /*partitionId=*/0));
+  sinkDriver->addSplits(splits);
+
+  // Start the consumer first and give its handshake time to reach the server.
+  // At this point the producer is represented only by a placeholder queue.
+  sinkDriver->run();
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  EXPECT_FALSE(queueManager_->canUseIntraNode(srcTaskId));
+
+  // Publishing partitioned task metadata must resolve the waiting handshake to
+  // the process-local path.
+  auto srcTask = createSourceTask(srcTaskId, pool_, UcxTestData::kTestRowType);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  // This specifically catches starvation in Communicator::run(): the polling
+  // source above keeps workQueue_ non-empty while this handshake is submitted
+  // through deferredActions_.
+  EXPECT_TRUE(waitForIntraNodeHandshakes(intraNodeHandshakesBefore + 2));
+
+  auto sourceMock = std::make_shared<UcxPartitionedOutputMock>(
+      srcTaskId,
+      /*numDrivers=*/1,
+      /*numPartitions=*/1,
+      numChunks,
+      numRowsPerChunk);
+  auto pollingSourceMock = std::make_shared<UcxPartitionedOutputMock>(
+      pollingSrcTaskId,
+      /*numDrivers=*/1,
+      /*numPartitions=*/1,
+      numChunks,
+      numRowsPerChunk);
+  sourceMock->run();
+  pollingSourceMock->run();
+
+  sourceMock->joinThreads();
+  pollingSourceMock->joinThreads();
+  sinkDriver->joinThreads();
+  pollingSinkDriver->joinThreads();
+
+  EXPECT_EQ(
+      sinkDriver->numRows(),
+      static_cast<uint64_t>(numChunks * numRowsPerChunk));
+  EXPECT_EQ(
+      pollingSinkDriver->numRows(),
+      static_cast<uint64_t>(numChunks * numRowsPerChunk));
+  EXPECT_EQ(Acceptor::numIntraNodeHandshakes(), intraNodeHandshakesBefore + 2);
+  EXPECT_EQ(Acceptor::numRemoteHandshakes(), remoteHandshakesBefore);
+
+  queueManager_->removeTask(srcTaskId);
+  queueManager_->removeTask(pollingSrcTaskId);
+  config.intraNodeExchange = origIntraNode;
 }
 
 // Regression test for broadcast + intra-node SIGSEGV.
