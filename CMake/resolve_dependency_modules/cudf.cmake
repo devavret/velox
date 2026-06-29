@@ -150,6 +150,26 @@ block(SCOPE_FOR VARIABLES)
     FetchContent_MakeAvailable(ucxx)
   endif()
 
+  # rapids_logger pins spdlog 1.14.1 and builds it with -DSPDLOG_FMT_EXTERNAL, i.e.
+  # against the external fmt 11.2 that Velox provides. spdlog 1.14.1 references
+  # fmt::basic_format_string, which fmt 11.1+ relocated out of the fmt namespace, so
+  # every spdlog/rapids_logger/cudf translation unit fails to compile. The
+  # cudf-cpm-overrides.json spdlog->1.15.3 override above is not reliably honored in
+  # this build, so force spdlog to use its own (compatible) bundled fmt by stripping
+  # the SPDLOG_FMT_EXTERNAL definitions; consumers inherit these transitively via
+  # spdlog's INTERFACE_COMPILE_DEFINITIONS.
+  foreach(_spdlog_tgt spdlog spdlog_header_only rapids_logger)
+    if(TARGET ${_spdlog_tgt})
+      foreach(_prop COMPILE_DEFINITIONS INTERFACE_COMPILE_DEFINITIONS)
+        get_target_property(_spdlog_defs ${_spdlog_tgt} ${_prop})
+        if(_spdlog_defs)
+          list(REMOVE_ITEM _spdlog_defs SPDLOG_FMT_EXTERNAL SPDLOG_FMT_EXTERNAL_HO)
+          set_target_properties(${_spdlog_tgt} PROPERTIES ${_prop} "${_spdlog_defs}")
+        endif()
+      endforeach()
+    endif()
+  endforeach()
+
   # cudf sets all warnings as errors, and therefore fails to compile with velox
   # expanded set of warnings. We selectively disable problematic warnings just for
   # cudf
