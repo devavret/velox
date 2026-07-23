@@ -132,6 +132,14 @@ struct OutputDesc {
   /// can set the output shape by that.
   bool byLargestInput{false};
 
+  /// Propagated from ArgumentMeta::nonRootOutput: this output belongs to a
+  /// non-last part of a split root op and is a real output of the original op,
+  /// so it is excluded from the freeable intermediates list (LaunchData::
+  /// intermediates). Flagged statically at registration, not from downstream
+  /// uses, because a shared ProjectOperation may or may not reference the value
+  /// externally per actual use.
+  bool nonRootOutput{false};
+
   SizeExpr sizeExpr;
 
   bool isList{false};
@@ -230,12 +238,28 @@ class KernelOperation {
     return expr_;
   }
 
+  /// True if the actual value 'id' is fed to more than one part of a multipart
+  /// expansion (WaveGraph::multiUseInputs). Such values are produced in one
+  /// part's kernel op but read by another, so they must not be freed as per-op
+  /// intermediates.
+  bool isMultiUseInput(nativert::ValueId id) const;
+
+  /// True if the actual value 'id' is a graph output (or a list-output
+  /// element), which escapes the graph and must not be freed as a per-op
+  /// intermediate.
+  bool isGraphOutput(nativert::ValueId id) const;
+
   int32_t numInputs() const {
     return numInputs_;
   }
 
   const std::vector<ValueCP>& orderedInputs() const {
     return orderedInputs_;
+  }
+
+  /// Returns the static tensor metadata of the subgraph leaf inputs.
+  const std::vector<const nativert::TensorMeta*>& inputTypes() const {
+    return inputTypes_;
   }
 
   bool isInput(ValueCP value) const {
@@ -309,6 +333,19 @@ class KernelOperation {
 
   std::vector<ElementExpr>& elementExprs() {
     return elementExprs_;
+  }
+
+  /// Records that the tensor param at 'offset' needs an own-dims index
+  /// calculator (sizes[]) force-initialized in the block prologue. Set for the
+  /// output and whole-tensor operands of gather ops (index_select, repeat)
+  /// whose device functions decompose the linear index by own dims.
+  void addOwnDimsCalcOffset(int32_t offset) {
+    ownDimsCalcOffsets_.insert(offset);
+  }
+
+  /// Param offsets of tensors needing an own-dims index calculator.
+  const std::unordered_set<int32_t>& ownDimsCalcOffsets() const {
+    return ownDimsCalcOffsets_;
   }
 
   const std::unordered_set<NodeCP>& allNodes() const {
@@ -426,6 +463,12 @@ class KernelOperation {
 
   std::vector<ValueCP> orderedInputs_;
 
+  // Static tensor metadata of the subgraph leaf inputs (carried from Subgraph).
+  // Used to size the grid from a static shape when an input is an
+  // unmaterialized intermediate at host sizing time (e.g. a view-rooted op
+  // under a cooperative grid).
+  std::vector<const nativert::TensorMeta*> inputTypes_;
+
   // Assigns a param offset for 'value', expanding TensorList elements.
   void assignParamOffset(ValueCP value, int32_t& offset);
 
@@ -459,6 +502,11 @@ class KernelOperation {
   std::vector<int32_t> barrierCounters_;
 
   std::vector<ElementExpr> elementExprs_;
+
+  // Param offsets of tensors whose sizes[] must be force-initialized for their
+  // own dims (gather-op output and whole-tensor operands). See
+  // ownDimsCalcOffsets().
+  std::unordered_set<int32_t> ownDimsCalcOffsets_;
 
   std::unordered_set<NodeCP> allNodes_;
 

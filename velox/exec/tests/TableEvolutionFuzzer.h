@@ -23,6 +23,8 @@
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
+#include <functional>
+#include <unordered_map>
 #include <unordered_set>
 #include "velox/expression/fuzzer/ExpressionFuzzer.h"
 
@@ -35,6 +37,16 @@ class TableEvolutionFuzzer {
     int evolutionCount;
     std::vector<dwio::common::FileFormat> formats;
     memory::MemoryPool* pool;
+
+    /// Returns extra writer serde params to merge for one file, or none when
+    /// unset. Called once per written file with the file's format and the
+    /// fuzzer rng, so a driver can exercise format-specific write options,
+    /// randomized yet reproducible from the seed. The core stays
+    /// format-agnostic.
+    std::function<std::unordered_map<std::string, std::string>(
+        dwio::common::FileFormat,
+        FuzzerGenerator&)>
+        extraWriteSerdeParams;
   };
 
   explicit TableEvolutionFuzzer(const Config& config);
@@ -52,6 +64,31 @@ class TableEvolutionFuzzer {
   // dwio-packaged defined file formats.
   static const std::vector<dwio::common::FileFormat> parseFileFormats(
       std::string input);
+
+  /// Returns true if 'columnName' is referenced by 'aggregationConfig's
+  /// grouping keys or aggregate expressions.
+  static bool isColumnUsedByAggregation(
+      const std::string& columnName,
+      const AggregationConfig& aggregationConfig);
+
+  /// Selects a random subset of 'filteredColumns' to read filter-only (filtered
+  /// but dropped from the scan output), exercising the selective reader's
+  /// filter-only column path. A column is eligible only when it is a top-level,
+  /// non-map, non-bucket column whose type is identical across all
+  /// 'perEvolutionSchemas', and, when 'aggregationConfig' is set, is not used
+  /// by the aggregation. Each eligible column is dropped with probability 1/2.
+  static folly::F14FastSet<std::string> selectFilterOnlyColumns(
+      const RowTypePtr& schema,
+      const std::unordered_set<std::string>& filteredColumns,
+      const std::vector<column_index_t>& bucketColumnIndices,
+      const std::vector<RowTypePtr>& perEvolutionSchemas,
+      const std::optional<AggregationConfig>& aggregationConfig,
+      FuzzerGenerator& rng);
+
+  /// Returns the column names in 'schema' order, excluding 'droppedColumns'.
+  static std::vector<std::string> projectedColumnNames(
+      const RowTypePtr& schema,
+      const folly::F14FastSet<std::string>& droppedColumns);
 
   void run();
 
@@ -108,7 +145,8 @@ class TableEvolutionFuzzer {
       bool enableFlatMap,
       folly::F14FastMap<int, folly::F14FastSet<std::string>>&
           globalMapColumnKeys,
-      std::vector<int>& globallyCompatibleFlatmapColumns);
+      std::vector<int>& globallyCompatibleFlatmapColumns,
+      const std::unordered_map<std::string, std::string>& extraSerdeParams);
 
   template <typename To, typename From>
   VectorPtr liftToPrimitiveType(
@@ -117,15 +155,18 @@ class TableEvolutionFuzzer {
 
   VectorPtr liftToType(const VectorPtr& input, const TypePtr& type);
 
+  /// Builds a TableScan TaskCursor for one setup. When 'useFiltersAsNode' is
+  /// true the filters are realized as a separate FilterNode above the scan (the
+  /// reference plan that the pushdown plan is validated against); when false
+  /// the filters are pushed down into the TableScan (the plan under test).
   std::unique_ptr<TaskCursor> makeScanTask(
       const RowTypePtr& tableSchema,
       std::vector<Split> splits,
       const PushdownConfig& pushdownConfig,
       bool useFiltersAsNode,
       bool insertProjectToBlockPushdown,
-      const folly::F14FastMap<int, folly::F14FastSet<std::string>>&
-          globalMapColumnKeys = {},
-      const std::vector<int>& globallyCompatibleFlatmapColumns = {});
+      const RowTypePtr& fullOutSchema,
+      const std::vector<std::string>& outputColumnNames);
 
   /// Builds schema for flatmap as struct reading by converting selected map
   /// columns to struct types.

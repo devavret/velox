@@ -20,6 +20,7 @@
 #include "velox/core/PlanNode.h"
 
 #include "velox/common/EnumDefine.h"
+#include "velox/core/FixedPointPlanNodes.h"
 #include "velox/core/TableWriteTraits.h"
 #include "velox/vector/VectorSaver.h"
 
@@ -1409,6 +1410,21 @@ UnnestNode::UnnestNode(
     types.emplace_back(variable->type());
   }
 
+  // Validate that unnestNames provides exactly one name per array (element) and
+  // two per map (key and value) before indexing into it below.
+  size_t expectedUnnestNames{0};
+  for (const auto& variable : unnestVariables_) {
+    if (variable->type()->isArray()) {
+      ++expectedUnnestNames;
+    } else if (variable->type()->isMap()) {
+      expectedUnnestNames += 2;
+    }
+  }
+  VELOX_USER_CHECK_EQ(
+      unnestNames_.size(),
+      expectedUnnestNames,
+      "UnnestNode requires one name per array column and two per map column");
+
   int unnestIndex = 0;
   for (const auto& variable : unnestVariables_) {
     if (variable->type()->isArray()) {
@@ -1557,9 +1573,10 @@ void AbstractJoinNode::validate() const {
     VELOX_CHECK(!rightType->containsChild(name));
   }
 
-  // Output of right semi join cannot include columns from the left side.
-  bool outputMayIncludeLeftColumns =
-      !(isRightSemiFilterJoin() || isRightSemiProjectJoin());
+  // Output of right semi and right anti joins cannot include columns from the
+  // left side.
+  bool outputMayIncludeLeftColumns = !(
+      isRightSemiFilterJoin() || isRightSemiProjectJoin() || isRightAntiJoin());
 
   // Output of left semi and anti joins cannot include columns from the right
   // side.
@@ -1628,6 +1645,7 @@ const auto& joinTypeNames() {
       {JoinType::kAnti, "ANTI"},
       {JoinType::kCountingAnti, "COUNTING ANTI"},
       {JoinType::kCountingLeftSemiFilter, "COUNTING LEFT SEMI (FILTER)"},
+      {JoinType::kRightAnti, "RIGHT ANTI"},
   };
   return kNames;
 }
@@ -4084,6 +4102,9 @@ void PlanNode::registerSerDe() {
   registry.Register("MarkDistinctNode", MarkDistinctNode::create);
   registry.Register("MixedUnionNode", MixedUnionNode::create);
   registry.Register("RPCNode", RPCNode::create);
+  registry.Register("FixedPointNode", FixedPointNode::create);
+  registry.Register("StateSourceNode", StateSourceNode::create);
+  registry.Register("StateHashJoinNode", StateHashJoinNode::create);
   registry.Register(
       "GatherPartitionFunctionSpec", GatherPartitionFunctionSpec::deserialize);
 }
