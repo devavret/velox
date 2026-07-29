@@ -25,10 +25,15 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace facebook::velox::cudf_velox {
+
+class CudaEvent;
 
 /// GPU operator that marks first occurrences of distinct key combinations.
 ///
@@ -78,6 +83,13 @@ class CudfMarkDistinct : public CudfOperatorBase {
   /// new distinct keys. Only rebuilt when seenKeys_ grows (new keys found).
   /// Null until the first batch has been processed.
   std::unique_ptr<cudf::filtered_join> seenFilter_;
+
+  /// Stream that owns the retained state allocations. State access is ordered
+  /// between this stream and each incoming batch stream using CUDA events.
+  std::optional<rmm::cuda_stream_view> stateStream_;
+
+  std::unique_ptr<CudaEvent> stateReadyEvent_;
+  std::unique_ptr<CudaEvent> stateReleaseEvent_;
 };
 
 } // namespace facebook::velox::cudf_velox

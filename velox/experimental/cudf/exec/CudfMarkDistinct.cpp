@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -40,7 +41,9 @@ CudfMarkDistinct::CudfMarkDistinct(
           nvtx3::rgb{255, 165, 0}, // Orange
           NvtxMethodFlag::kAddInput | NvtxMethodFlag::kGetOutput,
           std::nullopt,
-          planNode) {
+          planNode),
+      stateReadyEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)),
+      stateReleaseEvent_(std::make_unique<CudaEvent>(cudaEventDisableTiming)) {
   const auto& inputType = planNode->sources()[0]->outputType();
   for (const auto& key : planNode->distinctKeys()) {
     auto idx = inputType->getChildIdx(key->name());
@@ -62,6 +65,11 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
   VELOX_CHECK_NOT_NULL(cudfInput, "CudfMarkDistinct expects CudfVector input");
 
   auto stream = cudfInput->stream();
+  if (stateStream_.has_value() && stateStream_->value() != stream.value()) {
+    // Wait for all prior state updates and reads before using retained state on
+    // this batch's stream.
+    stateReadyEvent_->recordFrom(*stateStream_).waitOn(stream);
+  }
   auto outputMr = get_output_mr();
   auto tempMr = get_temp_mr();
   auto tableView = cudfInput->getTableView();
@@ -154,9 +162,18 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
       // concatenate-per-batch idiom.
       std::vector<cudf::table_view> seenPlusNew = {
           seenKeys_->view(), newKeys->view()};
-      seenKeys_ = cudf::concatenate(seenPlusNew, stream, tempMr);
+      auto updatedSeenKeys = cudf::concatenate(seenPlusNew, stream, tempMr);
+
+      if (stateStream_->value() != stream.value()) {
+        // The old filter references seenKeys_. Order destruction of both on
+        // their owning stream after this stream finishes reading them.
+        stateReleaseEvent_->recordFrom(stream).waitOn(*stateStream_);
+      }
+      seenFilter_.reset();
+      seenKeys_ = std::move(updatedSeenKeys);
       seenFilter_ = std::make_unique<cudf::filtered_join>(
           seenKeys_->view(), cudf::null_equality::EQUAL, stream);
+      stateStream_ = stream;
     }
   }
 
@@ -176,6 +193,14 @@ RowVectorPtr CudfMarkDistinct::doGetOutput() {
   auto size = cudfInput->size();
   auto columns = cudfInput->release()->release();
   columns.push_back(std::move(markerCol));
+  if (!stateStream_.has_value()) {
+    stateStream_ = stream;
+  } else if (stateStream_->value() != stream.value()) {
+    // Keep the retained state's owning stream ordered after readers even when
+    // this batch adds no new keys. A later batch can then safely wait on the
+    // owning stream before accessing or replacing the state.
+    stateReleaseEvent_->recordFrom(stream).waitOn(*stateStream_);
+  }
   cudfInput.reset();
   input_ = nullptr;
   return std::make_shared<CudfVector>(
