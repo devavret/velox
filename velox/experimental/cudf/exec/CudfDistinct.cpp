@@ -248,9 +248,7 @@ void CudfDistinct::doNoMoreInput() {
 
   // This driver was chosen to collect data from all peers.
   for (auto& peer : peers) {
-    // findOperator(planNodeId()) may return a CudfBatchConcat (same plan node
-    // ID) instead of the CudfDistinct, so search by operatorId which is unique.
-    auto* op = peer->findOperator(operatorCtx_->operatorId());
+    auto op = peer->findOperator(planNodeId());
     auto* peerDistinct = dynamic_cast<CudfDistinct*>(op);
     VELOX_CHECK_NOT_NULL(peerDistinct);
     inputs_.insert(
