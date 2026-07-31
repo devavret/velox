@@ -60,18 +60,6 @@ CudaEvent& eventForThread() {
   return *events[deviceIndex];
 }
 
-size_t maxBatchRows() {
-  const auto& cudfConfig = CudfConfig::getInstance();
-  if (cudfConfig.batchSizeMaxThreshold) {
-    VELOX_CHECK_GT(
-        cudfConfig.batchSizeMaxThreshold.value(),
-        0,
-        "cuDF max batch size must be positive");
-    return static_cast<size_t>(cudfConfig.batchSizeMaxThreshold.value());
-  }
-  return static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
-}
-
 vector_size_t checkedVectorSize(size_t rowCount) {
   VELOX_CHECK_LE(
       rowCount,
@@ -80,6 +68,16 @@ vector_size_t checkedVectorSize(size_t rowCount) {
   return static_cast<vector_size_t>(rowCount);
 }
 } // namespace
+
+size_t maxBatchRows() {
+  const auto configured = CudfConfig::getInstance().batchSizeMaxThreshold;
+  if (configured.has_value()) {
+    VELOX_CHECK_GT(
+        configured.value(), 0, "cuDF max batch size must be positive");
+    return static_cast<size_t>(configured.value());
+  }
+  return static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
+}
 
 std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,

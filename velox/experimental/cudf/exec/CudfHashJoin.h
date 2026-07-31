@@ -34,6 +34,7 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
+#include <queue>
 
 namespace facebook::velox::cudf_velox {
 
@@ -221,6 +222,8 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   std::vector<size_t> rightColumnOutputIndices_;
   bool finished_{false};
 
+  std::queue<CudfVectorPtr> outputQueue_;
+
   /// True if any build table has NULL values in join key columns.
   /// Used for null-aware LEFT SEMI PROJECT to determine match column
   /// nullability.
@@ -267,6 +270,12 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   /// host-synchronized all-false init state with no pending GPU work.
   std::optional<rmm::cuda_stream_view> lastProbeStream_;
 
+  /// State for incrementally emitting unmatched build rows in right/full joins.
+  size_t unmatchedBuildChunkIndex_{0};
+  size_t unmatchedBuildOffset_{0};
+  std::unique_ptr<cudf::column> unmatchedBuildIndices_;
+  std::optional<rmm::cuda_stream_view> unmatchedBuildStream_;
+
   static constexpr auto oobPolicy = cudf::out_of_bounds_policy::NULLIFY;
 
   struct JoinOutput {
@@ -274,42 +283,43 @@ class CudfHashJoinProbe : public CudfOperatorBase {
     vector_size_t numRows;
   };
 
+  struct PendingIndices {
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftIndices;
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightIndices;
+    size_t offset{0};
+    size_t buildChunkIndex;
+
+    size_t remaining() const {
+      return leftIndices->size() - offset;
+    }
+  };
+
+  std::queue<PendingIndices> pendingIndices_;
+
   /**
    * @brief Performs inner join between probe table and all build tables.
    * @param leftTable Probe-side table to join
    * @param stream CUDA stream for operations
-   * @return Vector of result tables (multiple if build data was batched)
    */
-  std::vector<JoinOutput> innerJoin(
-      cudf::table_view leftTableView,
-      rmm::cuda_stream_view stream);
+  void innerJoin(cudf::table_view leftTableView, rmm::cuda_stream_view stream);
   /**
    * @brief Performs left join between probe table and all build tables.
    * @param leftTableView Probe-side table view to join
    * @param stream CUDA stream for operations
-   * @return Vector of result tables (multiple if build data was batched)
    */
-  std::vector<JoinOutput> leftJoin(
-      cudf::table_view leftTableView,
-      rmm::cuda_stream_view stream);
+  void leftJoin(cudf::table_view leftTableView, rmm::cuda_stream_view stream);
   /**
    * @brief Performs right join between probe table and all build tables.
    * @param leftTableView Probe-side table view to join
    * @param stream CUDA stream for operations
-   * @return Vector of result tables (multiple if build data was batched)
    */
-  std::vector<JoinOutput> rightJoin(
-      cudf::table_view leftTableView,
-      rmm::cuda_stream_view stream);
+  void rightJoin(cudf::table_view leftTableView, rmm::cuda_stream_view stream);
   /**
    * @brief Performs full outer join between probe table and all build tables.
    * @param leftTableView Probe-side table view to join
    * @param stream CUDA stream for operations
-   * @return Vector of result tables (multiple if build data was batched)
    */
-  std::vector<JoinOutput> fullJoin(
-      cudf::table_view leftTableView,
-      rmm::cuda_stream_view stream);
+  void fullJoin(cudf::table_view leftTableView, rmm::cuda_stream_view stream);
   /**
    * @brief Performs left semi filter join between probe table and all build
    * tables.
@@ -394,6 +404,17 @@ class CudfHashJoinProbe : public CudfOperatorBase {
       cudf::table_view extendedRightView,
       cudf::join_kind joinKind,
       rmm::cuda_stream_view stream);
+
+  void enqueuePendingIndices(
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>> leftIndices,
+      std::unique_ptr<rmm::device_uvector<cudf::size_type>> rightIndices,
+      size_t buildChunkIndex);
+
+  RowVectorPtr gatherPendingBatch(rmm::cuda_stream_view stream);
+
+  void enqueueOutput(JoinOutput output, rmm::cuda_stream_view stream);
+
+  RowVectorPtr nextUnmatchedBuildOutput();
 };
 
 /**

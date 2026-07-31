@@ -112,6 +112,24 @@ TEST_F(HashJoinTest, countStarOverInnerJoinWithZeroColumnOutput) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(HashJoinTest, countStarOverBatchedInnerJoinWithZeroColumnOutput) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedMax = config.batchSizeMaxThreshold;
+  config.batchSizeMaxThreshold = 3;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+  };
+
+  auto probe = makeRowVector({"k"}, {makeFlatVector<int32_t>({1, 1, 1, 1})});
+  auto build = makeRowVector({"u_k"}, {makeFlatVector<int32_t>({1, 1, 1, 1})});
+
+  auto plan =
+      countStarOverZeroColumnHashJoinPlan(probe, build, core::JoinType::kInner);
+
+  auto expected = makeRowVector({makeFlatVector<int64_t>({16})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
 TEST_F(HashJoinTest, countStarOverRightSemiFilterJoinWithZeroColumnOutput) {
   auto probe = makeRowVector({"k"}, {makeFlatVector<int32_t>({1, 2, 3})});
   auto build = makeRowVector({"u_k"}, {makeFlatVector<int32_t>({2, 2, 3, 4})});
@@ -153,6 +171,26 @@ TEST_F(HashJoinTest, countStarOverNonAstFilteredJoinWithZeroColumnOutput) {
       "CASE WHEN t_val > 0.0 THEN t_val / u_val ELSE 0.0 END > 2.0");
 
   auto expected = makeRowVector({makeFlatVector<int64_t>({2})});
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+TEST_F(HashJoinTest, countStarOverNullNonAstFilterWithZeroColumnOutput) {
+  auto probe = makeRowVector(
+      {"k", "t_val"},
+      {makeFlatVector<int32_t>({1, 2}),
+       makeNullableFlatVector<double>({std::nullopt, std::nullopt})});
+  auto build = makeRowVector(
+      {"u_k", "u_val"},
+      {makeFlatVector<int32_t>({1, 2}), makeFlatVector<double>({1.0, 1.0})});
+
+  auto plan = countStarOverZeroColumnHashJoinPlan(
+      probe,
+      build,
+      core::JoinType::kInner,
+      "CASE WHEN t_val > 0.0 THEN t_val / u_val "
+      "ELSE CAST(NULL AS DOUBLE) END > 2.0");
+
+  auto expected = makeRowVector({makeFlatVector<int64_t>({0})});
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
@@ -9641,6 +9679,143 @@ TEST_F(HashJoinTest, emptyBuildWithDebugEnabled) {
       .referenceQuery(
           "SELECT t_k0, t_data, u_k0, u_data FROM t, u WHERE t_k0 = u_k0")
       .checkSpillStats(false)
+      .run();
+}
+
+TEST_F(HashJoinTest, innerJoinLazyGatherBatching) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedMax = config.batchSizeMaxThreshold;
+  config.batchSizeMaxThreshold = 7;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+  };
+
+  auto probeVectors = makeBatches(1, [&](int32_t) {
+    return makeRowVector({makeFlatVector<int32_t>(10, [](auto) { return 1; })});
+  });
+  auto buildVectors = makeBatches(1, [&](int32_t) {
+    return makeRowVector({makeFlatVector<int32_t>(10, [](auto) { return 1; })});
+  });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(1)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0"})
+      .joinType(core::JoinType::kInner)
+      .joinOutputLayout({"c0", "u_c0"})
+      .referenceQuery("SELECT t.c0, u.c0 FROM t JOIN u ON t.c0 = u.c0")
+      .verifier([](const std::shared_ptr<Task>& task, bool) {
+        const auto stats = toOperatorStats(task->taskStats());
+        ASSERT_EQ(stats.at("CudfHashJoinProbe").outputPositions, 100);
+        ASSERT_EQ(stats.at("CudfHashJoinProbe").outputVectors, 15);
+      })
+      .run();
+}
+
+TEST_F(HashJoinTest, rightJoinSplitsSingleBuildUnmatchedRows) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedMax = config.batchSizeMaxThreshold;
+  config.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+  };
+
+  auto probeVectors = makeBatches(1, [&](int32_t) {
+    return makeRowVector({makeFlatVector<int32_t>(1, [](auto) { return -1; })});
+  });
+  auto buildVectors = makeBatches(1, [&](int32_t) {
+    return makeRowVector(
+        {makeFlatVector<int32_t>(25, [](auto row) { return row; })});
+  });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(1)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0"})
+      .joinType(core::JoinType::kRight)
+      .joinOutputLayout({"c0", "u_c0"})
+      .referenceQuery("SELECT t.c0, u.c0 FROM t RIGHT JOIN u ON t.c0 = u.c0")
+      .verifier([](const std::shared_ptr<Task>& task, bool) {
+        const auto stats = toOperatorStats(task->taskStats());
+        ASSERT_EQ(stats.at("CudfHashJoinProbe").outputPositions, 25);
+        ASSERT_EQ(stats.at("CudfHashJoinProbe").outputVectors, 3);
+      })
+      .run();
+}
+
+TEST_P(MultiThreadedHashJoinTest, rightJoinBatchedUnmatchedRows) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedMax = config.batchSizeMaxThreshold;
+  config.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+  };
+
+  auto probeVectors = makeBatches(1, [&](int32_t) {
+    return makeRowVector(
+        {makeFlatVector<int32_t>(1, [](auto /* row */) { return -1; })});
+  });
+  auto buildVectors = makeBatches(1, [&](int32_t) {
+    return makeRowVector(
+        {makeFlatVector<int32_t>(25, [](auto row) { return row; })});
+  });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(numDrivers_)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0"})
+      .joinType(core::JoinType::kRight)
+      .joinOutputLayout({"c0", "u_c0"})
+      .referenceQuery("SELECT t.c0, u.c0 FROM t RIGHT JOIN u ON t.c0 = u.c0")
+      .run();
+}
+
+TEST_F(HashJoinTest, fullJoinSplitsSingleBuildUnmatchedRows) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedMax = config.batchSizeMaxThreshold;
+  config.batchSizeMaxThreshold = 10;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+  };
+
+  auto probeVectors = makeBatches(1, [&](int32_t) {
+    return makeRowVector(
+        {makeFlatVector<int32_t>(1, [](auto /* row */) { return -1; })});
+  });
+  auto buildVectors = makeBatches(1, [&](int32_t) {
+    return makeRowVector(
+        {makeFlatVector<int32_t>(25, [](auto row) { return row; })});
+  });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .injectSpill(false)
+      .numDrivers(1)
+      .probeKeys({"c0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u_c0"})
+      .buildVectors(std::move(buildVectors))
+      .buildProjections({"c0 AS u_c0"})
+      .joinType(core::JoinType::kFull)
+      .joinOutputLayout({"c0", "u_c0"})
+      .referenceQuery(
+          "SELECT t.c0, u.c0 FROM t FULL OUTER JOIN u ON t.c0 = u.c0")
+      .verifier([](const std::shared_ptr<Task>& task, bool) {
+        const auto stats = toOperatorStats(task->taskStats());
+        ASSERT_EQ(stats.at("CudfHashJoinProbe").outputPositions, 26);
+        ASSERT_EQ(stats.at("CudfHashJoinProbe").outputVectors, 4);
+      })
       .run();
 }
 

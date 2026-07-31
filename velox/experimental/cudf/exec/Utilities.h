@@ -27,6 +27,9 @@
 
 namespace facebook::velox::cudf_velox {
 
+/// Returns the configured maximum output batch size, or cuDF's row limit.
+size_t maxBatchRows();
+
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
