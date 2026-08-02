@@ -61,7 +61,7 @@ function install_build_prerequisites {
     llvm ninja-build python3-pip python3-devel wget which
 
   install_uv
-  uv_install cmake@3.31.1
+  uv_install --force cmake@4.3.2
 
   if [[ ${USE_CLANG} != "false" ]]; then
     install_clang15
@@ -98,6 +98,10 @@ function install_faiss_deps {
   dnf_install openblas-devel libomp
 }
 
+function install_cxl_deps {
+  dnf_install numactl-devel
+}
+
 function install_velox_deps {
   run_and_time install_velox_deps_from_dnf
   run_and_time install_conda
@@ -115,7 +119,6 @@ function install_velox_deps {
   run_and_time install_fbthrift
   run_and_time install_duckdb
   run_and_time install_stemmer
-  run_and_time install_thrift
   run_and_time install_arrow
   run_and_time install_xsimd
   run_and_time install_simdjson

@@ -24,6 +24,7 @@
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/type/Timestamp.h"
 
 #include <cmath>
 
@@ -259,6 +260,93 @@ TEST_F(AggregationTest, global) {
       "SELECT sum(c1), sum(c2), sum(c4), sum(c5), "
       "min(c1), min(c2), min(c3), min(c4), min(c5), "
       "max(c1), max(c2), max(c3), max(c4), max(c5) FROM tmp");
+}
+
+TEST_F(AggregationTest, minMaxTimestampGlobal) {
+  std::vector<std::optional<Timestamp>> timestamps = {
+      Timestamp(1609459200, 0), // 2021-01-01 00:00:00
+      Timestamp(1609459200, 500000000), // 2021-01-01 00:00:00.500
+      Timestamp(1609545600, 0), // 2021-01-02 00:00:00
+      std::nullopt,
+      Timestamp(1609459199, 900000000) // 2020-12-31 23:59:59.900
+  };
+
+  auto data = makeRowVector(
+      {makeNullableFlatVector<Timestamp>(timestamps, TIMESTAMP())});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({}, {"min(c0)", "max(c0)"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT min(c0), max(c0) FROM tmp");
+}
+
+TEST_F(AggregationTest, minMaxTimestampGroupBy) {
+  std::vector<std::optional<Timestamp>> timestamps = {
+      Timestamp(1609459200, 0), // 2021-01-01 00:00:00
+      std::nullopt,
+      Timestamp(1609545600, 0), // 2021-01-02 00:00:00
+      Timestamp(1609459199, 0), // 2020-12-31 23:59:59
+      Timestamp(1609632000, 0) // 2021-01-03 00:00:00
+  };
+
+  auto data = makeRowVector(
+      {makeFlatVector<int32_t>({1, 1, 2, 2, 2}),
+       makeNullableFlatVector<Timestamp>(timestamps, TIMESTAMP())});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({"c0"}, {"min(c1)", "max(c1)"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0, min(c1), max(c1) FROM tmp GROUP BY c0");
+}
+
+TEST_F(AggregationTest, minMaxDateGlobal) {
+  // cuDF represents DATE as TIMESTAMP_DAYS, a distinct type from TIMESTAMP, so
+  // exercise min/max on it directly.
+  std::vector<std::optional<int32_t>> dates = {
+      DATE()->toDays("2021-01-01"),
+      DATE()->toDays("2021-01-02"),
+      std::nullopt,
+      DATE()->toDays("2020-12-31"),
+      DATE()->toDays("2021-01-03"),
+  };
+
+  auto data = makeRowVector({makeNullableFlatVector<int32_t>(dates, DATE())});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({}, {"min(c0)", "max(c0)"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT min(c0), max(c0) FROM tmp");
+}
+
+TEST_F(AggregationTest, minMaxDateGroupBy) {
+  std::vector<std::optional<int32_t>> dates = {
+      DATE()->toDays("2021-01-01"),
+      std::nullopt,
+      DATE()->toDays("2021-01-02"),
+      DATE()->toDays("2020-12-31"),
+      DATE()->toDays("2021-01-03"),
+  };
+
+  auto data = makeRowVector(
+      {makeFlatVector<int32_t>({1, 1, 2, 2, 2}),
+       makeNullableFlatVector<int32_t>(dates, DATE())});
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .singleAggregation({"c0"}, {"min(c1)", "max(c1)"})
+                  .planNode();
+
+  assertQuery(plan, "SELECT c0, min(c1), max(c1) FROM tmp GROUP BY c0");
 }
 
 TEST_F(AggregationTest, singleBigintKey) {
@@ -1612,6 +1700,113 @@ TEST_F(AggregationTest, stddevSampAllNulls) {
                  .planNode();
 
   assertQuery(op2, "SELECT c0, stddev_samp(c2) FROM tmp GROUP BY c0");
+}
+
+// Test avg with all NULL input (should return NULL, not NaN)
+TEST_F(AggregationTest, avgAllNulls) {
+  // Group 0: all NULLs -> avg should return NULL
+  // Group 1: has values -> should compute normally
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({0, 0, 1, 1}),
+      makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 4, 6}),
+      makeNullableFlatVector<double>({std::nullopt, std::nullopt, 4.0, 6.0}),
+  });
+  createDuckDbTable({data});
+
+  auto op = PlanBuilder()
+                .values({data})
+                .singleAggregation({"c0"}, {"avg(c1)"})
+                .planNode();
+
+  assertQuery(op, "SELECT c0, avg(c1) FROM tmp GROUP BY c0");
+
+  auto op2 = PlanBuilder()
+                 .values({data})
+                 .singleAggregation({"c0"}, {"avg(c2)"})
+                 .planNode();
+
+  assertQuery(op2, "SELECT c0, avg(c2) FROM tmp GROUP BY c0");
+}
+
+// Test avg with all NULL input using partial + final (distributed) aggregation
+TEST_F(AggregationTest, avgAllNullsPartialFinal) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({0, 0, 1, 1}),
+      makeNullableFlatVector<int64_t>({std::nullopt, std::nullopt, 4, 6}),
+      makeNullableFlatVector<double>({std::nullopt, std::nullopt, 4.0, 6.0}),
+  });
+  createDuckDbTable({data});
+
+  auto op = PlanBuilder()
+                .values({data})
+                .partialAggregation({"c0"}, {"avg(c1)"})
+                .finalAggregation()
+                .planNode();
+
+  assertQuery(op, "SELECT c0, avg(c1) FROM tmp GROUP BY c0");
+
+  auto op2 = PlanBuilder()
+                 .values({data})
+                 .partialAggregation({"c0"}, {"avg(c2)"})
+                 .finalAggregation()
+                 .planNode();
+
+  assertQuery(op2, "SELECT c0, avg(c2) FROM tmp GROUP BY c0");
+}
+
+// Test avg with NaN inputs preserves NaN (does not convert to NULL)
+TEST_F(AggregationTest, avgNaNInputs) {
+  // Group 0: NaN only -> avg should be NaN
+  // Group 1: normal values -> avg should compute normally
+  // Group 2: all NULLs (count == 0) -> avg should be NULL
+  // Group 3: NaN + NULL + normal -> avg should be NaN
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({0, 0, 1, 1, 2, 2, 3, 3, 3}),
+      makeNullableFlatVector<double>(
+          {std::nan(""),
+           1.0,
+           3.0,
+           5.0,
+           std::nullopt,
+           std::nullopt,
+           std::nan(""),
+           std::nullopt,
+           7.0}),
+  });
+  createDuckDbTable({data});
+
+  auto op = PlanBuilder()
+                .values({data})
+                .singleAggregation({"c0"}, {"avg(c1)"})
+                .planNode();
+
+  assertQuery(op, "SELECT c0, avg(c1) FROM tmp GROUP BY c0");
+}
+
+// Test that zero-column rows flow correctly through CudfFromVelox.
+// project({}) produces zero-column output; localPartitionRoundRobin is a CPU
+// operator that forces CudfFromVelox insertion before the GPU aggregation.
+// Without the zero-column fix in CudfFromVelox, this crashes with:
+//   "Operator::getOutput() must return nullptr or a non-empty vector"
+// because toCudfTable loses the row count for zero-column tables.
+TEST_F(AggregationTest, zeroColumnThroughCudfFromVelox) {
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3, 4}),
+  });
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .filter("c0 > 0")
+                  .project({})
+                  .localPartitionRoundRobin()
+                  .singleAggregation({}, {"count(*)"})
+                  .planNode();
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "2")
+      .plan(plan)
+      .assertResults("SELECT count(*) FROM tmp WHERE c0 > 0");
 }
 
 } // namespace facebook::velox::exec::test

@@ -16,6 +16,7 @@
 
 #include "velox/functions/sparksql/specialforms/SparkCastHooks.h"
 #include "velox/functions/lib/string/StringImpl.h"
+#include "velox/functions/sparksql/TimestampUtils.h"
 #include "velox/type/TimestampConversion.h"
 #include "velox/type/tz/TimeZoneMap.h"
 
@@ -31,14 +32,25 @@ SparkCastHooks::SparkCastHooks(
   }
 }
 
+TimestampToStringOptions SparkCastHooks::timestampUtcToStringOptions() const {
+  auto options = timestampToStringOptions_;
+  options.timeZone = nullptr;
+  return options;
+}
+
 Expected<Timestamp> SparkCastHooks::castStringToTimestamp(
-    const StringView& view) const {
+    const StringView& view,
+    bool adjustTimezone) const {
   auto conversionResult = util::fromTimestampWithTimezoneString(
       view.data(), view.size(), util::TimestampParseMode::kSparkCast);
   if (conversionResult.hasError()) {
     return folly::makeUnexpected(conversionResult.error());
   }
-
+  if (!adjustTimezone) {
+    // For TIMESTAMP UTC, ignore any timezone suffix and store the parsed
+    // timestamp fields as-is, not subject to session timezone adjustment.
+    return conversionResult.value().timestamp;
+  }
   auto sessionTimezone = config_.sessionTimezone().empty()
       ? nullptr
       : tz::locateZone(config_.sessionTimezone());
@@ -71,7 +83,7 @@ Expected<Timestamp> SparkCastHooks::castIntToTimestamp(int64_t seconds) const {
   return castNumberToTimestamp(seconds);
 }
 
-Expected<int64_t> SparkCastHooks::castTimestampToInt(
+Expected<int64_t> SparkCastHooks::castTimestampToBigint(
     Timestamp timestamp) const {
   auto micros = timestamp.toMicros();
   if (micros < 0) {
@@ -124,6 +136,12 @@ StringView SparkCastHooks::removeWhiteSpaces(const StringView& view) const {
   stringImpl::trimUnicodeWhiteSpace<true, true, StringView, StringView>(
       output, view);
   return output;
+}
+
+void SparkCastHooks::castDateTimestampToGMT(
+    Timestamp& timestamp,
+    const tz::TimeZone& timeZone) const {
+  toGMTWithGapCorrection(timestamp, timeZone);
 }
 
 exec::PolicyType SparkCastHooks::getPolicy() const {

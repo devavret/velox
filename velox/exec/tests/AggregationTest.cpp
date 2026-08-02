@@ -37,12 +37,14 @@
 #include "velox/exec/prefixsort/PrefixSortEncoder.h"
 #include "velox/exec/tests/utils/ArbitratorTestUtil.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
+#include "velox/exec/tests/utils/BackpressureTestNode.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/SumNonPODAggregate.h"
-#include "velox/exec/tests/utils/TempFilePath.h"
+
 #include "velox/type/tests/utils/CustomTypesForTesting.h"
+#include "velox/vector/LazyVector.h"
 
 namespace facebook::velox::exec::test {
 
@@ -359,7 +361,7 @@ class AggregationTest : public HiveConnectorTestBase {
   }
 
   // Makes batches which reference rows in 'rows' via dictionary. The
-  // dictionary indices are given by 'order', wich has values with
+  // dictionary indices are given by 'order', which has values with
   // indices plus random bits so as to create randomly scattered,
   // sometimes repeated values.
   void makeBatches(
@@ -1636,6 +1638,95 @@ TEST_F(AggregationTest, groupingSetsEmptyInput) {
       }));
 }
 
+// Multi-driver empty input emits exactly one grand-total default row for the ()
+// set, not one per empty driver. The barrier fires on both the single-step and
+// the partial step.
+TEST_F(AggregationTest, globalGroupingSetDefaultRowMultiDriverEmpty) {
+  auto data = makeRowVector(
+      {"a"}, {makeFlatVector<int64_t>(std::vector<int64_t>{1, 2, 3, 4})});
+
+  // One default row: a null for the () set, group_id 1, count 0.
+  auto expected = makeRowVector({
+      makeNullableFlatVector<int64_t>({std::nullopt}),
+      makeFlatVector<int64_t>(std::vector<int64_t>{1}),
+      makeFlatVector<int64_t>(std::vector<int64_t>{0}),
+  });
+
+  // A local partition fans the empty GroupId output across drivers. When
+  // 'split' is true, a partial + final aggregation also exercises the partial
+  // step.
+  auto run = [&](bool split) {
+    core::PlanNodeId rawInputAggId;
+    PlanBuilder builder(std::make_shared<core::PlanNodeIdGenerator>());
+    builder.values({data})
+        .filter("a < 0")
+        .groupId({"a"}, {{"a"}, {}}, {})
+        .localPartition({"a", "group_id"});
+    if (split) {
+      builder.partialAggregation({"a", "group_id"}, {"count(1) as count_1"}, {})
+          .capturePlanNodeId(rawInputAggId)
+          .localPartition({})
+          .finalAggregation();
+    } else {
+      builder.singleAggregation({"a", "group_id"}, {"count(1) as count_1"})
+          .capturePlanNodeId(rawInputAggId);
+    }
+    auto task = AssertQueryBuilder(builder.planNode())
+                    .maxDrivers(4)
+                    .assertResults(expected);
+    // The raw-input aggregation must run on multiple drivers to exercise the
+    // peer barrier.
+    EXPECT_GT(toPlanStats(task->taskStats()).at(rawInputAggId).numDrivers, 1)
+        << (split ? "partial+final" : "single-step");
+  };
+  run(/*split=*/false);
+  run(/*split=*/true);
+}
+
+// Skewed non-empty input (all rows on one key) must not emit a spurious
+// count==0 default row from the starved drivers, for either the single-step or
+// the partial + final aggregation.
+TEST_F(AggregationTest, globalGroupingSetDefaultRowMultiDriverNonEmpty) {
+  auto data = makeRowVector(
+      {"a"}, {makeFlatVector<int64_t>(std::vector<int64_t>{1, 1, 1, 1})});
+
+  // Two rows: per-key (1, 0, 4) and grand total (null, 1, 4). No count==0 row.
+  auto expected = makeRowVector({
+      makeNullableFlatVector<int64_t>({1, std::nullopt}),
+      makeFlatVector<int64_t>(std::vector<int64_t>{0, 1}),
+      makeFlatVector<int64_t>(std::vector<int64_t>{4, 4}),
+  });
+
+  // A local partition fans the GroupId output across drivers. When 'split' is
+  // true, a partial + final aggregation also exercises the partial step.
+  auto run = [&](bool split) {
+    core::PlanNodeId rawInputAggId;
+    PlanBuilder builder(std::make_shared<core::PlanNodeIdGenerator>());
+    builder.values({data})
+        .filter("a >= 0")
+        .groupId({"a"}, {{"a"}, {}}, {})
+        .localPartition({"a", "group_id"});
+    if (split) {
+      builder.partialAggregation({"a", "group_id"}, {"count(1) as count_1"}, {})
+          .capturePlanNodeId(rawInputAggId)
+          .localPartition({})
+          .finalAggregation();
+    } else {
+      builder.singleAggregation({"a", "group_id"}, {"count(1) as count_1"})
+          .capturePlanNodeId(rawInputAggId);
+    }
+    auto task = AssertQueryBuilder(builder.planNode())
+                    .maxDrivers(4)
+                    .assertResults(expected);
+    // The raw-input aggregation must run on multiple drivers to exercise the
+    // peer barrier.
+    EXPECT_GT(toPlanStats(task->taskStats()).at(rawInputAggId).numDrivers, 1)
+        << (split ? "partial+final" : "single-step");
+  };
+  run(/*split=*/false);
+  run(/*split=*/true);
+}
+
 TEST_F(AggregationTest, disableNonBooleanMasks) {
   auto data = makeRowVector(
       {"c0", "c1"},
@@ -2491,6 +2582,100 @@ TEST_F(AggregationTest, distinctWithPreGroupedKeysAcrossBatches) {
                   .planNode();
   AssertQueryBuilder(plan, duckDbQueryRunner_)
       .assertResults("SELECT DISTINCT c0, c1 FROM tmp");
+}
+
+namespace {
+// VectorLoader whose hook branch streams values through ValueHook and leaves
+// the result VectorPtr null.
+template <typename T>
+class HookOnlyLazyLoader : public VectorLoader {
+ public:
+  HookOnlyLazyLoader(
+      memory::MemoryPool* pool,
+      std::function<T(vector_size_t)> valueAt,
+      vector_size_t size)
+      : pool_(pool), valueAt_(std::move(valueAt)), size_(size) {}
+
+  bool supportsHook() const override {
+    return true;
+  }
+
+ protected:
+  void loadInternal(
+      RowSet rows,
+      ValueHook* hook,
+      vector_size_t resultSize,
+      VectorPtr* result) override {
+    if (hook != nullptr) {
+      for (vector_size_t i = 0; i < rows.size(); ++i) {
+        hook->addValueTyped(rows[i], valueAt_(rows[i]));
+      }
+      return;
+    }
+    BaseVector::ensureWritable(
+        SelectivityVector::empty(), CppToType<T>::create(), pool_, *result);
+    auto* flat = (*result)->template asFlatVector<T>();
+    flat->resize(std::max<vector_size_t>(resultSize, size_));
+    for (vector_size_t i = 0; i < rows.size(); ++i) {
+      flat->set(rows[i], valueAt_(rows[i]));
+    }
+  }
+
+ private:
+  memory::MemoryPool* pool_;
+  std::function<T(vector_size_t)> valueAt_;
+  vector_size_t size_;
+};
+} // namespace
+
+TEST_F(AggregationTest, preGroupedSplitWithHookOnlyLazyChild) {
+  constexpr vector_size_t kSize = 1'024;
+  auto k1 = makeFlatVector<int64_t>(kSize, [](auto row) { return row / 256; });
+  auto k2 = makeFlatVector<int64_t>(kSize, [](auto row) { return row % 8; });
+  auto valueLazy = std::make_shared<LazyVector>(
+      pool(),
+      BIGINT(),
+      kSize,
+      std::make_unique<HookOnlyLazyLoader<int64_t>>(
+          pool(),
+          [](vector_size_t row) { return static_cast<int64_t>(row); },
+          kSize));
+  auto input = makeRowVector({"k1", "k2", "v"}, {k1, k2, valueLazy});
+
+  // `min(v)` exercises `SimpleNumericAggregate::pushdown<>`;
+  // `bitwise_or_agg(v)` exercises `SimpleNumericAggregate::updateGroups`.
+  auto plan = PlanBuilder()
+                  .values({input})
+                  .aggregation(
+                      {"k1", "k2"},
+                      {"k1"},
+                      {"min(v)", "bitwise_or_agg(v)"},
+                      {},
+                      core::AggregationNode::Step::kSingle,
+                      false)
+                  .planNode();
+
+  // Group (k1, k2) sees rows {k1*256 + k2 + 8*i : i in [0, 32)}.
+  // min = k1*256 + k2. For OR: low 3 bits = k2; bits 3..7 = OR over 8*i for
+  // i in [0, 31] = 248; bits 8+ = k1 << 8. So OR = (k1 << 8) | 248 | k2.
+  std::vector<int64_t> expectedK1(32);
+  std::vector<int64_t> expectedK2(32);
+  std::vector<int64_t> expectedMin(32);
+  std::vector<int64_t> expectedOr(32);
+  for (vector_size_t group = 0; group < 32; ++group) {
+    expectedK1[group] = group / 8;
+    expectedK2[group] = group % 8;
+    expectedMin[group] = expectedK1[group] * 256 + expectedK2[group];
+    expectedOr[group] = (expectedK1[group] << 8) | 248 | expectedK2[group];
+  }
+  auto expected = makeRowVector(
+      {"k1", "k2", "m", "o"},
+      {makeFlatVector<int64_t>(expectedK1),
+       makeFlatVector<int64_t>(expectedK2),
+       makeFlatVector<int64_t>(expectedMin),
+       makeFlatVector<int64_t>(expectedOr)});
+
+  AssertQueryBuilder(plan).assertResults(expected);
 }
 
 TEST_F(AggregationTest, preGroupedAggregationWithSpilling) {
@@ -5049,4 +5234,85 @@ TEST_F(AggregationTest, barrierExecutionSpillEnabledAggregationUnsupported) {
       "Barrier drain is not supported for spilled hash aggregation");
 }
 
+// Regression test for the distinct-mode buffer: a partial distinct aggregation
+// stores the input batch in input_ whenever the batch produced new groups, and
+// emits those groups from the following getOutput(). Distinct output is
+// produced purely incrementally -- there is no final table scan when nothing
+// spilled -- so a batch whose input_ is overwritten before it is drained loses
+// its rows permanently. Every key is unique, so a correct run emits exactly one
+// row per input row.
+TEST_F(AggregationTest, distinctNoRowLossWithBackpressuringDownstream) {
+  Operator::registerOperator(std::make_unique<BackpressureTranslator>());
+
+  const int32_t numBatches = 200;
+  const int32_t rowsPerBatch = 100;
+  const vector_size_t totalRows = numBatches * rowsPerBatch;
+  // One globally unique key per row, so a correct distinct aggregation emits
+  // exactly one row per input row.
+  std::vector<RowVectorPtr> batches;
+  batches.reserve(numBatches);
+  for (int32_t i = 0; i < numBatches; ++i) {
+    batches.push_back(makeRowVector({makeFlatVector<int64_t>(
+        rowsPerBatch, [&](auto row) { return i * rowsPerBatch + row; })}));
+  }
+
+  auto plan = PlanBuilder()
+                  .values(batches)
+                  .partialAggregation({"c0"}, {})
+                  .addNode([](const std::string& id, core::PlanNodePtr input) {
+                    return std::make_shared<BackpressureNode>(
+                        id, /*delayCycles=*/3, std::move(input));
+                  })
+                  .planNode();
+
+  // Single driver so the aggregation and the back-pressuring downstream share a
+  // pipeline.
+  auto result = AssertQueryBuilder(plan).maxDrivers(1).copyResults(pool());
+  EXPECT_EQ(result->size(), totalRows);
+}
+
+// Regression test for the abandoned-partial-aggregation buffer: once a partial
+// aggregation gives up (too little reduction at the memory ceiling), addInput()
+// stops aggregating and just parks the batch in input_ for getOutput() to pass
+// through via toIntermediate(). Capping both the partial and the extended
+// partial aggregation memory forces that state. Every key is unique, so the
+// aggregation is 1:1 both before and after it is abandoned, and a correct run
+// emits exactly one row per input row.
+TEST_F(
+    AggregationTest,
+    abandonedPartialAggNoRowLossWithBackpressuringDownstream) {
+  Operator::registerOperator(std::make_unique<BackpressureTranslator>());
+
+  const int32_t numBatches = 200;
+  const int32_t rowsPerBatch = 100;
+  const vector_size_t totalRows = numBatches * rowsPerBatch;
+  // One globally unique key per row, so the aggregation is 1:1 both before and
+  // after it is abandoned and must emit exactly one row per input row.
+  std::vector<RowVectorPtr> batches;
+  batches.reserve(numBatches);
+  for (int32_t i = 0; i < numBatches; ++i) {
+    batches.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             rowsPerBatch, [&](auto row) { return i * rowsPerBatch + row; }),
+         makeFlatVector<int64_t>(
+             rowsPerBatch, [&](auto row) { return i * rowsPerBatch + row; })}));
+  }
+
+  auto plan = PlanBuilder()
+                  .values(batches)
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .addNode([](const std::string& id, core::PlanNodePtr input) {
+                    return std::make_shared<BackpressureNode>(
+                        id, /*delayCycles=*/3, std::move(input));
+                  })
+                  .planNode();
+
+  auto result =
+      AssertQueryBuilder(plan)
+          .maxDrivers(1)
+          .config(QueryConfig::kMaxPartialAggregationMemory, "4096")
+          .config(QueryConfig::kMaxExtendedPartialAggregationMemory, "4096")
+          .copyResults(pool());
+  EXPECT_EQ(result->size(), totalRows);
+}
 } // namespace facebook::velox::exec::test

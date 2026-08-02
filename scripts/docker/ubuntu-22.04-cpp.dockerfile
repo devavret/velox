@@ -37,8 +37,11 @@ RUN apt update && \
 
 COPY scripts /velox/scripts/
 COPY CMake/resolve_dependency_modules/arrow/cmake-compatibility.patch /
+COPY CMake/resolve_dependency_modules/arrow/arrow-testing-boost.patch /
+COPY CMake/resolve_dependency_modules/fbthrift/compactv1-protocol-refiller.patch /
 
-ENV VELOX_ARROW_CMAKE_PATCH=/cmake-compatibility.patch \
+ENV VELOX_ARROW_CMAKE_PATCH="/cmake-compatibility.patch /arrow-testing-boost.patch" \
+    VELOX_FBTHRIFT_CMAKE_PATCH="/compactv1-protocol-refiller.patch" \
     UV_TOOL_BIN_DIR=/usr/local/bin \
     UV_INSTALL_DIR=/usr/local/bin
 
@@ -63,7 +66,7 @@ RUN apt-get update && \
 
 # Pre-download gflags source for BUNDLED builds to avoid downloading at build time.
 RUN mkdir -p /velox/deps-sources && \
-    curl -fsSL -o /velox/deps-sources/gflags-v2.2.2.tar.gz \
-      https://github.com/gflags/gflags/archive/refs/tags/v2.2.2.tar.gz
+    curl -fsSL -o /velox/deps-sources/gflags-v2.3.0.tar.gz \
+      https://github.com/gflags/gflags/archive/refs/tags/v2.3.0.tar.gz
 
 WORKDIR /velox

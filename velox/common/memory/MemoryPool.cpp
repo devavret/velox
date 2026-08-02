@@ -157,10 +157,6 @@ void treeMemoryUsageVisitor(
   });
 }
 
-std::string capacityToString(int64_t capacity) {
-  return capacity == kMaxMemory ? "UNLIMITED" : succinctBytes(capacity);
-}
-
 #define DEBUG_RECORD_ALLOC(pool, ...)         \
   if (FOLLY_UNLIKELY(pool->debugEnabled())) { \
     pool->recordAllocDbg(__VA_ARGS__);        \
@@ -655,6 +651,40 @@ void MemoryPoolImpl::free(void* p, int64_t size) {
   const auto alignedSize = sizeAlign(size);
   DEBUG_RECORD_FREE(p, size);
   allocator_->freeBytes(p, alignedSize);
+  release(alignedSize);
+}
+
+void* MemoryPoolImpl::allocateAligned(int64_t size, uint32_t alignment) {
+  VELOX_CHECK_GT(size, 0);
+  VELOX_CHECK(
+      bits::isPowerOfTwo(alignment),
+      "Alignment {} must be power of two.",
+      alignment);
+  const auto alignedSize = sizeAlign(size, alignment);
+  CHECK_AND_INC_MEM_OP_STATS(this, Allocs);
+  reserve(alignedSize);
+  void* buffer = allocator_->allocateBytes(alignedSize, alignment);
+  if (FOLLY_UNLIKELY(buffer == nullptr)) {
+    release(alignedSize);
+    VELOX_MEM_ALLOC_ERROR(
+        fmt::format(
+            "allocateAligned failed with {} aligned to {} from {} {}",
+            succinctBytes(size),
+            alignment,
+            toString(),
+            allocator_->getAndClearFailureMessage()));
+  }
+  return buffer;
+}
+
+void MemoryPoolImpl::freeAligned(
+    void* buffer,
+    int64_t size,
+    uint32_t alignment) {
+  VELOX_CHECK_NOT_NULL(buffer);
+  CHECK_AND_INC_MEM_OP_STATS(this, Frees);
+  const auto alignedSize = sizeAlign(size, alignment);
+  allocator_->freeBytes(buffer, alignedSize);
   release(alignedSize);
 }
 

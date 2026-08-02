@@ -24,6 +24,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/PrestoFunctions.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -162,6 +163,8 @@ void CudfTpchBenchmark::initialize() {
   }
 
   cudf_velox::registerCudf();
+  cudf_velox::registerPrestoFunctions(
+      cudf_velox::CudfConfig::getInstance().functionNamePrefix);
 
   if (FLAGS_preload != "off") {
     ensurePreloaded();

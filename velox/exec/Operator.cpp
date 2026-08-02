@@ -150,6 +150,21 @@ void Operator::finishTrace() {
   }
 }
 
+std::unique_ptr<Operator> Operator::PlanNodeTranslator::toOperator(
+    DriverCtx* /*ctx*/,
+    int32_t /*id*/,
+    const core::PlanNodePtr& /*node*/) {
+  return nullptr;
+}
+
+std::unique_ptr<Operator> Operator::PlanNodeTranslator::toOperator(
+    DriverCtx* /*ctx*/,
+    int32_t /*id*/,
+    const core::PlanNodePtr& /*node*/,
+    std::shared_ptr<ExchangeClient> /*exchangeClient*/) {
+  return nullptr;
+}
+
 std::vector<std::unique_ptr<Operator::PlanNodeTranslator>>&
 Operator::translators() {
   static std::vector<std::unique_ptr<PlanNodeTranslator>> translators;
@@ -538,6 +553,12 @@ void OperatorStats::addRuntimeStat(
     std::string_view name,
     const RuntimeCounter& value) {
   addOperatorRuntimeStats(name, value, runtimeStats);
+}
+
+void OperatorStats::setRuntimeStat(
+    std::string_view name,
+    const RuntimeMetric& metric) {
+  setOperatorRuntimeStats(name, metric, runtimeStats);
 }
 
 void OperatorStats::add(const OperatorStats& other) {

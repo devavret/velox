@@ -14,13 +14,174 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/expression/CommonFunctions.h"
+#include "velox/experimental/cudf/expression/DateTruncFunction.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
+#include "velox/experimental/cudf/expression/prestosql/DateAddFunction.h"
+#include "velox/experimental/cudf/expression/prestosql/DatePlusIntervalFunction.h"
+
+#include "velox/common/base/Exceptions.h"
+#include "velox/expression/ConstantExpr.h"
+#include "velox/expression/FunctionSignature.h"
+#include "velox/vector/BaseVector.h"
+
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/strings/slice.hpp>
+
+#include <memory>
+#include <optional>
 
 namespace facebook::velox::cudf_velox {
+namespace {
+
+void registerPrestoArrayAccessFunctions(const std::string& prefix) {
+  // Presto element_at is 1-based, allows negative indices from the end, and
+  // returns NULL for out-of-bounds indices.
+  registerArrayAccessFunction(
+      prefix + "element_at",
+      ArrayAccessPolicy{
+          .allowNegativeIndices = true,
+          .nullOnNegativeIndices = false,
+          .allowOutOfBound = true,
+          .indexStartsAtOne = true,
+      },
+      arrayAccessSignatures({"integer", "bigint"}));
+
+  // Presto subscript is 1-based and raises on negative or out-of-bounds
+  // indices.
+  registerArrayAccessFunction(
+      prefix + "subscript",
+      ArrayAccessPolicy{
+          .allowNegativeIndices = false,
+          .nullOnNegativeIndices = false,
+          .allowOutOfBound = false,
+          .indexStartsAtOne = true,
+      },
+      arrayAccessSignatures({"integer", "bigint"}));
+}
+
+class SubstrFunction : public CudfFunction {
+ public:
+  explicit SubstrFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    using velox::exec::ConstantExpr;
+
+    VELOX_CHECK_GE(
+        expr->inputs().size(), 2, "substr expects at least 2 inputs");
+    VELOX_CHECK_LE(expr->inputs().size(), 3, "substr expects at most 3 inputs");
+
+    auto startExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
+    VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");
+
+    auto startValue =
+        startExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+    start_ = static_cast<cudf::size_type>(startValue);
+    if (startValue >= 1) {
+      // cuDF indexing starts at 0.
+      // Presto indexing starts at 1.
+      // Positive indices need to subtract 1.
+      start_ = static_cast<cudf::size_type>(startValue - 1);
+    }
+
+    if (expr->inputs().size() > 2) {
+      auto lengthExpr =
+          std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[2]);
+      VELOX_CHECK_NOT_NULL(lengthExpr, "substr length must be a constant");
+
+      auto lengthValue =
+          lengthExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
+      // cuDF uses indices [begin, end).
+      // Presto uses length as the length of the substring.
+      // We compute the end as start + length.
+      end_ = start_ + static_cast<cudf::size_type>(lengthValue);
+      hasEnd_ = true;
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    const auto start = std::optional<cudf::size_type>{start_};
+    const auto end =
+        hasEnd_ ? std::optional<cudf::size_type>{end_} : std::nullopt;
+    const auto step = std::optional<cudf::size_type>{1};
+    return cudf::strings::slice_strings(inputCol, start, end, step, stream, mr);
+  }
+
+ private:
+  cudf::size_type start_{0};
+  cudf::size_type end_{0};
+  bool hasEnd_{false};
+};
+
+} // namespace
 
 void registerPrestoFunctions(const std::string& prefix) {
-  // Presto-specific functions will be registered here in the future
+  using exec::FunctionSignatureBuilder;
+
+  registerPrestoArrayAccessFunctions(prefix);
+
+  registerCudfFunctions(
+      {prefix + "substr", prefix + "substring"},
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<SubstrFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .constantArgumentType("bigint")
+           .constantArgumentType("bigint")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "plus",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<prestosql::DatePlusIntervalFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .argumentType("interval day to second")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "date_add",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<prestosql::DateAddFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("date")
+           .constantArgumentType("varchar")
+           .argumentType("bigint")
+           .argumentType("date")
+           .build()},
+      true,
+      prestosql::DateAddFunction::canEvaluate);
+
+  registerCudfFunction(
+      prefix + "date_trunc",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DateTruncFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("timestamp")
+           .constantArgumentType("varchar")
+           .argumentType("timestamp")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .constantArgumentType("varchar")
+           .argumentType("date")
+           .build()},
+      true,
+      DateTruncFunction::canEvaluate);
 }
 
 } // namespace facebook::velox::cudf_velox

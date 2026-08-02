@@ -15,7 +15,10 @@
  */
 #pragma once
 
+#include <limits>
 #include <string>
+#include <string_view>
+#include <utility>
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/config/Config.h"
 #include "velox/common/config/ConfigProperty.h"
@@ -32,36 +35,6 @@ class FileConfig {
   static const std::vector<config::ConfigProperty>& registeredProperties();
 
   // --- VELOX_HIVE_CONFIG_LEGACY properties ---
-
-  VELOX_HIVE_CONFIG_LEGACY(
-      kOrcUseColumnNamesSession,
-      kOrcUseColumnNames,
-      isOrcUseColumnNames,
-      "orc_use_column_names",
-      "orc.use-column-names",
-      bool,
-      false,
-      "Map ORC table field names to file field names using names, not indices.")
-
-  VELOX_HIVE_CONFIG_LEGACY(
-      kParquetUseColumnNamesSession,
-      kParquetUseColumnNames,
-      isParquetUseColumnNames,
-      "parquet_use_column_names",
-      "parquet.use-column-names",
-      bool,
-      false,
-      "Map Parquet table field names to file field names using names, not indices.")
-
-  VELOX_HIVE_CONFIG_LEGACY(
-      kAllowInt32NarrowingSession,
-      kAllowInt32Narrowing,
-      allowInt32Narrowing,
-      "allow_int32_narrowing",
-      "parquet.allow-int32-narrowing",
-      bool,
-      false,
-      "Allow reading INT32 Parquet columns as a narrower integer type.")
 
   VELOX_HIVE_CONFIG_LEGACY(
       kReadTimestampPartitionValueAsLocalTimeSession,
@@ -104,16 +77,6 @@ class FileConfig {
       "Speculative tail-read size in bytes for ORC files.")
 
   VELOX_HIVE_CONFIG_LEGACY(
-      kParquetFooterSpeculativeIoSizeSession,
-      kParquetFooterSpeculativeIoSize,
-      parquetFooterSpeculativeIoSize,
-      "parquet_footer_speculative_io_size",
-      "parquet.footer-speculative-io-size",
-      uint64_t,
-      256UL << 10,
-      "Speculative tail-read size in bytes for Parquet files.")
-
-  VELOX_HIVE_CONFIG_LEGACY(
       kNimbleFooterSpeculativeIoSizeSession,
       kNimbleFooterSpeculativeIoSize,
       nimbleFooterSpeculativeIoSize,
@@ -143,7 +106,25 @@ class FileConfig {
       false,
       "Preserve dictionary encoding for Nimble string column reads.")
 
+  VELOX_HIVE_CONFIG_LEGACY(
+      kNimbleLazyColumnIoSession,
+      kNimbleLazyColumnIo,
+      nimbleLazyColumnIo,
+      "nimble_lazy_column_io",
+      "nimble.lazy-column-io",
+      bool,
+      false,
+      "Defer I/O for projected columns without pushdown filters, remaining filters, or transforms.")
+
   // --- VELOX_HIVE_CONFIG properties ---
+
+  VELOX_HIVE_CONFIG_PROPERTY(
+      kUseColumnNamesSession,
+      "use_column_names",
+      bool,
+      false,
+      "Map table fields to file fields using names, not indices.")
+  static constexpr const char* kUseColumnNames = "use-column-names";
 
   VELOX_HIVE_CONFIG(
       kFileColumnNamesReadAsLowerCaseSession,
@@ -248,6 +229,17 @@ class FileConfig {
       true,
       "Enable selective Nimble reader.")
 
+  VELOX_HIVE_CONFIG(
+      kNimbleDirectBufferedInputEnabledSession,
+      nimbleDirectBufferedInputEnabled,
+      "nimble_direct_buffered_input_enabled",
+      bool,
+      false,
+      "Use DirectBufferedInput for Nimble reads. Loads streams in quanta "
+      "(loadQuantum-sized chunks) instead of full-stream reads. The first "
+      "quantum per stream is always issued; subsequent quanta are loaded on "
+      "demand. Small streams that fit in one quantum see no reduction. "
+      "Streams coalesced with eager columns may also be loaded early.")
   // --- VELOX_HIVE_CONFIG_PROPERTY properties ---
 
   VELOX_HIVE_CONFIG_PROPERTY(
@@ -272,7 +264,7 @@ class FileConfig {
       "reader.timestamp_unit",
       uint8_t,
       3,
-      "Unit for reading timestamps (0=second, 3=millisecond, 6=microsecond, 9=nanosecond).")
+      "Unit for reading timestamps (3=millisecond, 6=microsecond, 9=nanosecond).")
   static constexpr const char* kReadTimestampUnit = "reader.timestamp-unit";
 
   // --- Server-only properties (no macro) ---
@@ -284,13 +276,22 @@ class FileConfig {
   /// meta data together. Optimization to decrease the small IO requests.
   static constexpr const char* kFilePreloadThreshold = "file-preload-threshold";
 
-  explicit FileConfig(std::shared_ptr<const config::ConfigBase> config) {
+  explicit FileConfig(
+      std::shared_ptr<const config::ConfigBase> config,
+      std::string connectorConfigPrefix)
+      : connectorConfigPrefix_(std::move(connectorConfigPrefix)) {
     VELOX_CHECK_NOT_NULL(
         config, "Config is null for FileConfig initialization");
     config_ = std::move(config);
   }
 
   virtual ~FileConfig() = default;
+
+  /// Returns the connector-owned config prefix. For example, "hive" returns
+  /// "hive.".
+  static std::string makeConnectorConfigPrefix(std::string_view connectorName) {
+    return std::string(connectorName) + ".";
+  }
 
   int32_t maxCoalescedDistanceBytes(const config::ConfigBase* session) const;
 
@@ -300,11 +301,23 @@ class FileConfig {
 
   uint64_t filePreloadThreshold() const;
 
+  bool useColumnNames(const config::ConfigBase* session) const {
+    return session->get<bool>(
+        kUseColumnNamesSession,
+        config_->get<bool>(
+            connectorConfigPrefix_ + kUseColumnNames,
+            kUseColumnNamesSessionProperty::defaultValue));
+  }
+
   // Returns the timestamp unit used when reading timestamps from files.
   uint8_t readTimestampUnit(const config::ConfigBase* session) const;
 
   const std::shared_ptr<const config::ConfigBase>& config() const {
     return config_;
+  }
+
+  std::string_view connectorConfigPrefix() const {
+    return connectorConfigPrefix_;
   }
 
  protected:
@@ -341,6 +354,8 @@ class FileConfig {
   }
 
   std::shared_ptr<const config::ConfigBase> config_;
+  // Prefix used to extract connector-scoped format configs, e.g. "hive.".
+  const std::string connectorConfigPrefix_;
 };
 
 } // namespace facebook::velox::connector::hive

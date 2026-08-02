@@ -774,7 +774,7 @@ TEST_P(MemoryPoolTest, alignmentCheck) {
       0,
       MemoryAllocator::kMinAlignment,
       MemoryAllocator::kMinAlignment * 2,
-      MemoryAllocator::kMaxAlignment};
+      MemoryAllocator::kDefaultAlignment};
   for (const auto& alignment : alignments) {
     SCOPED_TRACE(fmt::format("alignment:{}", alignment));
     MemoryManager::Options options;
@@ -840,25 +840,18 @@ TEST_P(MemoryPoolTest, memoryCapExceptions) {
         ASSERT_TRUE(ex.isRetriable());
         if (useMmap_) {
           if (useCache_) {
-            ASSERT_EQ(
-                fmt::format(
-                    "allocate failed with 128.00MB from Memory Pool["
-                    "static_quota LEAF root[MemoryCapExceptions] "
-                    "parent[MemoryCapExceptions] MMAP track-usage {}]<max "
-                    "capacity 256.00MB capacity 256.00MB used 0B available 0B "
-                    "reservation [used 0B, reserved 0B, min 0B] counters [allocs "
-                    "1, frees 0, reserves 0, releases 0, collisions 0, "
-                    "external-allocs 0, external-frees 0, cumulative-external "
-                    "0B])> Failed to"
-                    " evict from cache state: AsyncDataCache:\nCache size: 0B "
-                    "tinySize: 0B large size: 0B\nCache entries: 0 read pins: "
-                    "0 write pins: 0 pinned shared: 0B pinned exclusive: 0B\n "
-                    "num write wait: 0 empty entries: 0\nCache access miss: 0 "
-                    "hit: 0 hit bytes: 0B eviction: 0 savable eviction: 0 eviction checks: 0 "
-                    "aged out: 0 stales: 0\nPrefetch entries: 0 bytes: 0B\nAlloc Megaclocks 0\n"
-                    "Allocated pages: 0 cached pages: 0\n",
-                    isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"),
-                ex.message());
+            ASSERT_THAT(
+                ex.message(),
+                HasSubstr(
+                    fmt::format(
+                        "allocate failed with 128.00MB from Memory Pool["
+                        "static_quota LEAF root[MemoryCapExceptions] "
+                        "parent[MemoryCapExceptions] MMAP track-usage {}]",
+                        isLeafThreadSafe_ ? "thread-safe"
+                                          : "non-thread-safe")));
+            ASSERT_THAT(
+                ex.message(),
+                HasSubstr("Failed to evict from cache state: AsyncDataCache:"));
           } else {
             ASSERT_EQ(
                 fmt::format(
@@ -878,25 +871,18 @@ TEST_P(MemoryPoolTest, memoryCapExceptions) {
           }
         } else {
           if (useCache_) {
-            ASSERT_EQ(
-                fmt::format(
-                    "allocate failed with 128.00MB from Memory Pool"
-                    "[static_quota LEAF root[MemoryCapExceptions] "
-                    "parent[MemoryCapExceptions] MALLOC track-usage {}]"
-                    "<max capacity 256.00MB capacity 256.00MB used 0B available "
-                    "0B reservation [used 0B, reserved 0B, min 0B] counters "
-                    "[allocs 1, frees 0, reserves 0, releases 0, collisions 0, "
-                    "external-allocs 0, external-frees 0, cumulative-external "
-                    "0B])>"
-                    " Failed to evict from cache state: AsyncDataCache:\nCache "
-                    "size: 0B tinySize: 0B large size: 0B\nCache entries: 0 "
-                    "read pins: 0 write pins: 0 pinned shared: 0B pinned "
-                    "exclusive: 0B\n num write wait: 0 empty entries: 0\nCache "
-                    "access miss: 0 hit: 0 hit bytes: 0B eviction: 0 savable eviction: 0 eviction "
-                    "checks: 0 aged out: 0 stales: 0\nPrefetch entries: 0 bytes: 0B\nAlloc Megaclocks"
-                    " 0\nAllocated pages: 0 cached pages: 0\n",
-                    isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"),
-                ex.message());
+            ASSERT_THAT(
+                ex.message(),
+                HasSubstr(
+                    fmt::format(
+                        "allocate failed with 128.00MB from Memory Pool"
+                        "[static_quota LEAF root[MemoryCapExceptions] "
+                        "parent[MemoryCapExceptions] MALLOC track-usage {}]",
+                        isLeafThreadSafe_ ? "thread-safe"
+                                          : "non-thread-safe")));
+            ASSERT_THAT(
+                ex.message(),
+                HasSubstr("Failed to evict from cache state: AsyncDataCache:"));
           } else {
             ASSERT_EQ(
                 fmt::format(
@@ -924,7 +910,7 @@ TEST(MemoryPoolTest, GetAlignment) {
     MemoryManager::Options options;
     options.allocatorCapacity = kMaxMemory;
     EXPECT_EQ(
-        MemoryAllocator::kMaxAlignment,
+        MemoryAllocator::kDefaultAlignment,
         MemoryManager{options}.addRootPool()->alignment());
   }
   {
@@ -934,6 +920,56 @@ TEST(MemoryPoolTest, GetAlignment) {
     MemoryManager manager{options};
     EXPECT_EQ(64, manager.addRootPool()->alignment());
   }
+}
+
+TEST(MemoryPoolTest, allocateAligned) {
+  MemoryManager::testingSetInstance({});
+  auto pool = memoryManager()->addLeafPool("allocateAlignedTest");
+
+  struct TestCase {
+    int64_t size;
+    uint32_t alignment;
+    std::string debugString() const {
+      return fmt::format("size={}, alignment={}", size, alignment);
+    }
+  };
+  std::vector<TestCase> testCases = {
+      {4'096, 4'096},
+      {8'192, 4'096},
+      {4'096, 128},
+      {1'024, 512},
+      {16'384, 4'096},
+  };
+
+  for (const auto& testCase : testCases) {
+    SCOPED_TRACE(testCase.debugString());
+    auto* buffer = pool->allocateAligned(testCase.size, testCase.alignment);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(buffer) % testCase.alignment, 0);
+    std::memset(buffer, 0x42, testCase.size);
+    pool->freeAligned(buffer, testCase.size, testCase.alignment);
+  }
+}
+
+TEST(MemoryPoolTest, allocateAlignedInvalidAlignment) {
+  MemoryManager::testingSetInstance({});
+  auto pool = memoryManager()->addLeafPool("allocateAlignedInvalidTest");
+
+  VELOX_ASSERT_THROW(pool->allocateAligned(4'096, 3), "power of two");
+  VELOX_ASSERT_THROW(pool->allocateAligned(0, 4'096), "");
+}
+
+TEST(MemoryPoolTest, allocateAlignedTracksUsage) {
+  MemoryManager::testingSetInstance({});
+  auto root =
+      memoryManager()->addRootPool("allocateAlignedUsageRoot", kMaxMemory);
+  auto pool = root->addLeafChild("allocateAlignedUsageTest");
+
+  const auto statsBefore = pool->stats();
+  auto* buffer = pool->allocateAligned(4'096, 4'096);
+  EXPECT_GT(pool->stats().numAllocs, statsBefore.numAllocs);
+  pool->freeAligned(buffer, 4'096, 4'096);
+  EXPECT_GT(pool->stats().numFrees, statsBefore.numFrees);
 }
 
 TEST_P(MemoryPoolTest, MemoryManagerGlobalCap) {

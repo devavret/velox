@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
@@ -32,6 +33,7 @@
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
+#include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/Validation.h"
@@ -57,6 +59,7 @@
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/Values.h"
+#include "velox/exec/Window.h"
 
 namespace facebook::velox::cudf_velox {
 
@@ -129,12 +132,20 @@ class TableScanAdapter : public OperatorAdapter {
     auto cudfHiveConnector = std::dynamic_pointer_cast<
         facebook::velox::cudf_velox::connector::hive::CudfHiveConnector>(
         connector);
-    if (!cudfHiveConnector) {
+    auto cudfIcebergConnector =
+        std::dynamic_pointer_cast<facebook::velox::cudf_velox::connector::hive::
+                                      iceberg::CudfIcebergConnector>(connector);
+
+    bool canRunOnGPU =
+        cudfHiveConnector != nullptr or cudfIcebergConnector != nullptr;
+
+    if (!canRunOnGPU) {
       LOG_FALLBACK(
-          "TableScan connector is not CudfHiveConnector, PlanNode id: {}",
+          "TableScan connector is not CudfHiveConnector or CudfIcebergConnector, PlanNode id: {}",
           planNode->id());
     }
-    return cudfHiveConnector != nullptr;
+
+    return canRunOnGPU;
   }
 
   bool acceptsGpuInput() const override {
@@ -433,6 +444,10 @@ class HashJoinProbeAdapter : public CudfHashJoinBaseAdapter {
         std::dynamic_pointer_cast<const core::HashJoinNode>(planNode);
 
     std::vector<std::unique_ptr<exec::Operator>> result;
+    if (CudfConfig::getInstance().concatOptimizationEnabled) {
+      result.push_back(
+          std::make_unique<CudfBatchConcat>(operatorId, ctx, joinPlanNode));
+    }
     result.push_back(
         std::make_unique<CudfHashJoinProbe>(operatorId, ctx, joinPlanNode));
     return result;
@@ -802,8 +817,9 @@ class AssignUniqueIdAdapter : public OperatorAdapter {
             operatorId,
             ctx,
             assignUniqueIdPlanNode,
-            assignUniqueIdPlanNode->taskUniqueId(),
-            assignUniqueIdPlanNode->uniqueIdCounter()));
+            ctx->task->planFragment().taskUniqueId.value_or(
+                assignUniqueIdPlanNode->taskUniqueId()),
+            ctx->task->uniqueRowIdPool()));
     return result;
   }
 };
@@ -970,6 +986,58 @@ class CallbackSinkAdapter : public OperatorAdapter {
   }
 };
 
+// WindowAdapter - Replaces with CudfWindow
+class WindowAdapter : public OperatorAdapter {
+ public:
+  WindowAdapter() : OperatorAdapter("Window") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::Window*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    auto windowNode =
+        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
+    if (!windowNode) {
+      return false;
+    }
+    std::string reason;
+    if (!CudfWindow::canRunOnGPU(*windowNode, &reason)) {
+      LOG_FALLBACK(
+          "{}, PlanNode id: {}",
+          reason.empty() ? "unknown" : reason,
+          planNode->id());
+      return false;
+    }
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto windowPlanNode =
+        std::dynamic_pointer_cast<const core::WindowNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfWindow>(operatorId, ctx, windowPlanNode));
+    return result;
+  }
+};
+
 /// GroupIdAdapter - Replaces with CudfGroupId
 class GroupIdAdapter : public OperatorAdapter {
  public:
@@ -1037,6 +1105,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<GroupIdAdapter>());
   registry.registerAdapter(std::make_unique<ValuesAdapter>());
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());
+  registry.registerAdapter(std::make_unique<WindowAdapter>());
 }
 
 } // namespace facebook::velox::cudf_velox

@@ -37,11 +37,13 @@ add_executable(
   DateTimeFunctionsTest.cpp
   DecimalArithmeticTest.cpp
   DecimalCompareTest.cpp
+  DecimalCeilFloorTest.cpp
   DecimalRoundTest.cpp
   DecimalUtilTest.cpp
   ElementAtTest.cpp
   FactorialTest.cpp
   FilterTest.cpp
+  FormatNumberTest.cpp
   FromJsonTest.cpp
   FromToJsonRoundTripTest.cpp
   GetArrayStructFieldsTest.cpp
@@ -50,6 +52,7 @@ add_executable(
   HashTest.cpp
   InitcapTest.cpp
   InTest.cpp
+  IntervalArithmeticTest.cpp
   JsonArrayLengthTest.cpp
   JsonObjectKeysTest.cpp
   LeastGreatestTest.cpp
@@ -74,12 +77,14 @@ add_executable(
   SparkCastExprTest.cpp
   XORShiftRandomTest.cpp
   SparkPartitionIdTest.cpp
+  SparkQueryConfigTest.cpp
   SplitTest.cpp
   StringTest.cpp
   StringToMapTest.cpp
   ToJsonTest.cpp
   ToPrettyStringTest.cpp
   TransformTest.cpp
+  TransformValuesTest.cpp
   UnBase64Test.cpp
   UnscaledValueFunctionTest.cpp
   UpperLowerTest.cpp

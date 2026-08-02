@@ -126,11 +126,11 @@ class Operator : public BaseRuntimeStatWriter {
     virtual ~PlanNodeTranslator() = default;
 
     /// Translates plan node to operator. Returns nullptr if the plan node
-    /// cannot be handled by this factory.
+    /// cannot be handled by this factory. Defined out-of-line in Operator.cpp
+    /// because returning `std::unique_ptr<Operator>` here would instantiate
+    /// the unique_ptr destructor while `Operator` is still incomplete.
     virtual std::unique_ptr<Operator>
-    toOperator(DriverCtx* ctx, int32_t id, const core::PlanNodePtr& node) {
-      return nullptr;
-    }
+    toOperator(DriverCtx* ctx, int32_t id, const core::PlanNodePtr& node);
 
     /// An overloaded method that should be called when the operator needs an
     /// ExchangeClient.
@@ -138,9 +138,7 @@ class Operator : public BaseRuntimeStatWriter {
         DriverCtx* ctx,
         int32_t id,
         const core::PlanNodePtr& node,
-        std::shared_ptr<ExchangeClient> exchangeClient) {
-      return nullptr;
-    }
+        std::shared_ptr<ExchangeClient> exchangeClient);
 
     /// Translates plan node to join bridge. Returns nullptr if the plan node
     /// cannot be handled by this factory.
@@ -361,6 +359,12 @@ class Operator : public BaseRuntimeStatWriter {
   void addRuntimeStat(std::string_view name, const RuntimeCounter& value)
       override {
     stats_.wlock()->addRuntimeStat(name, value);
+  }
+
+  /// Sets a runtime metric on operator stats, overriding any existing value.
+  void setRuntimeStat(std::string_view name, const RuntimeMetric& metric)
+      override {
+    stats_.wlock()->setRuntimeStat(name, metric);
   }
 
   /// Returns reference to the operator stats synchronized object to gain bulk

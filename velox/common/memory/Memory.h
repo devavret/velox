@@ -66,7 +66,7 @@ class MemoryManager {
   struct Options {
     Options() {}
     /// Specifies the default memory allocation alignment.
-    uint16_t alignment{MemoryAllocator::kMaxAlignment};
+    uint16_t alignment{MemoryAllocator::kDefaultAlignment};
 
     /// If true, enable memory usage tracking in the default memory pool.
     bool trackDefaultUsage{
@@ -162,7 +162,7 @@ class MemoryManager {
     /// The string kind of memory arbitrator used in the memory manager.
     ///
     /// NOTE: the arbitrator will only be created if its kind is set explicitly.
-    /// Otherwise MemoryArbitrator::create returns a nullptr.
+    /// Otherwise MemoryArbitrator::create returns a NoopArbitrator.
     std::string arbitratorKind{};
 
     /// Provided by the query system to validate the state after a memory pool
@@ -240,7 +240,7 @@ class MemoryManager {
   /// 'name'. If 'name' is missing, the memory manager generates a default name
   /// internally to ensure uniqueness. The leaf memory pool is created as the
   /// child of the memory manager's default root memory pool. If 'threadSafe' is
-  /// true, then we track its memory usage in a non-thread-safe mode to reduce
+  /// false, then we track its memory usage in a non-thread-safe mode to reduce
   /// its cpu cost.
   std::shared_ptr<MemoryPool> addLeafPool(
       const std::string& name = "",

@@ -53,6 +53,7 @@ def git_changed_lines(commit):
             if (
                 "cudf/" not in matched_file
                 and "wave/" not in matched_file
+                and "ucx-exchange/" not in matched_file
                 and not matched_file.endswith("-inl.h")
             ):
                 file = matched_file
@@ -83,7 +84,11 @@ def tidy(args):
 
     # Exclude files in cudf, wave, and torchwave directories
     # as clang-tidy doesn't support CUDA compiler flags and CUDA headers
-    files = [file for file in files if "cudf/" not in file and "wave/" not in file]
+    files = [
+        file
+        for file in files
+        if "cudf/" not in file and "wave/" not in file and "ucx-exchange/" not in file
+    ]
 
     # Exclude *-inl.h files: they are designed to be included from their
     # corresponding header and cannot be compiled as standalone translation
@@ -103,6 +108,17 @@ def tidy(args):
     fix = "--fix" if args.fix == "fix" else ""
     lines = f"'--line-filter={line_filter}'" if args.commit is not None else ""
 
+    # clang-tidy parses the GCC compile commands with its Clang frontend, which
+    # emits -Wnullability-completeness on core headers (e.g. StringView.h) when
+    # nullability qualifiers leak into a translation unit. The GCC compile
+    # commands lack the -Wno-nullability-completeness that CMakeLists.txt sets
+    # only for Clang builds, so under -Werror the warning escalates to an error.
+    # Pass the suppression as a real compiler flag. It must go through
+    # --extra-arg (appended after the command's -W flags) rather than the
+    # .clang-tidy ExtraArgs option, which clang-tidy 18.1.8 mis-parses as an
+    # input file.
+    extra_args = "--extra-arg=-Wno-nullability-completeness"
+
     ok = True
     build_path = args.p or os.getenv("BUILD_PATH")
     build_path_str = f"-p {build_path}" if build_path else ""
@@ -114,7 +130,7 @@ def tidy(args):
         return 0
 
     status, stdout, stderr = util.run(
-        f"xargs clang-tidy --format-style=file -header-filter='.*' --quiet {build_path_str} {fix} {lines}",
+        f"xargs clang-tidy --format-style=file -header-filter='.*' --quiet {extra_args} {build_path_str} {fix} {lines}",
         input=filtered_files,
     )
 
