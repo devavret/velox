@@ -9716,6 +9716,49 @@ TEST_F(HashJoinTest, innerJoinLazyGatherBatching) {
       .run();
 }
 
+TEST_F(HashJoinTest, filteredInnerJoinBatching) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  auto savedMax = config.batchSizeMaxThreshold;
+  config.batchSizeMaxThreshold = 7;
+  SCOPE_EXIT {
+    config.batchSizeMaxThreshold = savedMax;
+  };
+
+  auto run = [&](const std::string& filter) {
+    auto probeVectors = makeBatches(1, [&](int32_t) {
+      return makeRowVector(
+          {makeFlatVector<int32_t>(10, [](auto) { return 1; })});
+    });
+    auto buildVectors = makeBatches(1, [&](int32_t) {
+      return makeRowVector(
+          {makeFlatVector<int32_t>(10, [](auto) { return 1; })});
+    });
+
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .injectSpill(false)
+        .numDrivers(1)
+        .probeKeys({"c0"})
+        .probeVectors(std::move(probeVectors))
+        .buildKeys({"u_c0"})
+        .buildVectors(std::move(buildVectors))
+        .buildProjections({"c0 AS u_c0"})
+        .joinType(core::JoinType::kInner)
+        .joinFilter(filter)
+        .joinOutputLayout({"c0", "u_c0"})
+        .referenceQuery(
+            "SELECT t.c0, u.c0 FROM t JOIN u ON t.c0 = u.c0")
+        .verifier([](const std::shared_ptr<Task>& task, bool) {
+          const auto stats = toOperatorStats(task->taskStats());
+          ASSERT_EQ(stats.at("CudfHashJoinProbe").outputPositions, 100);
+          ASSERT_EQ(stats.at("CudfHashJoinProbe").outputVectors, 15);
+        })
+        .run();
+  };
+
+  run("c0 > 0");
+  run("c0 + u_c0 > 0");
+}
+
 TEST_F(HashJoinTest, rightJoinSplitsSingleBuildUnmatchedRows) {
   auto& config = cudf_velox::CudfConfig::getInstance();
   auto savedMax = config.batchSizeMaxThreshold;

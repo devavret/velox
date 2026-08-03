@@ -1095,19 +1095,22 @@ void CudfHashJoinProbe::innerJoin(
         stream,
         get_temp_mr());
 
-    if (joinNode_->filter()) {
-      VELOX_CHECK_LE(
-          leftJoinIndices->size(),
-          maxBatchRows(),
-          "Filtered cuDF hash join produced {} index pairs, exceeding the "
-          "configured batch limit of {}. Filtered join indices are not yet "
-          "processed in batches.",
-          leftJoinIndices->size(),
-          maxBatchRows());
+    if (!joinNode_->filter()) {
+      enqueuePendingIndices(
+          std::move(leftJoinIndices), std::move(rightJoinIndices), i);
+      continue;
+    }
+
+    VELOX_CHECK_EQ(leftJoinIndices->size(), rightJoinIndices->size());
+    for (size_t offset = 0; offset < leftJoinIndices->size();) {
+      const auto count =
+          std::min(maxBatchRows(), leftJoinIndices->size() - offset);
       auto leftIndicesCol = cudf::column_view{
-          cudf::device_span<cudf::size_type const>{*leftJoinIndices}};
+          cudf::device_span<cudf::size_type const>{
+              leftJoinIndices->data() + offset, count}};
       auto rightIndicesCol = cudf::column_view{
-          cudf::device_span<cudf::size_type const>{*rightJoinIndices}};
+          cudf::device_span<cudf::size_type const>{
+              rightJoinIndices->data() + offset, count}};
       if (useAstFilter_) {
         auto [filteredLeft, filteredRight] = cudf::filter_join_indices(
             extendedLeftView,
@@ -1142,9 +1145,7 @@ void CudfHashJoinProbe::innerJoin(
                 stream),
             stream);
       }
-    } else {
-      enqueuePendingIndices(
-          std::move(leftJoinIndices), std::move(rightJoinIndices), i);
+      offset += count;
     }
   }
 }
@@ -1274,6 +1275,13 @@ void CudfHashJoinProbe::leftJoin(
       continue;
     }
 
+    VELOX_CHECK_LE(
+        leftJoinIndices->size(),
+        static_cast<size_t>(std::numeric_limits<cudf::size_type>::max()),
+        "cuDF left hash join produced {} index pairs, exceeding the maximum "
+        "column size of {}. Left join index batching is not yet supported.",
+        leftJoinIndices->size(),
+        std::numeric_limits<cudf::size_type>::max());
     auto leftIndicesSpan =
         cudf::device_span<cudf::size_type const>{*leftJoinIndices};
     auto rightIndicesSpan =
