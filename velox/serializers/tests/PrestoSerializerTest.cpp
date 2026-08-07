@@ -1130,6 +1130,43 @@ TEST_P(PrestoSerializerTest, multiPage) {
   }
 }
 
+TEST_P(PrestoSerializerTest, nullCountInvalidatedAfterResultReuse) {
+  auto nonNull = makeRowVector({makeFlatVector<int64_t>({1, 2, 3})});
+  auto withNull = makeRowVector(
+      {makeNullableFlatVector<int64_t>({1, std::nullopt, 3})});
+
+  std::ostringstream out;
+  serialize(nonNull, &out, nullptr);
+  serialize(withNull, &out, nullptr);
+
+  auto bytes = out.str();
+  auto byteStream = toByteStream(bytes);
+  auto rowType = asRowType(nonNull->type());
+  auto paramOptions = getParamSerdeOptions(nullptr);
+  RowVectorPtr deserialized;
+
+  serde_->deserialize(
+      byteStream.get(),
+      pool_.get(),
+      rowType,
+      &deserialized,
+      0,
+      &paramOptions);
+  auto child = deserialized->childAt(0);
+  child->setNullCount(0);
+
+  serde_->deserialize(
+      byteStream.get(),
+      pool_.get(),
+      rowType,
+      &deserialized,
+      0,
+      &paramOptions);
+  child = deserialized->childAt(0);
+  EXPECT_TRUE(child->isNullAt(1));
+  EXPECT_FALSE(child->getNullCount().has_value());
+}
+
 TEST_P(PrestoSerializerTest, timestampWithNanosecondPrecision) {
   // Verify that nanosecond precision is preserved when the right options are
   // passed to the serde.

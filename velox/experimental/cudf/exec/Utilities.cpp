@@ -22,6 +22,8 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+#include <cudf/strings/utilities.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
@@ -66,6 +68,46 @@ vector_size_t checkedVectorSize(size_t rowCount) {
       static_cast<size_t>(std::numeric_limits<vector_size_t>::max()),
       "cuDF vector row count exceeds Velox vector size limit");
   return static_cast<vector_size_t>(rowCount);
+}
+
+void appendStringColumnBytes(
+    const cudf::column_view& column,
+    rmm::cuda_stream_view stream,
+    std::vector<int64_t>& bytes) {
+  if (column.type().id() == cudf::type_id::STRING) {
+    bytes.push_back(cudf::strings_column_view(column).chars_size(stream));
+    return;
+  }
+
+  for (cudf::size_type i = 0; i < column.num_children(); ++i) {
+    appendStringColumnBytes(column.child(i), stream, bytes);
+  }
+}
+
+std::vector<int64_t> stringColumnBytes(
+    const cudf::table_view& table,
+    rmm::cuda_stream_view stream) {
+  std::vector<int64_t> bytes;
+  for (const auto& column : table) {
+    appendStringColumnBytes(column, stream, bytes);
+  }
+  return bytes;
+}
+
+bool reachesOffset64Threshold(
+    const std::vector<int64_t>& runningBytes,
+    const std::vector<int64_t>& nextBytes,
+    int64_t threshold) {
+  VELOX_CHECK_EQ(runningBytes.size(), nextBytes.size());
+  for (size_t i = 0; i < runningBytes.size(); ++i) {
+    VELOX_CHECK_GE(runningBytes[i], 0);
+    VELOX_CHECK_GE(nextBytes[i], 0);
+    if (nextBytes[i] >= threshold ||
+        runningBytes[i] >= threshold - nextBytes[i]) {
+      return true;
+    }
+  }
+  return false;
 }
 } // namespace
 
@@ -184,14 +226,28 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
   cudf::detail::join_streams(inputStreams, stream);
 
   std::vector<std::unique_ptr<cudf::table>> outputTables;
-  auto const maxRows = maxBatchRows();
+  const auto maxRows = maxBatchRows();
+  const auto offset64Threshold = cudf::strings::get_offset64_threshold();
+  VELOX_CHECK_GT(offset64Threshold, 0);
+
   size_t startpos = 0;
   size_t runningRows = 0;
+  auto runningStringBytes = stringColumnBytes(tableViews.front(), stream);
+  std::fill(runningStringBytes.begin(), runningStringBytes.end(), 0);
+
   for (size_t i = 0; i < tableViews.size(); ++i) {
-    auto const numRows = static_cast<size_t>(tableViews[i].num_rows());
-    // If adding this table would exceed the limit, flush current batch
-    // [startpos, i).
-    if (runningRows > 0 && runningRows + numRows > maxRows) {
+    const auto numRows = static_cast<size_t>(tableViews[i].num_rows());
+    const auto nextStringBytes = stringColumnBytes(tableViews[i], stream);
+    const bool exceedsRows =
+        numRows > maxRows || runningRows > maxRows - numRows;
+    const bool requires64BitStringOffsets = reachesOffset64Threshold(
+        runningStringBytes, nextStringBytes, offset64Threshold);
+
+    // Besides the configured row limit, keep BatchConcat from introducing a
+    // large-strings column. Passing such a materialized result across the
+    // operator boundary can produce incorrect grouping keys. A single input
+    // that is already over the threshold is emitted alone.
+    if (runningRows > 0 && (exceedsRows || requires64BitStringOffsets)) {
       outputTables.push_back(
           cudf::concatenate(
               std::vector<cudf::table_view>(
@@ -200,9 +256,18 @@ std::vector<std::unique_ptr<cudf::table>> getConcatenatedTableBatched(
               mr));
       startpos = i;
       runningRows = 0;
+      std::fill(runningStringBytes.begin(), runningStringBytes.end(), 0);
     }
+
     runningRows += numRows;
+    for (size_t column = 0; column < runningStringBytes.size(); ++column) {
+      VELOX_CHECK_LE(
+          nextStringBytes[column],
+          std::numeric_limits<int64_t>::max() - runningStringBytes[column]);
+      runningStringBytes[column] += nextStringBytes[column];
+    }
   }
+
   // Flush the final batch [startpos, end).
   if (startpos < tableViews.size()) {
     outputTables.push_back(

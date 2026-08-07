@@ -22,10 +22,40 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
+#include <cstdlib>
+#include <optional>
+#include <string>
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::cudf_velox;
+
+namespace {
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* key, const char* value) : key_(key) {
+    if (const char* existing = std::getenv(key)) {
+      oldValue_ = std::string(existing);
+    }
+    setenv(key, value, 1);
+  }
+
+  ~ScopedEnvVar() {
+    if (oldValue_) {
+      setenv(key_.c_str(), oldValue_->c_str(), 1);
+    } else {
+      unsetenv(key_.c_str());
+    }
+  }
+
+ private:
+  std::string key_;
+  std::optional<std::string> oldValue_;
+};
+
+} // namespace
 
 class CudfBatchConcatTest : public OperatorTestBase {
  protected:
@@ -198,6 +228,45 @@ TEST_F(CudfBatchConcatTest, concatMergesAllOnFlushWithHighThreshold) {
   EXPECT_EQ(concatStats.inputVectors, 6);
   EXPECT_EQ(concatStats.outputVectors, 1)
       << "All batches should be merged into one on noMoreInput flush";
+}
+
+TEST_F(CudfBatchConcatTest, concatSplitsBeforeLargeStringOffsets) {
+  ScopedEnvVar enableLargeStrings("LIBCUDF_LARGE_STRINGS_ENABLED", "1");
+  ScopedEnvVar offset64Threshold("LIBCUDF_LARGE_STRINGS_THRESHOLD", "32");
+  updateCudfConfig(/*min=*/100, /*max=*/std::nullopt);
+  CudfConfig::getInstance().concatOptimizationEnabled = true;
+
+  std::vector<RowVectorPtr> vectors{
+      makeRowVector(
+          {makeFlatVector<std::string>({"aaaaaaaaaa", "bbbbbbbbbb"})}),
+      makeRowVector(
+          {makeFlatVector<std::string>({"aaaaaaaaaa", "bbbbbbbbbb"})})};
+  createDuckDbTable(vectors);
+
+  auto generator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId aggNodeId;
+  auto plan = PlanBuilder(generator)
+                  .addNode([&](auto id, auto pool) {
+                    return createFragmentedSource(vectors, generator);
+                  })
+                  .singleAggregation({"c0"}, {"count(*)"})
+                  .capturePlanNodeId(aggNodeId)
+                  .planNode();
+
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .plan(plan)
+          .maxDrivers(1)
+          .assertResults("SELECT c0, count(*) FROM tmp GROUP BY c0");
+
+  const auto planStats = toPlanStats(task->taskStats());
+  const auto& nodeStats = planStats.at(aggNodeId);
+  const auto concatIt = nodeStats.operatorStats.find("CudfBatchConcat");
+  ASSERT_NE(concatIt, nodeStats.operatorStats.end());
+  EXPECT_EQ(concatIt->second->inputVectors, 2);
+  EXPECT_EQ(concatIt->second->outputVectors, 2)
+      << "Two 20-byte string batches must stay separate at a 32-byte "
+         "offset64 threshold";
 }
 
 // Verifies correctness with grouped aggregation (non-global) and concat.

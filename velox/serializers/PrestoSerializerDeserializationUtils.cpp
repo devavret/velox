@@ -303,6 +303,9 @@ vector_size_t readNulls(
     const uint64_t* incomingNulls,
     int32_t numIncomingNulls,
     BaseVector& result) {
+  // The result vector may be reused from a previous page. Invalidate cached
+  // metadata before overwriting its null bitmap.
+  result.resetDataDependentFlags(nullptr);
   VELOX_DCHECK_LE(
       result.size(), resultOffset + (incomingNulls ? numIncomingNulls : size));
   if (source->readByte() == 0) {
