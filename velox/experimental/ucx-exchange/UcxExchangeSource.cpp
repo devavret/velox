@@ -518,7 +518,7 @@ void UcxExchangeSource::onMetadata(
       ptr->dataBuf = std::make_unique<rmm::device_buffer>(
           ptr->metadata.dataSizeBytes,
           stream,
-          cudf::get_current_device_resource_ref());
+          facebook::velox::cudf_velox::get_ucx_exchange_mr());
     } catch (const rmm::bad_alloc& e) {
       VLOG(0) << toString() << " *** RMM  failed to allocate: " << e.what();
       queue_->setError("Failed to alloc GPU memory"); // Let the operator know

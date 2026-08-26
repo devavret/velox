@@ -30,9 +30,15 @@ namespace facebook::velox::cudf_velox {
 extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>> mr_;
 extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
     output_mr_;
+extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
+    ucx_exchange_mr_;
 
 /// Returns the memory resource designated for output vector allocations.
 rmm::device_async_resource_ref get_output_mr();
+
+/// Returns the legacy-CUDA-backed pool used only for UCX exchange payloads.
+/// Stream-ordered CUDA allocations cannot be registered by the EFA provider.
+rmm::device_async_resource_ref get_ucx_exchange_mr();
 
 /**
  * @brief Creates a memory resource based on the given mode.

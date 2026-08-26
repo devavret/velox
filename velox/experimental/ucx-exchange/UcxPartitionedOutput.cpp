@@ -21,6 +21,7 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -588,7 +589,7 @@ void UcxPartitionedOutput::splitAndEnqueue(
   // routed to equalPartitionRowCountOnly instead and never arrive here.
   VELOX_CHECK_GT(tableView.num_columns(), 0);
   auto contiguousTables = cudf::contiguous_split(
-      tableView, offsets, stream, cudf::get_current_device_resource_ref());
+      tableView, offsets, stream, get_ucx_exchange_mr());
 
   // Synchronize the stream to ensure CUDA operations complete before enqueuing.
   // UCXX/UCX is not stream-aware, so without syncing, data could be sent before
