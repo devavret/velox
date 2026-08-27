@@ -354,15 +354,6 @@ void registerCudf() {
     output_mr_ = mr_;
   }
 
-#ifdef VELOX_ENABLE_UCX_EXCHANGE
-  if (CudfConfig::getInstance().exchange) {
-    // EFA cannot register stream-ordered CUDA allocations. Keep the general
-    // cuDF resource unchanged and use a small, growable legacy-CUDA-backed
-    // pool only for buffers that UCX may register for GPUDirect RDMA.
-    ucx_exchange_mr_ = cudf_velox::createMemoryResource("pool", 1);
-  }
-#endif
-
   exec::Operator::registerOperator(
       std::make_unique<CudfHashJoinBridgeTranslator>());
   exec::Operator::registerOperator(
