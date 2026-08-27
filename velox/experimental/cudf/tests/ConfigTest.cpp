@@ -1,3 +1,37 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/OperatorAdapters.h"
+#include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
+#include "velox/exec/OutputTransportRegistry.h"
+
+#include <gtest/gtest.h>
+
+namespace facebook::velox::cudf_velox::test {
+
+TEST(ConfigTest, cudfConfig) {
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfEnabled, "false"},
+      {CudfConfig::kCudfDebugEnabled, "true"},
+      {CudfConfig::kCudfMemoryResource, "arena"},
+      {CudfConfig::kCudfMemoryPercent, "25"},
+      {CudfConfig::kCudfFunctionNamePrefix, "presto"},
+      {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
+      {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kUcxExchange, "true"},
       {CudfConfig::kUcxxErrorHandling, "false"},
@@ -34,5 +68,25 @@
   ASSERT_EQ(config.exchangeCompressionPipelineThreads, 2);
   ASSERT_EQ(config.exchangeCompressionMinBytes, 268435456);
   ASSERT_DOUBLE_EQ(config.exchangeCompressionSafetyMargin, 1.5);
+}
+
+TEST(ConfigTest, ucxTransportRegistration) {
+  auto& config = CudfConfig::getInstance();
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfEnabled, "true"},
+      {CudfConfig::kUcxExchange, "true"}};
+  config.initialize(std::move(options));
+
+  exec::OutputTransportRegistry::unregisterAll();
+  registerAllOperatorAdapters();
+
+  auto entry = exec::OutputTransportRegistry::tryGet(
+      std::string{core::TransportKind::kUcx});
+  ASSERT_NE(entry, nullptr);
+  EXPECT_NE(
+      std::dynamic_pointer_cast<ucx_exchange::UcxOutputQueueManager>(
+          entry->manager),
+      nullptr);
+  exec::OutputTransportRegistry::unregisterAll();
 }
 } // namespace facebook::velox::cudf_velox::test
