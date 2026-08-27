@@ -1269,9 +1269,11 @@ void CudfGroupby::computeFinalGroupbyWithStreamingApi(CudfVectorPtr input) {
           inputRows);
 
       if (requiredCapacity > streamingGroupbyCapacity_) {
-        const auto geometricCapacity = cuda::std::saturating_add(
-            streamingGroupbyCapacity_,
-            std::max<size_t>(streamingGroupbyCapacity_ / 2, 1));
+        // Grow aggressively to reduce the number of transactional rebuilds.
+        const auto doubledCapacity = cuda::std::saturating_add(
+            streamingGroupbyCapacity_, streamingGroupbyCapacity_);
+        const auto geometricCapacity =
+            cuda::std::saturating_add(doubledCapacity, doubledCapacity);
         const auto newCapacity = std::min(
             std::max(requiredCapacity, geometricCapacity), safeCapacity);
 
