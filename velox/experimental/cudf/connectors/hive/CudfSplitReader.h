@@ -156,6 +156,12 @@ class CudfSplitReader : public NvtxHelper {
 
     // Owns the device data of the current pass.
     ByteRangeFetch fetch;
+
+    // Cache-only KvikIO reads started while preparing this pass. These fill
+    // AsyncDataCache but allocate no device buffers.
+    std::vector<std::future<size_t>> cachePrefetchTasks;
+
+    bool cachePrefetchStarted{false};
   };
 
   // Clear splitReaders and datasources after split has been fully processed.

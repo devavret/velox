@@ -39,6 +39,7 @@
 #include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/SpatialJoinBuild.h"
+#include "velox/exec/SplitPreloadTrace.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 
@@ -1813,6 +1814,9 @@ void Task::addSplitLocked(
       ++taskStats_.numQueuedTableScanSplits;
       taskStats_.queuedTableScanSplitWeights +=
           split.connectorSplit->splitWeight;
+      if (auto* trace = SplitPreloadTrace::get()) {
+        trace->descriptorQueued();
+      }
     }
   }
 
@@ -2187,6 +2191,15 @@ BlockingReason Task::getSplitOrFuture(
     const auto numQueuedBefore = taskStats_.numQueuedTableScanSplits;
     notBlocked = splitsStore->nextSplit(
         driverId, maxPreloadSplits, preload, split, future);
+    if (notBlocked && splitsState.sourceIsTableScan &&
+        split.hasConnectorSplit()) {
+      const auto* dataSource = split.connectorSplit->dataSource.get();
+      if (auto* trace = SplitPreloadTrace::get()) {
+        trace->splitSelected(
+            dataSource != nullptr,
+            dataSource != nullptr && dataSource->hasValue());
+      }
+    }
     // Wake status waiters when the scan split queue drains while more splits
     // may still arrive, so a coordinator can refill before the task starves.
     // Once noMoreSplits has been signaled there is nothing left to refill, so

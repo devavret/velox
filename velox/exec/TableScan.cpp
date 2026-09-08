@@ -18,6 +18,7 @@
 #include "velox/common/time/Timer.h"
 #include "velox/connectors/ConnectorRegistry.h"
 #include "velox/exec/OperatorType.h"
+#include "velox/exec/SplitPreloadTrace.h"
 #include "velox/exec/Task.h"
 
 using facebook::velox::common::testutil::TestValue;
@@ -508,7 +509,13 @@ void TableScan::checkPreload() {
         [ioExecutor,
          this](const std::shared_ptr<connector::ConnectorSplit>& split) {
           preload(split);
+          auto* trace = SplitPreloadTrace::get();
+          if (trace != nullptr) {
+            trace->preloadTaskQueued();
+          }
           ioExecutor->add([connectorSplit = split]() mutable {
+            SplitPreloadTrace::PrepareTaskExecution execution{
+                SplitPreloadTrace::get()};
             connectorSplit->dataSource->prepare();
             connectorSplit.reset();
           });

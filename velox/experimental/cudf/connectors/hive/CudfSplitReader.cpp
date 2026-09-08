@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/BufferedInputDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
+#include "velox/experimental/cudf/connectors/hive/KvikioCachingDataSource.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -64,6 +65,14 @@ bool isAbfsPath([[maybe_unused]] const std::string_view path) {
 #else
   return false;
 #endif
+}
+
+std::shared_ptr<cudf::io::datasource> makeKvikioDataSource(
+    const std::string& path,
+    folly::Executor* executor) {
+  auto sources = cudf::io::make_datasources(cudf::io::source_info{path});
+  return std::make_shared<KvikioCachingDataSource>(
+      std::move(sources.front()), path, executor);
 }
 
 // Rebuilds a struct/list column in-place after possibly transforming (e.g.,
@@ -300,7 +309,8 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
 
 void CudfSplitReader::startCurrentPassFetch() {
   if (passState_->currentPass >= passState_->passes.size() or
-      passState_->fetch.pending.valid() or passState_->isChunkingSetup) {
+      passState_->fetch.pending.valid() or
+      passState_->cachePrefetchStarted or passState_->isChunkingSetup) {
     return;
   }
 
@@ -313,7 +323,18 @@ void CudfSplitReader::startCurrentPassFetch() {
           ->all_column_chunks_byte_ranges(rowGroupIndices, readerOptions_)
           .first;
 
-  nvtxRangePush("startColumnChunkFetch");
+  if (auto* cachingSource =
+          dynamic_cast<KvikioCachingDataSource*>(dataSource_.get());
+      cachingSource != nullptr && cachingSource->cacheEnabled()) {
+    nvtxRangePush("startColumnChunkCachePrefetch");
+    passState_->cachePrefetchTasks =
+        cachingSource->prefetchRanges(columnChunkByteRanges);
+    passState_->cachePrefetchStarted = true;
+    nvtxRangePop();
+    return;
+  }
+
+  nvtxRangePush("startColumnChunkDeviceFetch");
   passState_->fetch = fetchByteRangesAsync(
       dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
   nvtxRangePop();
@@ -323,6 +344,26 @@ void CudfSplitReader::setupChunkingForCurrentPass(
     rmm::device_async_resource_ref mr) {
   // No-op when the fetch was already started while preparing the split.
   startCurrentPassFetch();
+
+  if (passState_->cachePrefetchStarted) {
+    nvtxRangePush("waitColumnChunkCachePrefetch");
+    for (auto& task : passState_->cachePrefetchTasks) {
+      task.get();
+    }
+    passState_->cachePrefetchTasks.clear();
+    passState_->cachePrefetchStarted = false;
+    nvtxRangePop();
+
+    const auto& rowGroupIndices = passState_->passes[passState_->currentPass];
+    const auto columnChunkByteRanges =
+        splitReader_
+            ->all_column_chunks_byte_ranges(rowGroupIndices, readerOptions_)
+            .first;
+    nvtxRangePush("copyCachedColumnChunksToDevice");
+    passState_->fetch = fetchByteRangesAsync(
+        dataSource_, columnChunkByteRanges, stream_, get_temp_mr());
+    nvtxRangePop();
+  }
 
   // Wait for all reads of the pass to complete.
   passState_->fetch.wait();
@@ -340,6 +381,12 @@ void CudfSplitReader::setupChunkingForCurrentPass(
 }
 
 void CudfSplitReader::releaseCurrentPassData() {
+  for (auto& task : passState_->cachePrefetchTasks) {
+    task.get();
+  }
+  passState_->cachePrefetchTasks.clear();
+  passState_->cachePrefetchStarted = false;
+
   // Reads still in flight write into the buffers about to be released.
   passState_->fetch.abandon();
   passState_->fetch = {};
@@ -390,9 +437,7 @@ void CudfSplitReader::setupCudfDataSource() {
   if (not useBufferedInput) {
     VLOG(1) << fmt::format(
         "Using KvikIO data source for file: {}", split_->filePath);
-    dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+    dataSource_ = makeKvikioDataSource(split_->filePath, executor_);
     return;
   }
 
@@ -420,9 +465,7 @@ void CudfSplitReader::setupCudfDataSource() {
     LOG(WARNING) << fmt::format(
         "Failed to generate file handle cache for file. Falling back to KvikIO. Path: {}",
         split_->filePath);
-    dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+    dataSource_ = makeKvikioDataSource(split_->filePath, executor_);
     return;
   }
 
@@ -454,9 +497,7 @@ void CudfSplitReader::setupCudfDataSource() {
     LOG(WARNING) << fmt::format(
         "Failed to create buffered input data source for file. Falling back to the KvikIO. Path: {}",
         split_->filePath);
-    dataSource_ = std::move(
-        cudf::io::make_datasources(cudf::io::source_info{split_->filePath})
-            .front());
+    dataSource_ = makeKvikioDataSource(split_->filePath, executor_);
     return;
   }
   dataSource_ =

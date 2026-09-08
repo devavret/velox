@@ -54,6 +54,7 @@ target_link_libraries(
     arrow
     velox_arrow_bridge
     velox_common_base
+    kvikio::kvikio
     velox_cudf_expression
     velox_cudf_hive_connector
     velox_cudf_iceberg_connector

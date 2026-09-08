@@ -39,9 +39,12 @@
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <kvikio/bounce_buffer.hpp>
+#include <kvikio/defaults.hpp>
 
 #include <cuda.h>
 
+#include <cstdlib>
 #include <iostream>
 
 static const std::string kCudfAdapterName = "cuDF";
@@ -315,6 +318,18 @@ void registerCudf() {
 
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
+
+  // A large remote-I/O thread pool otherwise grows KvikIO's CUDA-pinned
+  // bounce-buffer pool lazily while the first scan is running. cuMemHostAlloc
+  // serializes those first-use allocations and can block unrelated cuDF work.
+  // When requested, pay the same process-lifetime allocation cost here, after
+  // CUDA context initialization but before any query can submit remote I/O.
+  if (const auto* preallocate =
+          std::getenv("KVIKIO_REMOTE_IO_PREALLOCATE_BOUNCE_BUFFERS");
+      preallocate != nullptr && preallocate[0] == '1') {
+    kvikio::CudaPinnedBounceBufferPool::instance().reserve(
+        kvikio::defaults::num_threads());
+  }
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
