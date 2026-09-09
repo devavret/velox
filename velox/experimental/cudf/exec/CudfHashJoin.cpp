@@ -197,6 +197,13 @@ class ProbeMatchTracker {
 
 } // namespace
 
+HostJoinPartitions::~HostJoinPartitions() {
+  const bool hadStorage = std::any_of(partitions.begin(), partitions.end(),
+                                    [](const auto& p) { return !p.empty(); });
+  partitions.clear();
+  if (hadStorage) releaseHostSpillPages();
+}
+
 void HostJoinPartitions::append(
     cudf::table_view input,
     const std::vector<cudf::size_type>& keys,

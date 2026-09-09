@@ -12,11 +12,22 @@
 #include <mutex>
 #include <memory>
 #include <cuda_runtime_api.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace facebook::velox::cudf_velox {
 
 inline void checkHostSpillCuda(cudaError_t status) {
   VELOX_CHECK(status == cudaSuccess, "Host spill CUDA operation: {}", cudaGetErrorString(status));
+}
+
+inline void releaseHostSpillPages() {
+#if defined(__GLIBC__)
+  // Return free allocator pages after large retained datasets are released,
+  // instead of allowing consecutive queries to accumulate resident arenas.
+  malloc_trim(0);
+#endif
 }
 
 // Per-process bound: four 64 MiB CUDA-pinned staging buffers. Large retained

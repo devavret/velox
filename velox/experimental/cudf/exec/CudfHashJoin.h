@@ -49,6 +49,7 @@ struct HostJoinPartitions {
     size_t rawBytes{0};
   };
   explicit HostJoinPartitions(size_t count) : partitions(count) {}
+  ~HostJoinPartitions();
   std::vector<std::vector<Chunk>> partitions;
   std::shared_ptr<cudf::table> emptySchema;
   void append(cudf::table_view table,

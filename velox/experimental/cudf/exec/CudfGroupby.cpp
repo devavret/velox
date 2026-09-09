@@ -2028,6 +2028,7 @@ void CudfGroupby::doNoMoreInput() {
 
 void CudfGroupby::doClose() {
   hostPartitions_.clear();
+  if (hostPartitioning_) releaseHostSpillPages();
   if (streamingGroupby_ && streamingGroupbyStream_.has_value()) {
     // Match rebuild and finalization: wait before dropping persistent state
     // that an asynchronous aggregate or merge may still reference.
