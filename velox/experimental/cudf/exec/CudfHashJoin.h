@@ -143,6 +143,7 @@ class CudfHashJoinBuild : public CudfOperatorBase {
   ContinueFuture future_{ContinueFuture::makeEmpty()};
   size_t hostPartitionCount_{0};
   size_t hostBufferedBytes_{0};
+  size_t hostPartitionThreshold_{size_t{1} << 30};
   std::shared_ptr<HostJoinPartitions> hostBuild_;
 };
 

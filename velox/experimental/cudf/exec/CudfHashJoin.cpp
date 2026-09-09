@@ -211,11 +211,11 @@ void HostJoinPartitions::append(
   SCOPE_EXIT { nvtxRangePop(); };
   auto [table, offsets] = cudf::hash_partition(
       input, keys, static_cast<int>(partitions.size()),
-      cudf::hash_id::HASH_MURMUR3, cudf::DEFAULT_HASH_SEED, stream, get_temp_mr());
+      // Use the same independent seed on both join sides, not the exchange seed.
+      cudf::hash_id::HASH_MURMUR3, 0x9e3779b9U, stream, get_temp_mr());
   VELOX_CHECK_GE(offsets.size(), partitions.size());
   std::vector<cudf::size_type> cuts(offsets.begin()+1, offsets.begin()+partitions.size());
   auto packed = cudf::contiguous_split(table->view(), cuts, stream, get_temp_mr());
-  std::vector<HostJoinPartitions::Chunk*> added;
   SCOPE_EXIT { stream.synchronize(); };
   for (size_t p = 0; p < packed.size(); ++p) {
     if (packed[p].table.num_rows() == 0) {
@@ -223,15 +223,12 @@ void HostJoinPartitions::append(
     }
     auto& chunk = partitions[p].emplace_back();
     chunk.metadata = std::move(packed[p].data.metadata);
-    chunk.data.resize(packed[p].data.gpu_data->size());
-    added.push_back(&chunk);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(chunk.data.data(), packed[p].data.gpu_data->data(),
-        chunk.data.size(), cudaMemcpyDeviceToHost, stream.value()));
+    const auto* compression = std::getenv("VELOX_CUDF_HOST_JOIN_COMPRESSION");
+    downloadHostSpill(packed[p].data.gpu_data->data(), packed[p].data.gpu_data->size(),
+                      stream.value(), chunk.data, chunk.rawBytes,
+                      !compression || std::string_view(compression) != "0");
   }
   stream.synchronize();
-  for (auto* chunk : added) {
-    compressHostSpill(chunk->data, chunk->rawBytes);
-  }
 }
 
 std::unique_ptr<cudf::table> HostJoinPartitions::restore(
@@ -241,21 +238,13 @@ std::unique_ptr<cudf::table> HostJoinPartitions::restore(
     return cudf::empty_like(emptySchema->view());
   }
   std::vector<rmm::device_buffer> buffers;
-  std::vector<std::vector<uint8_t>> hostDecoded;
   std::vector<cudf::table_view> views;
   buffers.reserve(partitions[p].size());
-  hostDecoded.reserve(partitions[p].size());
   views.reserve(partitions[p].size());
   for (const auto& chunk : partitions[p]) {
     const auto bytes = chunk.rawBytes ? chunk.rawBytes : chunk.data.size();
-    const auto* source = chunk.data.data();
-    if (chunk.rawBytes) {
-      hostDecoded.push_back(decompressHostSpill(chunk.data, chunk.rawBytes));
-      source = hostDecoded.back().data();
-    }
     buffers.emplace_back(bytes, stream, get_temp_mr());
-    CUDF_CUDA_TRY(cudaMemcpyAsync(buffers.back().data(), source,
-        bytes, cudaMemcpyHostToDevice, stream.value()));
+    uploadHostSpill(buffers.back().data(), chunk.data, chunk.rawBytes, stream.value());
     views.push_back(cudf::unpack(chunk.metadata->data(),
         static_cast<const uint8_t*>(buffers.back().data())));
   }
@@ -373,6 +362,9 @@ CudfHashJoinBuild::CudfHashJoinBuild(
     hostPartitionCount_ = std::stoul(value);
     VELOX_USER_CHECK_LE(hostPartitionCount_, 256);
     VELOX_USER_CHECK(hostPartitionCount_ == 0 || hostPartitionCount_ >= 2);
+    if (const auto* threshold = std::getenv("VELOX_CUDF_HOST_JOIN_THRESHOLD")) {
+      hostPartitionThreshold_ = std::stoull(threshold);
+    }
   }
 }
 
@@ -383,7 +375,7 @@ void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
     VELOX_CHECK_NOT_NULL(cudfInput);
     if (hostPartitionCount_ > 0) {
       hostBufferedBytes_ += cudfInput->estimateFlatSize();
-      if (hostBuild_ || hostBufferedBytes_ > (size_t{1} << 30)) {
+      if (hostBuild_ || hostBufferedBytes_ > hostPartitionThreshold_) {
         std::vector<cudf::size_type> keys;
         const auto type = joinNode_->sources()[1]->outputType();
         for (const auto& key : joinNode_->rightKeys()) {
