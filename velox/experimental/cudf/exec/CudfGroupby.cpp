@@ -1832,8 +1832,10 @@ void CudfGroupby::appendHostPartitions(
   }
   nvtxRangePushA("FinalGroupby::partitionToHost");
   SCOPE_EXIT { nvtxRangePop(); };
+  std::vector<cudf::size_type> keys(groupingKeyOutputChannels_.begin(),
+                                   groupingKeyOutputChannels_.end());
   auto [partitioned, offsets] = cudf::hash_partition(
-      input, groupingKeyOutputChannels_, static_cast<int>(hostPartitionCount_),
+      input, keys, static_cast<int>(hostPartitionCount_),
       cudf::hash_id::HASH_MURMUR3, cudf::DEFAULT_HASH_SEED, stream, get_temp_mr());
   VELOX_CHECK_GE(offsets.size(), hostPartitionCount_);
   std::vector<cudf::size_type> cuts(offsets.begin() + 1,
