@@ -1623,6 +1623,16 @@ void CudfGroupby::computeFinalGroupbyIncrementally(CudfVectorPtr tbl) {
       cudf::concatenate(tablesToConcat, finalStream, get_temp_mr());
   cudf::detail::join_streams(
       std::vector<rmm::cuda_stream_view>{finalStream}, inputTableStream);
+
+  // The concatenation owns a copy of the previous intermediate result. Drop
+  // that result before allocating the next hash table and aggregation output.
+  // Its deallocation is ordered on finalStream after the concatenation, so
+  // asynchronous users of the old table have completed before storage is reused.
+  // Keeping it until after aggregate() adds a full accumulated result to the
+  // peak, which can exhaust memory even when the new aggregation fits by itself.
+  bufferedResult_.reset();
+  tablesToConcat.clear();
+
   auto compactedOutput = doGroupByAggregation(
       concatenatedTable->view(),
       groupingKeyOutputChannels_,
