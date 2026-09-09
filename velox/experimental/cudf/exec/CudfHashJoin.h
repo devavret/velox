@@ -40,6 +40,23 @@ namespace facebook::velox::cudf_velox {
 class CudaEvent;
 class CudfExpression;
 
+// Experimental CPU storage for bounded inner/left hash joins. Published build
+// partitions are immutable and may be shared by several probe drivers.
+struct HostJoinPartitions {
+  struct Chunk {
+    std::unique_ptr<std::vector<uint8_t>> metadata;
+    std::vector<uint8_t> data;
+  };
+  explicit HostJoinPartitions(size_t count) : partitions(count) {}
+  std::vector<std::vector<Chunk>> partitions;
+  std::shared_ptr<cudf::table> emptySchema;
+  void append(cudf::table_view table,
+              const std::vector<cudf::size_type>& keys,
+              rmm::cuda_stream_view stream);
+  std::unique_ptr<cudf::table> restore(size_t partition,
+                                     rmm::cuda_stream_view stream) const;
+};
+
 /**
  * @brief Bridge for transferring build-side hash tables between build and probe
  * operators.
@@ -76,6 +93,9 @@ class CudfHashJoinBridge : public exec::JoinBridge {
 
   std::shared_ptr<CudaEvent> getBuildReadyEvent();
 
+  void setHostBuild(std::shared_ptr<HostJoinPartitions> data);
+  std::shared_ptr<HostJoinPartitions> getHostBuild();
+
  private:
   /** @brief Hash tables and join objects transferred from build to probe
    * operators */
@@ -84,6 +104,7 @@ class CudfHashJoinBridge : public exec::JoinBridge {
   std::optional<rmm::cuda_stream_view> buildStream_;
   /** @brief Event recorded after build-side CUDA work is ready for probes */
   std::shared_ptr<CudaEvent> buildReadyEvent_;
+  std::shared_ptr<HostJoinPartitions> hostBuild_;
 };
 
 /**
@@ -119,6 +140,9 @@ class CudfHashJoinBuild : public CudfOperatorBase {
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   std::vector<CudfVectorPtr> inputs_;
   ContinueFuture future_{ContinueFuture::makeEmpty()};
+  size_t hostPartitionCount_{0};
+  size_t hostBufferedBytes_{0};
+  std::shared_ptr<HostJoinPartitions> hostBuild_;
 };
 
 /**
@@ -178,6 +202,11 @@ class CudfHashJoinProbe : public CudfOperatorBase {
 
  private:
   void waitForBuildReady(rmm::cuda_stream_view stream);
+  RowVectorPtr nextHostJoinPartition();
+  std::shared_ptr<HostJoinPartitions> hostBuild_;
+  std::unique_ptr<HostJoinPartitions> hostProbe_;
+  size_t hostPartitionIndex_{0};
+  bool insideHostPartition_{false};
 
   std::shared_ptr<const core::HashJoinNode> joinNode_;
   /** @brief Hash tables and join objects received from build operator */

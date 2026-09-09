@@ -34,6 +34,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/filling.hpp>
@@ -42,6 +43,7 @@
 #include <cudf/join/join.hpp>
 #include <cudf/join/mixed_join.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/reshape.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
@@ -56,6 +58,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <iterator>
 #include <optional>
 
@@ -193,7 +196,73 @@ class ProbeMatchTracker {
 
 } // namespace
 
+void HostJoinPartitions::append(
+    cudf::table_view input,
+    const std::vector<cudf::size_type>& keys,
+    rmm::cuda_stream_view stream) {
+  if (!emptySchema) {
+    emptySchema = cudf::empty_like(input);
+  }
+  if (input.num_rows() == 0) {
+    return;
+  }
+  nvtxRangePushA("HashJoin::partitionToHost");
+  SCOPE_EXIT { nvtxRangePop(); };
+  auto [table, offsets] = cudf::hash_partition(
+      input, keys, static_cast<int>(partitions.size()),
+      cudf::hash_id::HASH_MURMUR3, cudf::DEFAULT_HASH_SEED, stream, get_temp_mr());
+  VELOX_CHECK_GE(offsets.size(), partitions.size());
+  std::vector<cudf::size_type> cuts(offsets.begin()+1, offsets.begin()+partitions.size());
+  auto packed = cudf::contiguous_split(table->view(), cuts, stream, get_temp_mr());
+  SCOPE_EXIT { stream.synchronize(); };
+  for (size_t p = 0; p < packed.size(); ++p) {
+    if (packed[p].table.num_rows() == 0) {
+      continue;
+    }
+    auto& chunk = partitions[p].emplace_back();
+    chunk.metadata = std::move(packed[p].data.metadata);
+    chunk.data.resize(packed[p].data.gpu_data->size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(chunk.data.data(), packed[p].data.gpu_data->data(),
+        chunk.data.size(), cudaMemcpyDeviceToHost, stream.value()));
+  }
+}
+
+std::unique_ptr<cudf::table> HostJoinPartitions::restore(
+    size_t p, rmm::cuda_stream_view stream) const {
+  VELOX_CHECK_NOT_NULL(emptySchema);
+  if (partitions[p].empty()) {
+    return cudf::empty_like(emptySchema->view());
+  }
+  std::vector<rmm::device_buffer> buffers;
+  std::vector<cudf::table_view> views;
+  buffers.reserve(partitions[p].size());
+  views.reserve(partitions[p].size());
+  for (const auto& chunk : partitions[p]) {
+    buffers.emplace_back(chunk.data.size(), stream, get_temp_mr());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(buffers.back().data(), chunk.data.data(),
+        chunk.data.size(), cudaMemcpyHostToDevice, stream.value()));
+    views.push_back(cudf::unpack(chunk.metadata->data(),
+        static_cast<const uint8_t*>(buffers.back().data())));
+  }
+  auto table = cudf::concatenate(views, stream, get_output_mr());
+  stream.synchronize();
+  return table;
+}
+
+void CudfHashJoinBridge::setHostBuild(std::shared_ptr<HostJoinPartitions> data) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  hostBuild_ = std::move(data);
+}
+
+std::shared_ptr<HostJoinPartitions> CudfHashJoinBridge::getHostBuild() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return hostBuild_;
+}
+
 void CudfHashJoinProbe::doClose() {
+  hostProbe_.reset();
+  hostBuild_.reset();
+  hashObject_.reset();
   Operator::close();
   filterEvaluator_.reset();
   scalars_.clear();
@@ -201,6 +270,7 @@ void CudfHashJoinProbe::doClose() {
 }
 
 void CudfHashJoinBuild::doClose() {
+  hostBuild_.reset();
   inputs_.clear();
   Operator::close();
 }
@@ -281,13 +351,42 @@ CudfHashJoinBuild::CudfHashJoinBuild(
           NvtxMethodFlag::kAll,
           std::nullopt, // spillConfig
           joinNode),
-      joinNode_(joinNode) {}
+      joinNode_(joinNode) {
+  if (const auto* value = std::getenv("VELOX_CUDF_HOST_JOIN_PARTITIONS");
+      value && (joinNode_->isInnerJoin() || joinNode_->isLeftJoin()) &&
+      !joinNode_->rightKeys().empty()) {
+    hostPartitionCount_ = std::stoul(value);
+    VELOX_USER_CHECK_LE(hostPartitionCount_, 256);
+    VELOX_USER_CHECK(hostPartitionCount_ == 0 || hostPartitionCount_ >= 2);
+  }
+}
 
 void CudfHashJoinBuild::doAddInput(RowVectorPtr input) {
   // Queue inputs, process all at once.
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     VELOX_CHECK_NOT_NULL(cudfInput);
+    if (hostPartitionCount_ > 0) {
+      hostBufferedBytes_ += cudfInput->estimateFlatSize();
+      if (hostBuild_ || hostBufferedBytes_ > (size_t{1} << 30)) {
+        std::vector<cudf::size_type> keys;
+        const auto type = joinNode_->sources()[1]->outputType();
+        for (const auto& key : joinNode_->rightKeys()) {
+          keys.push_back(type->getChildIdx(key->name()));
+        }
+        if (!hostBuild_) {
+          hostBuild_ = std::make_shared<HostJoinPartitions>(hostPartitionCount_);
+          for (const auto& old : inputs_) {
+            hostBuild_->append(old->getTableView(), keys, old->stream());
+          }
+          inputs_.clear();
+        }
+        hostBuild_->append(cudfInput->getTableView(), keys, cudfInput->stream());
+        stats_.wlock()->addRuntimeStat("hostJoinBuildBytes",
+                                      RuntimeCounter(cudfInput->estimateFlatSize()));
+        return;
+      }
+    }
     // Count nulls in join key columns
     auto [_, null_count] = cudf::bitmask_and(
         cudfInput->getTableView(), cudfInput->stream(), get_temp_mr());
@@ -327,6 +426,21 @@ void CudfHashJoinBuild::doNoMoreInput() {
         std::make_move_iterator(build->inputs_.begin()),
         std::make_move_iterator(build->inputs_.end()));
     build->inputs_.clear();
+    if (build->hostBuild_) {
+      if (!hostBuild_) {
+        hostBuild_ = std::make_shared<HostJoinPartitions>(hostPartitionCount_);
+      }
+      if (!hostBuild_->emptySchema) {
+        hostBuild_->emptySchema = build->hostBuild_->emptySchema;
+      }
+      for (size_t p = 0; p < hostPartitionCount_; ++p) {
+        auto& src = build->hostBuild_->partitions[p];
+        auto& dst = hostBuild_->partitions[p];
+        dst.insert(dst.end(), std::make_move_iterator(src.begin()), std::make_move_iterator(src.end()));
+        src.clear();
+      }
+      build->hostBuild_.reset();
+    }
     auto retainedInputBatches = build->inputs_.size();
     common::testutil::TestValue::adjust(
         "facebook::velox::cudf_velox::CudfHashJoinBuild::doNoMoreInput::sourceDriverRetainedInputBatchesAfterTransfer",
@@ -352,6 +466,26 @@ void CudfHashJoinBuild::doNoMoreInput() {
       VLOG(1) << "Build batch " << i
               << ": number of rows: " << inputs_[i]->getTableView().num_rows();
     }
+  }
+
+  if (hostBuild_) {
+    std::vector<cudf::size_type> keys;
+    const auto type = joinNode_->sources()[1]->outputType();
+    for (const auto& key : joinNode_->rightKeys()) {
+      keys.push_back(type->getChildIdx(key->name()));
+    }
+    for (const auto& input : inputs_) {
+      hostBuild_->append(input->getTableView(), keys, input->stream());
+    }
+    inputs_.clear();
+    auto bridge = std::dynamic_pointer_cast<CudfHashJoinBridge>(
+        operatorCtx_->task()->getCustomJoinBridge(operatorCtx_->driverCtx()->splitGroupId,
+                                                 planNodeId()));
+    VELOX_CHECK_NOT_NULL(bridge);
+    VELOX_CHECK_NOT_NULL(hostBuild_->emptySchema);
+    bridge->setHostBuild(hostBuild_);
+    bridge->setHashTable(CudfHashJoinBridge::hash_type{{hostBuild_->emptySchema}, {nullptr}});
+    return;
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
@@ -644,6 +778,13 @@ bool CudfHashJoinProbe::needsInput() const {
 }
 
 void CudfHashJoinProbe::doAddInput(RowVectorPtr input) {
+  if (hostBuild_) {
+    auto cv = std::dynamic_pointer_cast<CudfVector>(input);
+    VELOX_CHECK_NOT_NULL(cv);
+    hostProbe_->append(cv->getTableView(), leftKeyIndices_, cv->stream());
+    stats_.wlock()->addRuntimeStat("hostJoinProbeBytes", RuntimeCounter(cv->estimateFlatSize()));
+    return;
+  }
   if (skipInput_) {
     VELOX_CHECK_NULL(input_);
     return;
@@ -2162,7 +2303,60 @@ std::vector<CudfHashJoinProbe::JoinOutput> CudfHashJoinProbe::antiJoin(
   return cudfOutputs;
 }
 
+RowVectorPtr CudfHashJoinProbe::nextHostJoinPartition() {
+  auto stream = cudfGlobalStreamPool().get_stream();
+  while (hostPartitionIndex_ < hostBuild_->partitions.size()) {
+    const auto p = hostPartitionIndex_++;
+    if (hostProbe_->partitions[p].empty()) {
+      continue;
+    }
+    nvtxRangePushA("HashJoin::restoreAndProbeHostPartition");
+    SCOPE_EXIT { nvtxRangePop(); };
+    auto right = hostBuild_->restore(p, stream);
+    auto left = hostProbe_->restore(p, stream);
+    hostProbe_->partitions[p].clear();
+    auto hash = std::make_shared<cudf::hash_join>(right->view().select(rightKeyIndices_),
+        cudf::null_equality::UNEQUAL, stream, get_temp_mr());
+    std::shared_ptr<cudf::table> sharedRight = std::move(right);
+    hashObject_ = hash_type{{sharedRight}, {std::move(hash)}};
+    buildStream_ = stream;
+    buildReadyEvent_.reset();
+    cachedRightPrecomputed_.clear();
+    cachedExtendedRightViews_.clear();
+    if (joinNode_->filter() && !rightPrecomputeInstructions_.empty()) {
+      auto columns = tableViewToColumnViews(sharedRight->view());
+      auto precomputed = precomputeSubexpressions(columns, rightPrecomputeInstructions_,
+                                                  scalars_, buildType_, stream);
+      auto extended = createExtendedTableView(sharedRight->view(), precomputed);
+      cachedRightPrecomputed_.push_back(std::move(precomputed));
+      cachedExtendedRightViews_.push_back(extended);
+    }
+    const auto rows = left->num_rows();
+    input_ = std::make_shared<CudfVector>(pool(), probeType_, rows, std::move(left), stream);
+    // Reuse the regular inner/left implementation, including residual predicate
+    // handling and null extension, on exactly one matching hash partition.
+    insideHostPartition_ = true;
+    noMoreInput_ = false;
+    SCOPE_EXIT { insideHostPartition_ = false; noMoreInput_ = true; };
+    auto output = doGetOutput();
+    stream.synchronize();
+    cachedExtendedRightViews_.clear();
+    cachedRightPrecomputed_.clear();
+    hashObject_.reset();
+    stats_.wlock()->addRuntimeStat("hostJoinPartitions", RuntimeCounter(1));
+    finished_ = hostPartitionIndex_ == hostBuild_->partitions.size();
+    if (output) {
+      return output;
+    }
+  }
+  finished_ = true;
+  return nullptr;
+}
+
 RowVectorPtr CudfHashJoinProbe::doGetOutput() {
+  if (hostBuild_ && !insideHostPartition_) {
+    return noMoreInput_ && !finished_ ? nextHostJoinPartition() : nullptr;
+  }
   if (finished_ or !hashObject_.has_value()) {
     return nullptr;
   }
@@ -2351,6 +2545,9 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 }
 
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
+  if (hostBuild_) {
+    return exec::BlockingReason::kNotBlocked;
+  }
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
        joinNode_->isFullJoin()) &&
       hashObject_.has_value()) {
@@ -2380,6 +2577,11 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     return exec::BlockingReason::kWaitForJoinBuild;
   }
   hashObject_ = std::move(hashObject);
+  hostBuild_ = cudfJoinBridge->getHostBuild();
+  if (hostBuild_) {
+    hostProbe_ = std::make_unique<HostJoinPartitions>(hostBuild_->partitions.size());
+    return exec::BlockingReason::kNotBlocked;
+  }
   buildStream_ = cudfJoinBridge->getBuildStream();
   buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
 
@@ -2471,6 +2673,9 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
 }
 
 bool CudfHashJoinProbe::isFinished() {
+  if (hostBuild_) {
+    return finished_;
+  }
   auto const isFinished = finished_ || (noMoreInput_ && input_ == nullptr);
 
   // Release hashObject_ if finished
