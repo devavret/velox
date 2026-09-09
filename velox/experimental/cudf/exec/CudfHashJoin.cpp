@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/HostSpillCompression.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
@@ -214,6 +215,7 @@ void HostJoinPartitions::append(
   VELOX_CHECK_GE(offsets.size(), partitions.size());
   std::vector<cudf::size_type> cuts(offsets.begin()+1, offsets.begin()+partitions.size());
   auto packed = cudf::contiguous_split(table->view(), cuts, stream, get_temp_mr());
+  std::vector<HostJoinPartitions::Chunk*> added;
   SCOPE_EXIT { stream.synchronize(); };
   for (size_t p = 0; p < packed.size(); ++p) {
     if (packed[p].table.num_rows() == 0) {
@@ -222,8 +224,13 @@ void HostJoinPartitions::append(
     auto& chunk = partitions[p].emplace_back();
     chunk.metadata = std::move(packed[p].data.metadata);
     chunk.data.resize(packed[p].data.gpu_data->size());
+    added.push_back(&chunk);
     CUDF_CUDA_TRY(cudaMemcpyAsync(chunk.data.data(), packed[p].data.gpu_data->data(),
         chunk.data.size(), cudaMemcpyDeviceToHost, stream.value()));
+  }
+  stream.synchronize();
+  for (auto* chunk : added) {
+    compressHostSpill(chunk->data, chunk->rawBytes);
   }
 }
 
@@ -234,13 +241,21 @@ std::unique_ptr<cudf::table> HostJoinPartitions::restore(
     return cudf::empty_like(emptySchema->view());
   }
   std::vector<rmm::device_buffer> buffers;
+  std::vector<std::vector<uint8_t>> hostDecoded;
   std::vector<cudf::table_view> views;
   buffers.reserve(partitions[p].size());
+  hostDecoded.reserve(partitions[p].size());
   views.reserve(partitions[p].size());
   for (const auto& chunk : partitions[p]) {
-    buffers.emplace_back(chunk.data.size(), stream, get_temp_mr());
-    CUDF_CUDA_TRY(cudaMemcpyAsync(buffers.back().data(), chunk.data.data(),
-        chunk.data.size(), cudaMemcpyHostToDevice, stream.value()));
+    const auto bytes = chunk.rawBytes ? chunk.rawBytes : chunk.data.size();
+    const auto* source = chunk.data.data();
+    if (chunk.rawBytes) {
+      hostDecoded.push_back(decompressHostSpill(chunk.data, chunk.rawBytes));
+      source = hostDecoded.back().data();
+    }
+    buffers.emplace_back(bytes, stream, get_temp_mr());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(buffers.back().data(), source,
+        bytes, cudaMemcpyHostToDevice, stream.value()));
     views.push_back(cudf::unpack(chunk.metadata->data(),
         static_cast<const uint8_t*>(buffers.back().data())));
   }

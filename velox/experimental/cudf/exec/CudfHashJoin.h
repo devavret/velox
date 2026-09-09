@@ -46,6 +46,7 @@ struct HostJoinPartitions {
   struct Chunk {
     std::unique_ptr<std::vector<uint8_t>> metadata;
     std::vector<uint8_t> data;
+    size_t rawBytes{0};
   };
   explicit HostJoinPartitions(size_t count) : partitions(count) {}
   std::vector<std::vector<Chunk>> partitions;

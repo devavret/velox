@@ -216,6 +216,7 @@ class CudfGroupby : public CudfOperatorBase {
   struct HostAggregationChunk {
     std::unique_ptr<std::vector<uint8_t>> metadata;
     std::vector<uint8_t> data;
+    size_t rawBytes{0};
   };
   size_t hostPartitionCount_{0};
   size_t hostPartitionThreshold_{1073741824};

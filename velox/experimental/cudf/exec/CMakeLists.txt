@@ -52,6 +52,7 @@ target_link_libraries(
   PUBLIC cudf::cudf nvtx3::nvtx3-cpp
   PRIVATE
     arrow
+    lz4::lz4
     velox_arrow_bridge
     velox_common_base
     velox_cudf_expression

@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/HostSpillCompression.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
@@ -1842,6 +1843,7 @@ void CudfGroupby::appendHostPartitions(
                                    offsets.begin() + hostPartitionCount_);
   auto packed = cudf::contiguous_split(partitioned->view(), cuts, stream, get_temp_mr());
   uint64_t copied = 0;
+  std::vector<HostAggregationChunk*> added;
   // All host destinations remain alive until the copies complete. Pageable
   // buffers avoid permanently pinning the entire spill working set.
   SCOPE_EXIT { stream.synchronize(); };
@@ -1853,11 +1855,19 @@ void CudfGroupby::appendHostPartitions(
     auto& chunk = hostPartitions_[p].emplace_back();
     chunk.metadata = std::move(packed[p].data.metadata);
     chunk.data.resize(bytes);
+    added.push_back(&chunk);
     CUDF_CUDA_TRY(cudaMemcpyAsync(chunk.data.data(), packed[p].data.gpu_data->data(),
                                   bytes, cudaMemcpyDeviceToHost, stream.value()));
     copied += bytes;
   }
+  stream.synchronize();
+  uint64_t stored = 0;
+  for (auto* chunk : added) {
+    compressHostSpill(chunk->data, chunk->rawBytes);
+    stored += chunk->data.size();
+  }
   stats_.wlock()->addRuntimeStat("finalGroupbyHostBytes", RuntimeCounter(copied));
+  stats_.wlock()->addRuntimeStat("finalGroupbyStoredBytes", RuntimeCounter(stored));
 }
 
 CudfVectorPtr CudfGroupby::nextHostPartition() {
@@ -1870,13 +1880,21 @@ CudfVectorPtr CudfGroupby::nextHostPartition() {
     nvtxRangePushA("FinalGroupby::aggregateHostPartition");
     SCOPE_EXIT { nvtxRangePop(); };
     std::vector<rmm::device_buffer> restored;
+    std::vector<std::vector<uint8_t>> hostDecoded;
     std::vector<cudf::table_view> views;
     restored.reserve(chunks.size());
+    hostDecoded.reserve(chunks.size());
     views.reserve(chunks.size());
     for (const auto& chunk : chunks) {
-      restored.emplace_back(chunk.data.size(), stream, get_temp_mr());
-      CUDF_CUDA_TRY(cudaMemcpyAsync(restored.back().data(), chunk.data.data(),
-                                    chunk.data.size(), cudaMemcpyHostToDevice, stream.value()));
+      const auto bytes = chunk.rawBytes ? chunk.rawBytes : chunk.data.size();
+      const auto* source = chunk.data.data();
+      if (chunk.rawBytes) {
+        hostDecoded.push_back(decompressHostSpill(chunk.data, chunk.rawBytes));
+        source = hostDecoded.back().data();
+      }
+      restored.emplace_back(bytes, stream, get_temp_mr());
+      CUDF_CUDA_TRY(cudaMemcpyAsync(restored.back().data(), source,
+                                    bytes, cudaMemcpyHostToDevice, stream.value()));
       views.push_back(cudf::unpack(chunk.metadata->data(),
                                   static_cast<const uint8_t*>(restored.back().data())));
     }
@@ -1884,6 +1902,7 @@ CudfVectorPtr CudfGroupby::nextHostPartition() {
     stream.synchronize();
     views.clear();
     restored.clear();
+    hostDecoded.clear();
     chunks.clear();
     auto result = doGroupByAggregation(input->view(), groupingKeyOutputChannels_,
                                        aggregators_, outputType_, stream, get_output_mr());
