@@ -210,6 +210,19 @@ class CudfGroupby : public CudfOperatorBase {
   void computeFinalGroupbyIncrementally(CudfVectorPtr tbl);
   void computeSingleGroupbyIncrementally(CudfVectorPtr tbl);
 
+  void appendHostPartitions(cudf::table_view input, rmm::cuda_stream_view stream);
+  CudfVectorPtr nextHostPartition();
+
+  struct HostAggregationChunk {
+    std::unique_ptr<std::vector<uint8_t>> metadata;
+    std::vector<uint8_t> data;
+  };
+  size_t hostPartitionCount_{0};
+  size_t hostPartitionThreshold_{1073741824};
+  bool hostPartitioning_{false};
+  size_t nextHostPartition_{0};
+  std::vector<std::vector<HostAggregationChunk>> hostPartitions_;
+
   std::vector<column_index_t> groupingKeyInputChannels_;
   std::vector<column_index_t> groupingKeyOutputChannels_;
   std::vector<column_index_t> aggregationInputChannels_;

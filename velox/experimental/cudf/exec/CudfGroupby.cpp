@@ -33,8 +33,10 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/transform.hpp>
@@ -43,6 +45,7 @@
 #include <cuda/std/numeric>
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 namespace {
@@ -1532,6 +1535,23 @@ void CudfGroupby::initialize() {
       aggregationInput.constants,
       aggregationInput.maskChannels);
 
+  // Experimental bounded final aggregation. Only mergeable, non-streaming
+  // final aggregates are eligible; partial and single-step semantics stay intact.
+  if (const auto* value = std::getenv("VELOX_CUDF_FINAL_AGG_HOST_PARTITIONS");
+      value && !streamingGroupbyEnabled_ && incrementalAggregationEnabled_ &&
+      aggregationNode_->step() == core::AggregationNode::Step::kFinal &&
+      !groupingKeyOutputChannels_.empty()) {
+    hostPartitionCount_ = std::stoul(value);
+    VELOX_USER_CHECK_LE(hostPartitionCount_, 256);
+    if (hostPartitionCount_ > 0) {
+      VELOX_USER_CHECK_GE(hostPartitionCount_, 2);
+      hostPartitions_.resize(hostPartitionCount_);
+      if (const auto* threshold = std::getenv("VELOX_CUDF_FINAL_AGG_HOST_THRESHOLD")) {
+        hostPartitionThreshold_ = std::stoull(threshold);
+      }
+    }
+  }
+
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
   // output types reported by aggregation functions. We can't do that in cudf
@@ -1688,6 +1708,26 @@ void CudfGroupby::doAddInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
+  if (hostPartitionCount_ > 0) {
+    if (!hostPartitioning_ &&
+        (cudfInput->estimateFlatSize() +
+         (bufferedResult_ ? bufferedResult_->estimateFlatSize() : 0)) >
+            hostPartitionThreshold_) {
+      hostPartitioning_ = true;
+      if (bufferedResult_) {
+        appendHostPartitions(bufferedResult_->getTableView(), bufferedResult_->stream());
+        bufferedResult_.reset();
+      }
+    }
+    if (hostPartitioning_) {
+      appendHostPartitions(
+          cudfInput->getTableView().select(
+              aggregationInputChannels_.begin(), aggregationInputChannels_.end()),
+          cudfInput->stream());
+      return;
+    }
+  }
+
   if (streamingGroupbyEnabled_) {
     computeFinalGroupbyStreaming(std::move(cudfInput));
     return;
@@ -1784,7 +1824,84 @@ CudfVectorPtr CudfGroupby::releaseAndResetBufferedResult() {
   return std::move(bufferedResult_);
 }
 
+void CudfGroupby::appendHostPartitions(
+    cudf::table_view input,
+    rmm::cuda_stream_view stream) {
+  if (input.num_rows() == 0) {
+    return;
+  }
+  nvtxRangePushA("FinalGroupby::partitionToHost");
+  SCOPE_EXIT { nvtxRangePop(); };
+  auto [partitioned, offsets] = cudf::hash_partition(
+      input, groupingKeyOutputChannels_, static_cast<int>(hostPartitionCount_),
+      cudf::hash_id::HASH_MURMUR3, cudf::DEFAULT_HASH_SEED, stream, get_temp_mr());
+  VELOX_CHECK_GE(offsets.size(), hostPartitionCount_);
+  std::vector<cudf::size_type> cuts(offsets.begin() + 1,
+                                   offsets.begin() + hostPartitionCount_);
+  auto packed = cudf::contiguous_split(partitioned->view(), cuts, stream, get_temp_mr());
+  uint64_t copied = 0;
+  // All host destinations remain alive until the copies complete. Pageable
+  // buffers avoid permanently pinning the entire spill working set.
+  SCOPE_EXIT { stream.synchronize(); };
+  for (size_t p = 0; p < packed.size(); ++p) {
+    if (packed[p].table.num_rows() == 0) {
+      continue;
+    }
+    const auto bytes = packed[p].data.gpu_data->size();
+    auto& chunk = hostPartitions_[p].emplace_back();
+    chunk.metadata = std::move(packed[p].data.metadata);
+    chunk.data.resize(bytes);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(chunk.data.data(), packed[p].data.gpu_data->data(),
+                                  bytes, cudaMemcpyDeviceToHost, stream.value()));
+    copied += bytes;
+  }
+  stats_.wlock()->addRuntimeStat("finalGroupbyHostBytes", RuntimeCounter(copied));
+}
+
+CudfVectorPtr CudfGroupby::nextHostPartition() {
+  auto stream = cudfGlobalStreamPool().get_stream();
+  while (nextHostPartition_ < hostPartitions_.size()) {
+    auto& chunks = hostPartitions_[nextHostPartition_++];
+    if (chunks.empty()) {
+      continue;
+    }
+    nvtxRangePushA("FinalGroupby::aggregateHostPartition");
+    SCOPE_EXIT { nvtxRangePop(); };
+    std::vector<rmm::device_buffer> restored;
+    std::vector<cudf::table_view> views;
+    restored.reserve(chunks.size());
+    views.reserve(chunks.size());
+    for (const auto& chunk : chunks) {
+      restored.emplace_back(chunk.data.size(), stream, get_temp_mr());
+      CUDF_CUDA_TRY(cudaMemcpyAsync(restored.back().data(), chunk.data.data(),
+                                    chunk.data.size(), cudaMemcpyHostToDevice, stream.value()));
+      views.push_back(cudf::unpack(chunk.metadata->data(),
+                                  static_cast<const uint8_t*>(restored.back().data())));
+    }
+    auto input = cudf::concatenate(views, stream, get_temp_mr());
+    stream.synchronize();
+    views.clear();
+    restored.clear();
+    chunks.clear();
+    auto result = doGroupByAggregation(input->view(), groupingKeyOutputChannels_,
+                                       aggregators_, outputType_, stream, get_output_mr());
+    stream.synchronize();
+    stats_.wlock()->addRuntimeStat("finalGroupbyHostPartitions", RuntimeCounter(1));
+    if (nextHostPartition_ == hostPartitions_.size()) {
+      finished_ = true;
+    }
+    if (result) {
+      return result;
+    }
+  }
+  finished_ = true;
+  return nullptr;
+}
+
 RowVectorPtr CudfGroupby::doGetOutput() {
+  if (hostPartitioning_) {
+    return noMoreInput_ && !finished_ ? nextHostPartition() : nullptr;
+  }
   // Handle partial streaming groupby.
   if (isPartialOutput_ && incrementalAggregationEnabled_) {
     if (bufferedResult_ &&
@@ -1879,6 +1996,7 @@ void CudfGroupby::doNoMoreInput() {
 }
 
 void CudfGroupby::doClose() {
+  hostPartitions_.clear();
   if (streamingGroupby_ && streamingGroupbyStream_.has_value()) {
     // Match rebuild and finalization: wait before dropping persistent state
     // that an asynchronous aggregate or merge may still reference.
