@@ -15,6 +15,10 @@
 
 namespace facebook::velox::cudf_velox {
 
+inline void checkHostSpillCuda(cudaError_t status) {
+  VELOX_CHECK(status == cudaSuccess, "Host spill CUDA operation: {}", cudaGetErrorString(status));
+}
+
 // Per-process bound: four 64 MiB CUDA-pinned staging buffers. Large retained
 // spill datasets remain pageable and compressed. Acquire never holds the pool
 // mutex while executing CUDA operations or compression.
@@ -99,14 +103,14 @@ inline void downloadHostSpill(
   rawBytes = 0;
   if (bytes > HostSpillStaging::kBytes) {
     data.resize(bytes);
-    VELOX_CHECK_EQ(cudaMemcpyAsync(data.data(), device, bytes, cudaMemcpyDeviceToHost, stream), cudaSuccess);
-    VELOX_CHECK_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    checkHostSpillCuda(cudaMemcpyAsync(data.data(), device, bytes, cudaMemcpyDeviceToHost, stream));
+    checkHostSpillCuda(cudaStreamSynchronize(stream));
     if (compress) compressHostSpill(data, rawBytes);
     return;
   }
   HostSpillStagingLease lease;
-  VELOX_CHECK_EQ(cudaMemcpyAsync(lease.slot->data, device, bytes, cudaMemcpyDeviceToHost, stream), cudaSuccess);
-  VELOX_CHECK_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+  checkHostSpillCuda(cudaMemcpyAsync(lease.slot->data, device, bytes, cudaMemcpyDeviceToHost, stream));
+  checkHostSpillCuda(cudaStreamSynchronize(stream));
   if (!compress) {
     const auto* ptr = static_cast<const uint8_t*>(lease.slot->data);
     data.assign(ptr, ptr+bytes);
@@ -130,9 +134,9 @@ inline void uploadHostSpill(
   const auto bytes = rawBytes ? rawBytes : data.size();
   if (bytes > HostSpillStaging::kBytes) {
     auto decoded = rawBytes ? decompressHostSpill(data, rawBytes) : std::vector<uint8_t>{};
-    VELOX_CHECK_EQ(cudaMemcpyAsync(device, rawBytes ? decoded.data() : data.data(), bytes,
-                                   cudaMemcpyHostToDevice, stream), cudaSuccess);
-    VELOX_CHECK_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    checkHostSpillCuda(cudaMemcpyAsync(device, rawBytes ? decoded.data() : data.data(), bytes,
+                                   cudaMemcpyHostToDevice, stream));
+    checkHostSpillCuda(cudaStreamSynchronize(stream));
     return;
   }
   HostSpillStagingLease lease;
@@ -143,9 +147,9 @@ inline void uploadHostSpill(
   } else {
     std::memcpy(lease.slot->data, data.data(), bytes);
   }
-  VELOX_CHECK_EQ(cudaMemcpyAsync(device, lease.slot->data, bytes, cudaMemcpyHostToDevice, stream), cudaSuccess);
+  checkHostSpillCuda(cudaMemcpyAsync(device, lease.slot->data, bytes, cudaMemcpyHostToDevice, stream));
   // The staging lease must outlive DMA. It may then be reused by another driver.
-  VELOX_CHECK_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+  checkHostSpillCuda(cudaStreamSynchronize(stream));
 }
 
 } // namespace facebook::velox::cudf_velox
