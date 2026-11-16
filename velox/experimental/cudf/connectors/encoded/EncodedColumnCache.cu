@@ -85,8 +85,10 @@ __global__ void segmentMinMaxKernel(
     localMin = min(localMin, value);
     localMax = max(localMax, value);
   }
-  const int64_t blockMin = BlockReduce(minStorage).Reduce(localMin, cuda::minimum<>{});
-  const int64_t blockMax = BlockReduce(maxStorage).Reduce(localMax, cuda::maximum<>{});
+  const int64_t blockMin =
+      BlockReduce(minStorage).Reduce(localMin, cuda::minimum<>{});
+  const int64_t blockMax =
+      BlockReduce(maxStorage).Reduce(localMax, cuda::maximum<>{});
   if (threadIdx.x == 0) {
     outMin[blockIdx.x] = blockMin;
     outMax[blockIdx.x] = blockMax;
@@ -100,8 +102,8 @@ __global__ void packKernel(
     int32_t segmentRows,
     const SegmentParams* params,
     unsigned long long* words) {
-  const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x +
-      threadIdx.x;
+  const int64_t row =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row >= numRows) {
     return;
   }
@@ -117,7 +119,8 @@ __global__ void packKernel(
   atomicOr(&words[word], static_cast<unsigned long long>(value << shift));
   if (shift + p.bitWidth > 64) {
     atomicOr(
-        &words[word + 1], static_cast<unsigned long long>(value >> (64 - shift)));
+        &words[word + 1],
+        static_cast<unsigned long long>(value >> (64 - shift)));
   }
 }
 
@@ -133,8 +136,7 @@ unpack(const uint64_t* words, const SegmentParams& p, int64_t index) {
   if (shift + p.bitWidth > 64) {
     value |= words[word + 1] << (64 - shift);
   }
-  const uint64_t mask =
-      p.bitWidth == 64 ? ~0ULL : ((1ULL << p.bitWidth) - 1);
+  const uint64_t mask = p.bitWidth == 64 ? ~0ULL : ((1ULL << p.bitWidth) - 1);
   return p.base + static_cast<int64_t>(value & mask);
 }
 
@@ -213,21 +215,19 @@ void encodeForBitpack(
   rmm::device_uvector<int64_t> deviceMax(numSegments, stream, mr);
   if (numSegments > 0 && numRows > 0) {
     if (wide) {
-      segmentMinMaxKernel<int64_t>
-          <<<numSegments, kThreads, 0, stream.get()>>>(
-              values.data<int64_t>(),
-              numRows,
-              segmentRows,
-              deviceMin.data(),
-              deviceMax.data());
+      segmentMinMaxKernel<int64_t><<<numSegments, kThreads, 0, stream.get()>>>(
+          values.data<int64_t>(),
+          numRows,
+          segmentRows,
+          deviceMin.data(),
+          deviceMax.data());
     } else {
-      segmentMinMaxKernel<int32_t>
-          <<<numSegments, kThreads, 0, stream.get()>>>(
-              values.data<int32_t>(),
-              numRows,
-              segmentRows,
-              deviceMin.data(),
-              deviceMax.data());
+      segmentMinMaxKernel<int32_t><<<numSegments, kThreads, 0, stream.get()>>>(
+          values.data<int32_t>(),
+          numRows,
+          segmentRows,
+          deviceMin.data(),
+          deviceMax.data());
     }
     checkCuda(cudaGetLastError(), "segmentMinMaxKernel");
   }
@@ -266,7 +266,8 @@ void encodeForBitpack(
   }
   const int64_t numWords = static_cast<int64_t>(bitOffset / 64) + 1;
 
-  column.segmentParams = rmm::device_uvector<SegmentParams>(numSegments, stream, mr);
+  column.segmentParams =
+      rmm::device_uvector<SegmentParams>(numSegments, stream, mr);
   checkCuda(
       cudaMemcpyAsync(
           column.segmentParams.data(),
@@ -281,8 +282,7 @@ void encodeForBitpack(
           column.packed.data(), 0, numWords * sizeof(uint64_t), stream.get()),
       "clear packed words");
   if (numRows > 0) {
-    auto* words =
-        reinterpret_cast<unsigned long long*>(column.packed.data());
+    auto* words = reinterpret_cast<unsigned long long*>(column.packed.data());
     if (wide) {
       packKernel<int64_t><<<numBlocks(numRows), kThreads, 0, stream.get()>>>(
           values.data<int64_t>(),
@@ -368,15 +368,86 @@ std::unique_ptr<cudf::column> normalize(
 EncodedColumn::EncodedColumn(
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr)
-    : codec(Codec::kPlain), packed(0, stream, mr), segmentParams(0, stream, mr) {}
+    : codec(Codec::kPlain),
+      packed(0, stream, mr),
+      segmentParams(0, stream, mr) {}
 
-int64_t EncodedColumn::encodedBytes() const {
+int64_t EncodedColumn::hostBytes() const {
+  int64_t bytes = 0;
+  for (const auto& words : hostPacked) {
+    bytes += words.size() * sizeof(uint64_t);
+  }
+  for (const auto& piece : hostValues) {
+    bytes += piece->alloc_size();
+  }
+  return bytes;
+}
+
+int64_t EncodedColumn::deviceBytes() const {
   int64_t bytes = packed.size() * sizeof(uint64_t) +
       segmentParams.size() * sizeof(SegmentParams);
   if (values) {
     bytes += values->alloc_size();
   }
   return bytes;
+}
+
+int64_t EncodedTable::hostBytes() const {
+  int64_t bytes = 0;
+  for (const auto& column : columns) {
+    bytes += column->hostBytes();
+  }
+  return bytes;
+}
+
+int64_t EncodedTable::deviceBytes() const {
+  int64_t bytes = 0;
+  for (const auto& column : columns) {
+    bytes += column->deviceBytes();
+  }
+  return bytes;
+}
+
+void* BoundedPinnedHostResource::allocate_sync(
+    std::size_t bytes,
+    std::size_t /*alignment*/) {
+  if (bytes == 0) {
+    return nullptr;
+  }
+  auto& state = *state_;
+  const uint64_t limit = state.limitBytes.load();
+  const uint64_t used = state.usedBytes.fetch_add(bytes) + bytes;
+  if (limit != 0 && used > limit) {
+    state.usedBytes.fetch_sub(bytes);
+    throw EncodedHostBudgetExceeded(
+        "Encoded cache host memory limit exceeded: limit " +
+        std::to_string(limit) + " bytes, in use " +
+        std::to_string(used - bytes) + " bytes, requested " +
+        std::to_string(bytes) + " bytes");
+  }
+  void* pointer = nullptr;
+  const auto error = cudaHostAlloc(&pointer, bytes, cudaHostAllocDefault);
+  if (error != cudaSuccess) {
+    state.usedBytes.fetch_sub(bytes);
+    throw std::runtime_error(
+        "cudaHostAlloc of " + std::to_string(bytes) +
+        " bytes failed: " + cudaGetErrorString(error));
+  }
+  uint64_t peak = state.peakBytes.load();
+  while (used > peak && !state.peakBytes.compare_exchange_weak(peak, used)) {
+  }
+  return pointer;
+}
+
+void BoundedPinnedHostResource::deallocate_sync(
+    void* pointer,
+    std::size_t bytes,
+    std::size_t /*alignment*/) noexcept {
+  if (pointer == nullptr || bytes == 0) {
+    return;
+  }
+  cudaFreeHost(pointer);
+  state_->usedBytes.fetch_sub(bytes);
 }
 
 const EncodedColumn& EncodedTable::column(const std::string& columnName) const {
@@ -480,12 +551,14 @@ constexpr cudf::size_type kMaxDictionaryKeys = 1 << 16;
 // as each call parses the file footer again.
 constexpr int64_t kReadRows = 1 << 22;
 
-// Reads 'files' in runs of consecutive row groups of at least kReadRows rows,
-// or one row group if it is larger, and calls 'consume' with each run after
-// normalize(), and whether it is the last.
+// Reads 'columnNames' of 'files', or every column if that is empty, in runs
+// of consecutive row groups of at least kReadRows rows, or one row group if
+// it is larger. Calls 'consume' with each run after normalize(), and whether
+// it is the last.
 template <typename Consume>
 void forEachRowGroup(
     const std::vector<std::string>& files,
+    const std::vector<std::string>& columnNames,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     Consume consume) {
@@ -513,6 +586,9 @@ void forEachRowGroup(
                        cudf::io::source_info(files[file]))
                        .row_groups({groups})
                        .build();
+    if (!columnNames.empty()) {
+      options.set_column_names(columnNames);
+    }
     auto read = cudf::io::read_parquet(options, stream, mr);
     auto columns = read.tbl->release();
     for (auto& column : columns) {
@@ -527,16 +603,35 @@ void forEachRowGroup(
   }
 }
 
-// Bit-packed segments encoded piece by piece and stored in 'storageMr'.
-struct PackedPieces {
-  std::vector<rmm::device_uvector<uint64_t>> words;
+// One piece of a bit-packed stream, stored in the storage resource.
+struct PackedPiece {
+  // The packed words, without a padding word.
+  rmm::device_uvector<uint64_t> words;
+  // Params of the piece's segments, 'bitOffset' counted from the first word
+  // of the piece.
   std::vector<SegmentParams> params;
-  uint64_t numWords{0};
+  int64_t numRows;
 };
 
+// A column being loaded. Its pieces line up with those of the other columns
+// of the same load.
+struct ColumnLoad {
+  std::unique_ptr<EncodedColumn> column;
+  // kForBitpack values or kDictionary codes.
+  std::vector<PackedPiece> packed;
+  // kPlain values.
+  std::vector<std::unique_ptr<cudf::column>> plain;
+  // kDictionary: the distinct values in order of first appearance, the
+  // permutation that sorts them, and the sorted values. A code is an index
+  // into 'keys', so earlier pieces stay valid as 'keys' grows.
+  std::unique_ptr<cudf::column> keys;
+  std::unique_ptr<cudf::column> sortedOrder;
+  std::unique_ptr<cudf::column> sortedKeys;
+};
+
+// Bit-packs 'values' on the device and stores the words in 'storageMr'.
 void appendPacked(
-    EncodedColumn& column,
-    PackedPieces& pieces,
+    ColumnLoad& load,
     cudf::column_view values,
     int32_t segmentRows,
     cuda::stream_ref stream,
@@ -555,189 +650,358 @@ void appendPacked(
       "copy piece segment params");
   const uint64_t words = piece.packed.size() - 1;
   rmm::device_uvector<uint64_t> stored(words, stream, storageMr);
-  checkCuda(
-      cudaMemcpyAsync(
-          stored.data(),
-          piece.packed.data(),
-          words * sizeof(uint64_t),
-          cudaMemcpyDefault,
-          stream.get()),
-      "store packed words");
-  stream.sync();
-  for (auto p : params) {
-    p.bitOffset += pieces.numWords * 64;
-    pieces.params.push_back(p);
+  if (words > 0) {
+    checkCuda(
+        cudaMemcpyAsync(
+            stored.data(),
+            piece.packed.data(),
+            words * sizeof(uint64_t),
+            cudaMemcpyDefault,
+            stream.get()),
+        "store packed words");
   }
-  pieces.words.push_back(std::move(stored));
-  pieces.numWords += words;
+  stream.sync();
+  auto& column = *load.column;
   column.segmentMin.insert(
-      column.segmentMin.end(), piece.segmentMin.begin(), piece.segmentMin.end());
+      column.segmentMin.end(),
+      piece.segmentMin.begin(),
+      piece.segmentMin.end());
   column.segmentMax.insert(
-      column.segmentMax.end(), piece.segmentMax.begin(), piece.segmentMax.end());
+      column.segmentMax.end(),
+      piece.segmentMax.begin(),
+      piece.segmentMax.end());
   column.segmentBitWidth.insert(
       column.segmentBitWidth.end(),
       piece.segmentBitWidth.begin(),
       piece.segmentBitWidth.end());
+  load.packed.push_back(
+      PackedPiece{std::move(stored), std::move(params), values.size()});
 }
 
-void finishPacked(
-    EncodedColumn& column,
-    PackedPieces& pieces,
+// Decodes the INT32 codes of one stored piece on the device.
+std::unique_ptr<cudf::column> unpackPiece(
+    const PackedPiece& piece,
+    int32_t segmentRows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  const auto numSegments = piece.params.size();
+  rmm::device_uvector<uint64_t> words(piece.words.size() + 1, stream, mr);
+  if (piece.words.size() > 0) {
+    checkCuda(
+        cudaMemcpyAsync(
+            words.data(),
+            piece.words.data(),
+            piece.words.size() * sizeof(uint64_t),
+            cudaMemcpyDefault,
+            stream.get()),
+        "copy piece words");
+  }
+  checkCuda(
+      cudaMemsetAsync(
+          words.data() + piece.words.size(), 0, sizeof(uint64_t), stream.get()),
+      "clear padding word");
+  rmm::device_uvector<SegmentParams> params(numSegments, stream, mr);
+  checkCuda(
+      cudaMemcpyAsync(
+          params.data(),
+          piece.params.data(),
+          numSegments * sizeof(SegmentParams),
+          cudaMemcpyHostToDevice,
+          stream.get()),
+      "copy piece params");
+  std::vector<int32_t> ids(numSegments);
+  for (size_t s = 0; s < numSegments; ++s) {
+    ids[s] = static_cast<int32_t>(s);
+  }
+  rmm::device_uvector<int32_t> segments(numSegments, stream, mr);
+  checkCuda(
+      cudaMemcpyAsync(
+          segments.data(),
+          ids.data(),
+          numSegments * sizeof(int32_t),
+          cudaMemcpyHostToDevice,
+          stream.get()),
+      "copy piece segment ids");
+  auto out = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(piece.numRows),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  if (piece.numRows > 0) {
+    unpackKernel<int32_t>
+        <<<numBlocks(piece.numRows), kThreads, 0, stream.get()>>>(
+            words.data(),
+            params.data(),
+            segments.data(),
+            segmentRows,
+            nullptr,
+            piece.numRows,
+            out->mutable_view().data<int32_t>());
+    checkCuda(cudaGetLastError(), "unpackKernel");
+  }
+  stream.sync();
+  return out;
+}
+
+// Turns a kDictionary column being loaded into kPlain: its coded pieces
+// become the strings they stand for, stored in 'storageMr'.
+void toPlain(
+    ColumnLoad& load,
+    int32_t segmentRows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    rmm::device_async_resource_ref storageMr) {
+  for (auto& piece : load.packed) {
+    auto codes = unpackPiece(piece, segmentRows, stream, mr);
+    auto strings = cudf::gather(
+        cudf::table_view({load.keys->view()}),
+        codes->view(),
+        cudf::out_of_bounds_policy::DONT_CHECK,
+        stream,
+        storageMr);
+    load.plain.push_back(std::move(strings->release()[0]));
+    stream.sync();
+    // Release the coded piece before decoding the next one.
+    piece.words = rmm::device_uvector<uint64_t>(0, stream, storageMr);
+  }
+  load.packed.clear();
+  load.keys.reset();
+  load.sortedOrder.reset();
+  load.sortedKeys.reset();
+  auto& column = *load.column;
+  column.codec = Codec::kPlain;
+  column.segmentMin.clear();
+  column.segmentMax.clear();
+  column.segmentBitWidth.clear();
+}
+
+// Codes one piece of a kDictionary column against the values seen so far,
+// adding its new values to them. Returns false, with the column turned into
+// kPlain and the piece not stored, if the column has more distinct values
+// than a dictionary may hold.
+bool appendDictionaryCoded(
+    ColumnLoad& load,
+    cudf::column_view values,
+    int32_t segmentRows,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr,
+    rmm::device_async_resource_ref storageMr) {
+  auto distinct = cudf::distinct(
+      cudf::table_view({values}),
+      {0},
+      cudf::duplicate_keep_option::KEEP_ANY,
+      cudf::null_equality::EQUAL,
+      cudf::nan_equality::ALL_EQUAL,
+      stream,
+      mr);
+  if (distinct->num_rows() > kMaxDictionaryKeys) {
+    toPlain(load, segmentRows, stream, mr, storageMr);
+    return false;
+  }
+  // The values so far come first, so they keep their codes.
+  std::vector<cudf::column_view> parts;
+  if (load.keys) {
+    parts.push_back(load.keys->view());
+  }
+  parts.push_back(distinct->view().column(0));
+  auto all = cudf::concatenate(parts, stream, mr);
+  auto merged = cudf::stable_distinct(
+      cudf::table_view({all->view()}),
+      {0},
+      cudf::duplicate_keep_option::KEEP_FIRST,
+      cudf::null_equality::EQUAL,
+      cudf::nan_equality::ALL_EQUAL,
+      stream,
+      mr);
+  if (merged->num_rows() > kMaxDictionaryKeys) {
+    toPlain(load, segmentRows, stream, mr, storageMr);
+    return false;
+  }
+  if (!load.keys || merged->num_rows() != load.keys->size()) {
+    load.keys = std::move(merged->release()[0]);
+    load.sortedOrder = cudf::sorted_order(
+        cudf::table_view({load.keys->view()}), {}, {}, stream, mr);
+    auto sorted = cudf::gather(
+        cudf::table_view({load.keys->view()}),
+        load.sortedOrder->view(),
+        cudf::out_of_bounds_policy::DONT_CHECK,
+        stream,
+        mr);
+    load.sortedKeys = std::move(sorted->release()[0]);
+  }
+  auto positions = cudf::lower_bound(
+      cudf::table_view({load.sortedKeys->view()}),
+      cudf::table_view({values}),
+      {cudf::order::ASCENDING},
+      {cudf::null_order::AFTER},
+      stream,
+      mr);
+  auto codes = cudf::gather(
+      cudf::table_view({load.sortedOrder->view()}),
+      positions->view(),
+      cudf::out_of_bounds_policy::DONT_CHECK,
+      stream,
+      mr);
+  appendPacked(
+      load, codes->view().column(0), segmentRows, stream, mr, storageMr);
+  return true;
+}
+
+// Moves the pieces of a loaded column into its final form: kept as pieces for
+// a host-resident table, joined into one device buffer otherwise.
+void finishColumn(
+    ColumnLoad& load,
+    const std::vector<int64_t>& pieceBeginRow,
+    int64_t numRows,
+    int32_t segmentRows,
     bool hostResident,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     rmm::device_async_resource_ref storageMr) {
-  column.packed =
-      rmm::device_uvector<uint64_t>(pieces.numWords + 1, stream, storageMr);
-  uint64_t offset = 0;
-  for (const auto& words : pieces.words) {
-    checkCuda(
-        cudaMemcpyAsync(
-            column.packed.data() + offset,
-            words.data(),
-            words.size() * sizeof(uint64_t),
-            cudaMemcpyDefault,
-            stream.get()),
-        "concatenate packed words");
-    offset += words.size();
+  auto& column = *load.column;
+  if (column.codec == Codec::kDictionary &&
+      int64_t{load.keys->size()} * 8 >= numRows) {
+    toPlain(load, segmentRows, stream, mr, storageMr);
   }
-  const uint64_t zero = 0;
+  if (column.codec == Codec::kDictionary) {
+    column.values = std::move(load.keys);
+  }
+  if (column.codec == Codec::kPlain) {
+    if (hostResident) {
+      column.hostValues = std::move(load.plain);
+      column.hostPieceBeginRow = pieceBeginRow;
+    } else if (load.plain.size() == 1) {
+      column.values = std::move(load.plain[0]);
+    } else {
+      std::vector<cudf::column_view> parts;
+      for (const auto& part : load.plain) {
+        parts.push_back(part->view());
+      }
+      column.values = cudf::concatenate(parts, stream, storageMr);
+    }
+    load.plain.clear();
+    stream.sync();
+    return;
+  }
+  if (hostResident) {
+    uint64_t word = 0;
+    for (auto& piece : load.packed) {
+      column.hostPackedBeginWord.push_back(word);
+      for (auto p : piece.params) {
+        p.bitOffset += word * 64;
+        column.hostSegmentParams.push_back(p);
+      }
+      word += piece.words.size();
+      column.hostPacked.push_back(std::move(piece.words));
+    }
+    column.hostPieceBeginRow = pieceBeginRow;
+    load.packed.clear();
+    return;
+  }
+  uint64_t numWords = 0;
+  std::vector<SegmentParams> params;
+  for (const auto& piece : load.packed) {
+    for (auto p : piece.params) {
+      p.bitOffset += numWords * 64;
+      params.push_back(p);
+    }
+    numWords += piece.words.size();
+  }
+  column.packed =
+      rmm::device_uvector<uint64_t>(numWords + 1, stream, storageMr);
+  uint64_t offset = 0;
+  for (const auto& piece : load.packed) {
+    if (piece.words.size() > 0) {
+      checkCuda(
+          cudaMemcpyAsync(
+              column.packed.data() + offset,
+              piece.words.data(),
+              piece.words.size() * sizeof(uint64_t),
+              cudaMemcpyDefault,
+              stream.get()),
+          "concatenate packed words");
+    }
+    offset += piece.words.size();
+  }
   checkCuda(
-      cudaMemcpyAsync(
-          column.packed.data() + pieces.numWords,
-          &zero,
-          sizeof(uint64_t),
-          cudaMemcpyDefault,
-          stream.get()),
+      cudaMemsetAsync(
+          column.packed.data() + numWords, 0, sizeof(uint64_t), stream.get()),
       "clear padding word");
   column.segmentParams =
-      rmm::device_uvector<SegmentParams>(pieces.params.size(), stream, mr);
+      rmm::device_uvector<SegmentParams>(params.size(), stream, mr);
   checkCuda(
       cudaMemcpyAsync(
           column.segmentParams.data(),
-          pieces.params.data(),
-          pieces.params.size() * sizeof(SegmentParams),
+          params.data(),
+          params.size() * sizeof(SegmentParams),
           cudaMemcpyHostToDevice,
           stream.get()),
       "copy segment params");
   stream.sync();
-  if (hostResident) {
-    column.hostSegmentParams = std::move(pieces.params);
-  }
-  pieces = PackedPieces{};
-}
-
-// A string column coded piece by piece before its dictionary is known: each
-// piece holds codes into its own sorted distinct values, recoded to the
-// table's dictionary once every piece is read.
-struct DictionaryPieces {
-  std::vector<std::unique_ptr<cudf::column>> keys;
-  std::vector<std::unique_ptr<cudf::column>> codes;
-  std::unique_ptr<cudf::column> allKeys;
-};
-
-// The strings of each piece of 'pieces', stored in 'storageMr'.
-void decodePieces(
-    DictionaryPieces& pieces,
-    std::vector<std::unique_ptr<cudf::column>>& plain,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref storageMr) {
-  for (size_t p = 0; p < pieces.keys.size(); ++p) {
-    auto strings = cudf::gather(
-        cudf::table_view({pieces.keys[p]->view()}),
-        pieces.codes[p]->view(),
-        cudf::out_of_bounds_policy::DONT_CHECK,
-        stream,
-        storageMr);
-    plain.push_back(std::move(strings->release()[0]));
-  }
-  stream.sync();
-  pieces = DictionaryPieces{};
+  load.packed.clear();
 }
 
 } // namespace
 
-void EncodedColumnCache::loadTable(
+void EncodedColumnCache::loadColumns(
     const std::string& name,
     const std::vector<std::string>& parquetFiles,
+    const std::vector<std::string>& columnNames,
     int32_t segmentRows,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     rmm::device_async_resource_ref storageMr,
     bool hostResident) {
   check(segmentRows > 0, "segmentRows must be positive");
+  EncodedTable* existing = nullptr;
+  if (auto it = tables_.find(name); it != tables_.end()) {
+    existing = it->second.get();
+    check(
+        existing->segmentRows == segmentRows &&
+            existing->hostResident == hostResident,
+        "Encoded table " + name + " is loaded with other settings");
+  }
+  std::vector<std::string> missing;
+  for (const auto& column : columnNames) {
+    if (existing == nullptr || !existing->hasColumn(column)) {
+      missing.push_back(column);
+    }
+  }
+  if (!columnNames.empty() && missing.empty()) {
+    return;
+  }
 
-  auto table = std::make_unique<EncodedTable>();
-  table->name = name;
-  table->segmentRows = segmentRows;
-  table->hostResident = hostResident;
-  // String columns start as kDictionary and become kPlain once they have more
-  // distinct values than a dictionary may hold.
-  std::vector<PackedPieces> packed;
-  std::vector<DictionaryPieces> dictionaries;
-  std::vector<std::vector<std::unique_ptr<cudf::column>>> plain;
-  auto toPlain = [&](size_t i) {
-    decodePieces(dictionaries[i], plain[i], stream, storageMr);
-    table->columns[i]->codec = Codec::kPlain;
-  };
+  // New columns, and for each column read its index in 'loads', or -1 for a
+  // column the table already has.
+  std::vector<ColumnLoad> loads;
+  std::vector<int32_t> loadOf;
+  std::vector<int64_t> pieceBeginRow;
+  int64_t numRows = 0;
+  int64_t encodedRows = 0;
 
   auto encodePiece = [&](cudf::table_view piece) {
-    for (size_t i = 0; i < table->columns.size(); ++i) {
-      auto& column = *table->columns[i];
-      const auto values = piece.column(i);
-      if (column.codec == Codec::kDictionary) {
-        auto& dictionary = dictionaries[i];
-        auto distinct = cudf::distinct(
-            cudf::table_view({values}),
-            {0},
-            cudf::duplicate_keep_option::KEEP_ANY,
-            cudf::null_equality::EQUAL,
-            cudf::nan_equality::ALL_EQUAL,
-            stream,
-            mr);
-        if (distinct->num_rows() > kMaxDictionaryKeys) {
-          toPlain(i);
-        } else {
-          auto sorted = cudf::sort(distinct->view(), {}, {}, stream, mr);
-          auto keys = std::move(sorted->release()[0]);
-          auto codes = cudf::lower_bound(
-              cudf::table_view({keys->view()}),
-              cudf::table_view({values}),
-              {cudf::order::ASCENDING},
-              {cudf::null_order::AFTER},
-              stream,
-              storageMr);
-          std::vector<cudf::column_view> parts{keys->view()};
-          if (dictionary.allKeys) {
-            parts.push_back(dictionary.allKeys->view());
-          }
-          auto all = cudf::concatenate(parts, stream, mr);
-          auto allDistinct = cudf::distinct(
-              cudf::table_view({all->view()}),
-              {0},
-              cudf::duplicate_keep_option::KEEP_ANY,
-              cudf::null_equality::EQUAL,
-              cudf::nan_equality::ALL_EQUAL,
-              stream,
-              mr);
-          dictionary.allKeys = std::move(allDistinct->release()[0]);
-          dictionary.keys.push_back(std::move(keys));
-          dictionary.codes.push_back(std::move(codes));
-          if (dictionary.allKeys->size() > kMaxDictionaryKeys) {
-            toPlain(i);
-          }
-          continue;
-        }
+    pieceBeginRow.push_back(encodedRows);
+    for (size_t i = 0; i < loadOf.size(); ++i) {
+      if (loadOf[i] < 0) {
+        continue;
       }
-      if (column.codec == Codec::kForBitpack) {
-        appendPacked(
-            column, packed[i], values, segmentRows, stream, mr, storageMr);
+      auto& load = loads[loadOf[i]];
+      const auto values = piece.column(i);
+      if (load.column->codec == Codec::kDictionary &&
+          appendDictionaryCoded(
+              load, values, segmentRows, stream, mr, storageMr)) {
+        continue;
+      }
+      if (load.column->codec == Codec::kForBitpack) {
+        appendPacked(load, values, segmentRows, stream, mr, storageMr);
       } else {
         std::vector<cudf::column_view> parts{values};
-        plain[i].push_back(cudf::concatenate(parts, stream, storageMr));
+        load.plain.push_back(cudf::concatenate(parts, stream, storageMr));
       }
     }
     stream.sync();
+    encodedRows += piece.num_rows();
   };
 
   // Encode whole segments as they fill, carrying the rest of each row group
@@ -745,27 +1009,33 @@ void EncodedColumnCache::loadTable(
   std::unique_ptr<cudf::table> carry;
   forEachRowGroup(
       parquetFiles,
+      missing,
       stream,
       mr,
       [&](std::unique_ptr<cudf::table> rows, const auto& metadata, bool last) {
-        if (table->columns.empty()) {
+        if (loadOf.empty()) {
           for (size_t i = 0; i < metadata.schema_info.size(); ++i) {
+            const auto& columnName = metadata.schema_info[i].name;
+            if (existing != nullptr && existing->hasColumn(columnName)) {
+              loadOf.push_back(-1);
+              continue;
+            }
             auto encoded = std::make_unique<EncodedColumn>(stream, mr);
-            encoded->name = metadata.schema_info[i].name;
+            encoded->name = columnName;
             encoded->type = rows->view().column(i).type();
             encoded->codec = isIntegerLike(encoded->type) ? Codec::kForBitpack
                 : encoded->type.id() == cudf::type_id::STRING
                 ? Codec::kDictionary
                 : Codec::kPlain;
-            table->columnIndex.emplace(
-                encoded->name, static_cast<int32_t>(i));
-            table->columns.push_back(std::move(encoded));
+            loadOf.push_back(static_cast<int32_t>(loads.size()));
+            loads.emplace_back();
+            loads.back().column = std::move(encoded);
           }
-          packed.resize(table->columns.size());
-          dictionaries.resize(table->columns.size());
-          plain.resize(table->columns.size());
         }
-        table->numRows += rows->num_rows();
+        check(
+            static_cast<size_t>(rows->num_columns()) == loadOf.size(),
+            "Row groups of " + name + " differ in their columns");
+        numRows += rows->num_rows();
         if (carry) {
           std::vector<cudf::table_view> parts{carry->view(), rows->view()};
           rows = cudf::concatenate(parts, stream, mr);
@@ -782,68 +1052,92 @@ void EncodedColumnCache::loadTable(
           carry = cudf::concatenate(rest, stream, mr);
         }
       });
-  check(!table->columns.empty(), "No row groups in " + name);
-  table->numSegments = static_cast<int32_t>(
-      (table->numRows + segmentRows - 1) / segmentRows);
-
-  for (size_t i = 0; i < table->columns.size(); ++i) {
-    auto& column = *table->columns[i];
-    if (column.codec == Codec::kDictionary &&
-        int64_t{dictionaries[i].allKeys->size()} * 8 >= table->numRows) {
-      toPlain(i);
-    }
-    if (column.codec == Codec::kDictionary) {
-      auto& dictionary = dictionaries[i];
-      auto sorted = cudf::stable_sort(
-          cudf::table_view({dictionary.allKeys->view()}), {}, {}, stream, mr);
-      column.values = std::move(sorted->release()[0]);
-      for (size_t p = 0; p < dictionary.keys.size(); ++p) {
-        auto recode = cudf::lower_bound(
-            cudf::table_view({column.values->view()}),
-            cudf::table_view({dictionary.keys[p]->view()}),
-            {cudf::order::ASCENDING},
-            {cudf::null_order::AFTER},
-            stream,
-            mr);
-        auto codes = cudf::gather(
-            cudf::table_view({recode->view()}),
-            dictionary.codes[p]->view(),
-            cudf::out_of_bounds_policy::DONT_CHECK,
-            stream,
-            mr);
-        appendPacked(
-            column,
-            packed[i],
-            codes->view().column(0),
-            segmentRows,
-            stream,
-            mr,
-            storageMr);
-        dictionary.keys[p].reset();
-        dictionary.codes[p].reset();
-      }
-      dictionaries[i] = DictionaryPieces{};
-    }
-    if (column.codec == Codec::kPlain) {
-      if (plain[i].size() == 1) {
-        column.values = std::move(plain[i][0]);
-      } else {
-        std::vector<cudf::column_view> parts;
-        for (const auto& part : plain[i]) {
-          parts.push_back(part->view());
-        }
-        column.values = cudf::concatenate(parts, stream, storageMr);
-      }
-      plain[i].clear();
-    } else {
-      finishPacked(column, packed[i], hostResident, stream, mr, storageMr);
-    }
-    stream.sync();
+  check(!loadOf.empty(), "No row groups in " + name);
+  check(
+      existing == nullptr || existing->numRows == numRows,
+      "Encoded table " + name + " changed its row count");
+  for (auto& load : loads) {
+    finishColumn(
+        load,
+        pieceBeginRow,
+        numRows,
+        segmentRows,
+        hostResident,
+        stream,
+        mr,
+        storageMr);
   }
-  tables_[name] = std::move(table);
+
+  if (existing == nullptr) {
+    auto table = std::make_unique<EncodedTable>();
+    table->name = name;
+    table->segmentRows = segmentRows;
+    table->hostResident = hostResident;
+    table->numRows = numRows;
+    table->numSegments =
+        static_cast<int32_t>((numRows + segmentRows - 1) / segmentRows);
+    existing = table.get();
+    tables_[name] = std::move(table);
+  }
+  for (auto& load : loads) {
+    existing->columnIndex.emplace(
+        load.column->name, static_cast<int32_t>(existing->columns.size()));
+    existing->columns.push_back(std::move(load.column));
+  }
 }
 
-const EncodedTable* EncodedColumnCache::findTable(const std::string& name) const {
+void EncodedColumnCache::retainColumns(
+    const std::string& name,
+    const std::unordered_set<std::string>& keep) {
+  auto it = tables_.find(name);
+  if (it == tables_.end()) {
+    return;
+  }
+  auto& table = *it->second;
+  std::vector<std::unique_ptr<EncodedColumn>> kept;
+  for (auto& column : table.columns) {
+    if (keep.count(column->name) != 0) {
+      kept.push_back(std::move(column));
+    }
+  }
+  if (kept.empty()) {
+    tables_.erase(it);
+    return;
+  }
+  table.columns = std::move(kept);
+  table.columnIndex.clear();
+  for (size_t i = 0; i < table.columns.size(); ++i) {
+    table.columnIndex.emplace(table.columns[i]->name, static_cast<int32_t>(i));
+  }
+}
+
+std::vector<std::string> EncodedColumnCache::tableNames() const {
+  std::vector<std::string> names;
+  for (const auto& [name, _] : tables_) {
+    names.push_back(name);
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+int64_t EncodedColumnCache::hostBytes() const {
+  int64_t bytes = 0;
+  for (const auto& [_, table] : tables_) {
+    bytes += table->hostBytes();
+  }
+  return bytes;
+}
+
+int64_t EncodedColumnCache::deviceBytes() const {
+  int64_t bytes = 0;
+  for (const auto& [_, table] : tables_) {
+    bytes += table->deviceBytes();
+  }
+  return bytes;
+}
+
+const EncodedTable* EncodedColumnCache::findTable(
+    const std::string& name) const {
   auto it = tables_.find(name);
   return it == tables_.end() ? nullptr : it->second.get();
 }
@@ -864,21 +1158,11 @@ __global__ void addToOffsetsKernel(T* offsets, int64_t n, T delta) {
   }
 }
 
-// Ascending runs of adjacent segments, as [first, last] segment ids.
-std::vector<std::pair<int32_t, int32_t>> segmentRuns(
-    std::span<const int32_t> segments) {
-  std::vector<std::pair<int32_t, int32_t>> runs;
-  for (auto segment : segments) {
-    if (!runs.empty() && runs.back().second + 1 == segment) {
-      runs.back().second = segment;
-    } else {
-      runs.emplace_back(segment, segment);
-    }
-  }
-  return runs;
-}
-
-void copyToDevice(void* dst, const void* src, size_t bytes, cuda::stream_ref stream) {
+void copyToDevice(
+    void* dst,
+    const void* src,
+    size_t bytes,
+    cuda::stream_ref stream) {
   if (bytes > 0) {
     checkCuda(
         cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream.get()),
@@ -890,6 +1174,41 @@ void copyToDevice(void* dst, const void* src, size_t bytes, cuda::stream_ref str
 // memory waits for the work already on the stream, so the bulk copies from
 // pinned memory are queued last to keep them asynchronous.
 using Deferred = std::vector<std::function<void()>>;
+
+// A range of adjacent segments stored in one piece of a host-resident column.
+struct PieceRun {
+  size_t piece;
+  int32_t firstSegment;
+  int32_t lastSegment;
+  // Rows of the run, counted from the first row of the piece.
+  int64_t beginRow;
+  int64_t endRow;
+};
+
+// Splits 'segments' into runs of adjacent segments of the same piece.
+std::vector<PieceRun> pieceRuns(
+    const EncodedTable& table,
+    const EncodedColumn& column,
+    std::span<const int32_t> segments) {
+  const auto& begins = column.hostPieceBeginRow;
+  check(!begins.empty(), "Host pieces missing for " + column.name);
+  std::vector<PieceRun> runs;
+  for (auto segment : segments) {
+    const int64_t row = int64_t{segment} * table.segmentRows;
+    const size_t piece = std::upper_bound(begins.begin(), begins.end(), row) -
+        begins.begin() - 1;
+    const int64_t begin = row - begins[piece];
+    const int64_t end = begin + table.segmentSize(segment);
+    if (!runs.empty() && runs.back().piece == piece &&
+        runs.back().lastSegment + 1 == segment) {
+      runs.back().lastSegment = segment;
+      runs.back().endRow = end;
+    } else {
+      runs.push_back(PieceRun{piece, segment, segment, begin, end});
+    }
+  }
+  return runs;
+}
 
 // Stages the packed words and params of 'segments' of a bit-packed stream.
 void stagePacked(
@@ -931,13 +1250,16 @@ void stagePacked(
           staged.packed.data() + numWords, 0, sizeof(uint64_t), stream.get()),
       "clear padding word");
   uint64_t word = 0;
-  for (const auto& [first, last] : segmentRuns(segments)) {
+  for (const auto& run : pieceRuns(table, column, segments)) {
     uint64_t runWords = 0;
-    for (int32_t s = first; s <= last; ++s) {
+    for (int32_t s = run.firstSegment; s <= run.lastSegment; ++s) {
       runWords += wordsOf(s);
     }
+    const uint64_t* src = column.hostPacked[run.piece].data() +
+        (params[run.firstSegment].bitOffset / 64 -
+         column.hostPackedBeginWord[run.piece]);
     deferred.push_back([dst = staged.packed.data() + word,
-                        src = column.packed.data() + params[first].bitOffset / 64,
+                        src,
                         bytes = runWords * sizeof(uint64_t),
                         stream] { copyToDevice(dst, src, bytes, stream); });
     word += runWords;
@@ -949,25 +1271,29 @@ void stagePacked(
 template <typename OffsetT>
 std::unique_ptr<cudf::column> stageStrings(
     const EncodedTable& table,
-    cudf::strings_column_view strings,
+    const EncodedColumn& column,
     std::span<const int32_t> segments,
     Deferred& deferred,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  const auto* offsets = strings.offsets().data<OffsetT>();
-  const char* chars = strings.parent().data<char>();
-  std::vector<std::pair<int64_t, int64_t>> rowRuns;
+  const auto runs = pieceRuns(table, column, segments);
+  const auto offsetType = cudf::data_type{cudf::type_to_id<OffsetT>()};
   int64_t numRows = 0;
   int64_t numChars = 0;
-  for (const auto& [first, last] : segmentRuns(segments)) {
-    const int64_t begin = int64_t{first} * table.segmentRows;
-    const int64_t end = int64_t{last} * table.segmentRows + table.segmentSize(last);
-    rowRuns.emplace_back(begin, end);
-    numRows += end - begin;
-    numChars += offsets[end] - offsets[begin];
+  for (const auto& run : runs) {
+    cudf::strings_column_view strings(column.hostValues[run.piece]->view());
+    check(
+        strings.offsets().type() == offsetType,
+        "Pieces of " + column.name + " differ in their offset width");
+    const auto* offsets = strings.offsets().data<OffsetT>();
+    numRows += run.endRow - run.beginRow;
+    numChars += offsets[run.endRow] - offsets[run.beginRow];
   }
+  check(
+      numChars <= static_cast<int64_t>(std::numeric_limits<OffsetT>::max()),
+      "Staged batch of " + column.name + " has too many characters");
   auto stagedOffsets = cudf::make_fixed_width_column(
-      strings.offsets().type(),
+      offsetType,
       static_cast<cudf::size_type>(numRows + 1),
       cudf::mask_state::UNALLOCATED,
       stream,
@@ -977,12 +1303,17 @@ std::unique_ptr<cudf::column> stageStrings(
   auto* outChars = static_cast<char*>(stagedChars.data());
   int64_t row = 0;
   int64_t charBase = 0;
-  for (const auto& [begin, end] : rowRuns) {
-    const int64_t runRows = end - begin;
-    const int64_t runChars = offsets[end] - offsets[begin];
+  for (const auto& run : runs) {
+    cudf::strings_column_view strings(column.hostValues[run.piece]->view());
+    const auto* offsets = strings.offsets().data<OffsetT>();
+    const char* chars = strings.parent().data<char>();
+    const int64_t begin = run.beginRow;
+    const int64_t runRows = run.endRow - run.beginRow;
+    const int64_t runChars = offsets[run.endRow] - offsets[begin];
     const auto delta = static_cast<OffsetT>(charBase - offsets[begin]);
     deferred.push_back([=] {
-      copyToDevice(outChars + charBase, chars + offsets[begin], runChars, stream);
+      copyToDevice(
+          outChars + charBase, chars + offsets[begin], runChars, stream);
       copyToDevice(
           outOffsets + row,
           offsets + begin,
@@ -1006,33 +1337,34 @@ std::unique_ptr<cudf::column> stageStrings(
 
 std::unique_ptr<cudf::column> stageFixedWidth(
     const EncodedTable& table,
-    cudf::column_view values,
+    const EncodedColumn& column,
     std::span<const int32_t> segments,
     Deferred& deferred,
     cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) {
-  const auto width = cudf::size_of(values.type());
+  const auto type = column.hostValues.front()->type();
+  const auto width = cudf::size_of(type);
   int64_t numRows = 0;
   for (auto segment : segments) {
     numRows += table.segmentSize(segment);
   }
   auto staged = cudf::make_fixed_width_column(
-      values.type(),
+      type,
       static_cast<cudf::size_type>(numRows),
       cudf::mask_state::UNALLOCATED,
       stream,
       mr);
   auto* out = static_cast<char*>(staged->mutable_view().head());
-  const auto* in = static_cast<const char*>(values.head()) + values.offset() * width;
   int64_t row = 0;
-  for (const auto& [first, last] : segmentRuns(segments)) {
-    const int64_t begin = int64_t{first} * table.segmentRows;
-    const int64_t end = int64_t{last} * table.segmentRows + table.segmentSize(last);
+  for (const auto& run : pieceRuns(table, column, segments)) {
+    const auto values = column.hostValues[run.piece]->view();
+    const auto* in =
+        static_cast<const char*>(values.head()) + values.offset() * width;
     deferred.push_back([dst = out + row * width,
-                        src = in + begin * width,
-                        bytes = (end - begin) * width,
+                        src = in + run.beginRow * width,
+                        bytes = (run.endRow - run.beginRow) * width,
                         stream] { copyToDevice(dst, src, bytes, stream); });
-    row += end - begin;
+    row += run.endRow - run.beginRow;
   }
   return staged;
 }
@@ -1075,22 +1407,27 @@ std::unique_ptr<EncodedTable> stageSegments(
         break;
       case Codec::kDictionary:
         stagePacked(table, column, segments, *out, deferred, stream, mr);
-        out->values = std::make_unique<cudf::column>(
-            column.values->view(), stream, mr);
+        out->values =
+            std::make_unique<cudf::column>(column.values->view(), stream, mr);
         break;
-      case Codec::kPlain:
-        if (column.values->type().id() == cudf::type_id::STRING) {
-          cudf::strings_column_view strings(column.values->view());
+      case Codec::kPlain: {
+        check(
+            !column.hostValues.empty(),
+            "Host values missing for " + column.name);
+        const auto first = column.hostValues.front()->view();
+        if (first.type().id() == cudf::type_id::STRING) {
+          cudf::strings_column_view strings(first);
           out->values = strings.offsets().type().id() == cudf::type_id::INT64
               ? stageStrings<int64_t>(
-                    table, strings, segments, deferred, stream, mr)
+                    table, column, segments, deferred, stream, mr)
               : stageStrings<int32_t>(
-                    table, strings, segments, deferred, stream, mr);
+                    table, column, segments, deferred, stream, mr);
         } else {
-          out->values = stageFixedWidth(
-              table, column.values->view(), segments, deferred, stream, mr);
+          out->values =
+              stageFixedWidth(table, column, segments, deferred, stream, mr);
         }
         break;
+      }
     }
     staged->columnIndex.emplace(
         name, static_cast<int32_t>(staged->columns.size()));
