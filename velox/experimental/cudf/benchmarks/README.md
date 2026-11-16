@@ -81,7 +81,67 @@ echo "cudf.batch_size_min_threshold=16777216" > cudf.properties
   --num_repeats=4 --run_queries=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
 ```
 
-`--run_queries` runs the queries in one process, so the tables load once.
+With `--encoded_load=query` (the default), the cache retains only the columns
+needed by the next query. Columns shared with the previous query are reused;
+other columns are released. `--encoded_load=all` retains whole tables instead.
+Preparation loads and encodes rows in file order. It does not filter or aggregate
+rows ahead of the timed query.
+
+### Bounded GPU memory and host spilling
+
+The benchmark gives every execution its own GPU query pool. Set
+`--gpu_budget_bytes` to limit accounted query allocations and
+`--spill_host_bytes` to enable spilling into a bounded pinned-host pool.
+There is no disk spill destination.
+
+For host-resident encoded input, `--host_budget_bytes` reserves a fixed share
+for spilling and gives the remainder to the input cache:
+
+```
+input cache limit = host_budget_bytes - spill_host_bytes
+```
+
+This is an allocation budget for cached input and spilled state, not a limit on
+whole-process RSS. Leave room for other CPU allocations, CUDA bookkeeping and
+pinned-pool allocation rounding. The GPU budget similarly excludes CUDA runtime
+overhead and device allocations made while preparing the input cache.
+
+For example, the following runs Q1 on SF1000 data with a 16 GiB GPU budget,
+16 GiB host-spill budget and 99 GiB combined input/spill budget:
+
+```bash
+cat > host-spill.properties <<'EOF'
+cudf.memory_resource=async
+cudf.allow_cpu_fallback=false
+cudf.batch_size_min_threshold=16777216
+cudf.batch_size_max_threshold=16777216
+EOF
+
+./velox_cudf_tpch_benchmark \
+  --data_path=/path/to/tpch_sf1000 --data_format=parquet --scale_factor=1000 \
+  --encoded --encoded_memory=pinned_host --encoded_load=query \
+  --gpu_budget_bytes=17179869184 --host_budget_bytes=106300440576 \
+  --spill_host_bytes=17179869184 --input_overflow=fail \
+  --cudf_properties=host-spill.properties --num_drivers=4 \
+  --num_repeats=6 --run_queries=1 --results_json_dir=/path/to/results
+```
+
+The appropriate input/spill split depends on the query. `--input_overflow=fail`
+reports input that cannot fit instead of changing its source. The optional
+`--input_overflow=parquet` explicitly falls back to reading input Parquet files;
+the log and per-repeat metadata identify that input mode. This concerns input
+loading only and does not enable disk spilling.
+
+Each repeat writes `repeat<N>/q<Q>.json` and `repeat<N>/q<Q>.stats.json`.
+Statistics include operator counters, GPU pool peaks, spill-pool peaks and the
+input mode. The first repeat is available as a warmup; reporting scripts should
+exclude it when computing warm-query medians. The timer includes query-context
+creation, execution, result materialization and task completion. Input-cache
+preparation and writing JSON files are outside the timer. A failed repeat is
+recorded and makes the benchmark exit unsuccessfully.
+
+Use a fresh process when changing GPU or host-spill limits. The process GPU
+resource is initialized once; query pools share its capacity.
 
 ---
 
