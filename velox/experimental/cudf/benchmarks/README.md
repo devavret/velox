@@ -114,7 +114,7 @@ cat > host-spill.properties <<'EOF'
 cudf.memory_resource=async
 cudf.allow_cpu_fallback=false
 cudf.batch_size_min_threshold=16777216
-cudf.batch_size_max_threshold=16777216
+cudf.spill_groupby_max_rows_per_leaf=16777216
 EOF
 
 ./velox_cudf_tpch_benchmark \
@@ -125,6 +125,13 @@ EOF
   --cudf_properties=host-spill.properties --num_drivers=4 \
   --num_repeats=6 --run_queries=1 --results_json_dir=/path/to/results
 ```
+
+The aggregation spill-leaf bound is independent of the global batch maximum.
+Leave `cudf.batch_size_max_threshold` unset for these runs: setting it also splits
+join builds into multiple tables, which can add probe work and is unsupported by
+some join types. Encoded scans still cap decoding at 16M rows by default.
+`cudf.spill_groupby_max_rows_per_leaf` keeps aggregation leaves bounded without
+changing join builds.
 
 The appropriate input/spill split depends on the query. `--input_overflow=fail`
 reports input that cannot fit instead of changing its source. The optional

@@ -479,6 +479,8 @@ folly::dynamic configJson() {
   json["memory_percent"] = jsonInt(config.memoryPercent);
   json["spill_host_memory_bytes"] = jsonInt(config.spillHostBytes);
   json["spill_partition_fanout"] = jsonInt(config.spillPartitionFanout);
+  json["spill_groupby_max_rows_per_leaf"] =
+      jsonInt(config.spillGroupbyMaxRowsPerLeaf);
   json["spill_join_partition_bytes"] = jsonInt(config.spillJoinPartitionBytes);
   json["groupby_self_spill_percent"] = jsonInt(config.groupbySelfSpillPercent);
   json["groupby_self_spill_target_percent"] =
