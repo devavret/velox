@@ -28,6 +28,7 @@
 #include "velox/experimental/cudf/connectors/encoded/EncodedConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/PrestoFunctions.h"
@@ -54,6 +55,7 @@
 
 #include <fmt/format.h>
 #include <folly/ScopeGuard.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
@@ -685,10 +687,21 @@ Splits encodedSplits(const std::vector<std::string>& files) {
       kSegmentsPerSplit);
 }
 
+// Set only by the host-spill fixture. The executor outlives every query
+// context.
+std::shared_ptr<folly::CPUThreadPoolExecutor> spillQueryExecutor;
+
 exec::CursorParameters cursorParameters(const TpchPlan& plan) {
   exec::CursorParameters params;
   params.planNode = plan.plan;
   params.maxDrivers = kNumDrivers;
+  if (spillQueryExecutor) {
+    params.queryCtx = core::QueryCtx::Builder()
+                          .executor(spillQueryExecutor.get())
+                          .queryId("tpch-host-spill-test")
+                          .build();
+    cudf_velox::attachCudfMemoryPool(*params.queryCtx, 1LL << 30);
+  }
   return params;
 }
 
@@ -844,6 +857,38 @@ class EncodedHostTpchTest : public CpuTpchTest {
   }
 };
 
+// Exercise the same plans with their actual query-owned GPU accounting and
+// spillable operators enabled. A low self-spill watermark makes larger final
+// group-bys use host storage even at this small correctness-test scale.
+class EncodedHostSpillTpchTest : public EncodedHostTpchTest {
+ protected:
+  static void SetUpTestSuite() {
+    auto& config = cudf_velox::CudfConfig::getInstance();
+    savedConfig_ = config;
+    config.spillHostBytes = 1ULL << 30;
+    config.streamingGroupbyEnabled = false;
+    config.groupbySelfSpillPercent = 2;
+    config.groupbySelfSpillTargetPercent = 1;
+    spillQueryExecutor =
+        std::make_shared<folly::CPUThreadPoolExecutor>(kNumDrivers);
+    EncodedHostTpchTest::SetUpTestSuite();
+  }
+
+  static void TearDownTestSuite() {
+    EncodedHostTpchTest::TearDownTestSuite();
+    spillQueryExecutor.reset();
+    cudf_velox::CudfConfig::getInstance() = savedConfig_;
+  }
+
+ private:
+  inline static cudf_velox::CudfConfig savedConfig_;
+};
+
+TEST_P(EncodedHostSpillTpchTest, matchesReferenceSql) {
+  ASSERT_NO_FATAL_FAILURE(loadPlanColumns(builder_->getQueryPlan(GetParam())));
+  assertQuery(GetParam());
+}
+
 TEST_P(CpuTpchTest, matchesReferenceSql) {
   assertQuery(GetParam());
 }
@@ -883,6 +928,11 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     CudfTpchQueryBuilderTest,
     EncodedHostTpchTest,
+    testing::Range(1, 23),
+    queryName);
+INSTANTIATE_TEST_SUITE_P(
+    CudfTpchQueryBuilderTest,
+    EncodedHostSpillTpchTest,
     testing::Range(1, 23),
     queryName);
 
