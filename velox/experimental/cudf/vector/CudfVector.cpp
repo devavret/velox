@@ -97,6 +97,8 @@ std::pair<uint64_t, std::unique_ptr<cudf::table>> getTableSize(
       totalBytes, std::make_unique<cudf::table>(std::move(columnsOut)));
 }
 
+thread_local std::shared_ptr<void> threadAllocationOwnerStorage;
+
 void logDefaultStreamIfNeeded(
     cuda::stream_ref stream,
     const char* constructorName) {
@@ -115,7 +117,8 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     std::unique_ptr<cudf::table>&& table,
-    cuda::stream_ref stream)
+    cuda::stream_ref stream,
+    std::shared_ptr<void> allocationOwner)
     : RowVector(
           pool,
           std::move(type),
@@ -123,6 +126,10 @@ CudfVector::CudfVector(
           size,
           std::vector<VectorPtr>(),
           std::nullopt),
+      allocationOwner_{
+          allocationOwner ? std::move(allocationOwner)
+                          : threadAllocationOwner()},
+      cpuPoolOwner_{pool->shared_from_this()},
       tableStorage_{std::move(table)},
       stream_{stream} {
   logDefaultStreamIfNeeded(stream_, "CudfVector(table)");
@@ -138,7 +145,8 @@ CudfVector::CudfVector(
     TypePtr type,
     vector_size_t size,
     std::unique_ptr<cudf::packed_table>&& packedTable,
-    cuda::stream_ref stream)
+    cuda::stream_ref stream,
+    std::shared_ptr<void> allocationOwner)
     : RowVector(
           pool,
           std::move(type),
@@ -146,6 +154,10 @@ CudfVector::CudfVector(
           size,
           std::vector<VectorPtr>(),
           std::nullopt),
+      allocationOwner_{
+          allocationOwner ? std::move(allocationOwner)
+                          : threadAllocationOwner()},
+      cpuPoolOwner_{pool->shared_from_this()},
       tableStorage_{std::move(packedTable)},
       stream_{stream} {
   logDefaultStreamIfNeeded(stream_, "CudfVector(packed_table)");
@@ -215,6 +227,20 @@ bool CudfVector::rebindStream(cuda::stream_ref stream) {
 
 uint64_t CudfVector::estimateFlatSize() const {
   return flatSize_;
+}
+
+bool CudfVector::hasOwnedTable() const {
+  auto* table = std::get_if<std::unique_ptr<cudf::table>>(&tableStorage_);
+  return table != nullptr && *table != nullptr;
+}
+
+std::shared_ptr<void> CudfVector::threadAllocationOwner() {
+  return threadAllocationOwnerStorage;
+}
+
+std::shared_ptr<void> CudfVector::exchangeThreadAllocationOwner(
+    std::shared_ptr<void> owner) {
+  return std::exchange(threadAllocationOwnerStorage, std::move(owner));
 }
 
 uint64_t CudfVector::retainedSizeImpl(
