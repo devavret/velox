@@ -58,6 +58,28 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.batchSizeMinBytes.value(), 2'147'483'648);
 }
 
+// The leaf bound of a spillable group-by is a setting of its own. The global
+// batch maximum, set or not, does not change it.
+TEST(ConfigTest, spillGroupbyMaxRowsPerLeaf) {
+  {
+    CudfConfig config;
+    EXPECT_EQ(config.spillGroupbyMaxRowsPerLeaf, 1 << 24);
+    EXPECT_FALSE(config.batchSizeMaxThreshold.has_value());
+  }
+  {
+    CudfConfig config;
+    config.initialize({{CudfConfig::kCudfBatchSizeMaxThreshold, "1000"}});
+    EXPECT_EQ(config.batchSizeMaxThreshold.value(), 1'000);
+    EXPECT_EQ(config.spillGroupbyMaxRowsPerLeaf, 1 << 24);
+  }
+  {
+    CudfConfig config;
+    config.initialize({{CudfConfig::kCudfSpillGroupbyMaxRowsPerLeaf, "4096"}});
+    EXPECT_EQ(config.spillGroupbyMaxRowsPerLeaf, 4'096);
+    EXPECT_FALSE(config.batchSizeMaxThreshold.has_value());
+  }
+}
+
 TEST(ConfigTest, rejectsNonPositiveBatchConcatTargets) {
   auto initialize = [](const char* key, const char* value) {
     CudfConfig config;
@@ -76,6 +98,26 @@ TEST(ConfigTest, rejectsNonPositiveBatchConcatTargets) {
   VELOX_ASSERT_USER_THROW(
       initialize(CudfConfig::kCudfBatchSizeMinBytes, "-1"),
       "cuDF BatchConcat minimum byte target must be a positive integer: -1");
+}
+
+TEST(ConfigTest, rejectsInvalidSpillGroupbyMaxRowsPerLeaf) {
+  auto initialize = [](const char* value) {
+    CudfConfig config;
+    config.initialize({{CudfConfig::kCudfSpillGroupbyMaxRowsPerLeaf, value}});
+  };
+
+  VELOX_ASSERT_USER_THROW(
+      initialize("0"), "cudf.spill_groupby_max_rows_per_leaf must be positive");
+  VELOX_ASSERT_USER_THROW(
+      initialize("-16"),
+      "cudf.spill_groupby_max_rows_per_leaf must be positive");
+  VELOX_ASSERT_USER_THROW(
+      initialize("2147483648"),
+      "cudf.spill_groupby_max_rows_per_leaf must be a 32-bit integer: "
+      "2147483648");
+  VELOX_ASSERT_USER_THROW(
+      initialize("many"),
+      "cudf.spill_groupby_max_rows_per_leaf must be a 32-bit integer: many");
 }
 
 } // namespace facebook::velox::cudf_velox::test
