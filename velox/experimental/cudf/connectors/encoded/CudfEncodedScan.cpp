@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/connectors/encoded/CudfEncodedScan.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/connectors/encoded/CudfEncodedScan.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
@@ -29,8 +30,6 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
-
-#include "velox/experimental/cudf/CudfNoDefaults.h"
 
 #include <algorithm>
 #include <numeric>
@@ -67,7 +66,10 @@ CudfEncodedScan::CudfEncodedScan(
   ensureCudaContextForThread();
   if (!spec_.subfieldFilters.empty()) {
     subfieldAst_ = &createAstFromSubfieldFilters(
-        spec_.subfieldFilters, subfieldTree_, subfieldScalars_, spec_.filterType);
+        spec_.subfieldFilters,
+        subfieldTree_,
+        subfieldScalars_,
+        spec_.filterType);
   }
   if (spec_.remainingFilter) {
     remainingFilterExpression_ = createCudfExpression(
@@ -113,7 +115,8 @@ int64_t CudfEncodedScan::decodeRowsTarget() const {
   }
   const int64_t maxRows =
       config.batchSizeMaxThreshold.value_or(kDefaultMaxDecodeRows);
-  return std::min<int64_t>(maxRows, static_cast<int64_t>(targetRows / passRate));
+  return std::min<int64_t>(
+      maxRows, static_cast<int64_t>(targetRows / passRate));
 }
 
 bool CudfEncodedScan::fillPending(int64_t decodeRows) {
@@ -143,7 +146,8 @@ bool CudfEncodedScan::fillPending(int64_t decodeRows) {
     VELOX_CHECK_EQ(encodedSplit->table, spec_.table->name);
     const auto segments = spec_.rejectsAllRows
         ? std::vector<int32_t>{}
-        : spec_.pruneSegments(encodedSplit->segmentBegin, encodedSplit->segmentEnd);
+        : spec_.pruneSegments(
+              encodedSplit->segmentBegin, encodedSplit->segmentEnd);
     for (auto segment : segments) {
       pendingSegments_.push_back(segment);
       pendingRows_ += spec_.table->segmentSize(segment);
@@ -195,8 +199,7 @@ bool CudfEncodedScan::takeBatch(Batch& batch) {
         table, stagedColumnNames_, batch.segments, stream, get_temp_mr());
     cudaEvent_t event;
     VELOX_CHECK(
-        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) ==
-            cudaSuccess,
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess,
         "Creating a staging event failed");
     batch.staged.reset(event);
     VELOX_CHECK(
@@ -215,6 +218,17 @@ bool CudfEncodedScan::takeBatch(Batch& batch) {
       "encodedStageIssueTime",
       RuntimeCounter(timeUs * 1000, RuntimeCounter::Unit::kNanos));
   return true;
+}
+
+void CudfEncodedScan::doClose() {
+  // A cancelled scan may still own the next batch. Release it while the
+  // operator's memory-accounting resources and the cached input are alive.
+  prefetched_.reset();
+  pendingSegments_.clear();
+  pendingRows_ = 0;
+  remainingFilterExpression_.reset();
+  subfieldScalars_.clear();
+  CudfSourceOperatorBase::doClose();
 }
 
 RowVectorPtr CudfEncodedScan::doGetOutput() {
@@ -269,8 +283,7 @@ RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
   if (batch.table) {
     std::iota(segments.begin(), segments.end(), 0);
     VELOX_CHECK(
-        cudaStreamWaitEvent(stream.get(), batch.staged.get(), 0) ==
-            cudaSuccess,
+        cudaStreamWaitEvent(stream.get(), batch.staged.get(), 0) == cudaSuccess,
         "Waiting for staged segments failed");
   }
   rmm::device_uvector<int32_t> deviceSegments(segments.size(), stream, tempMr);

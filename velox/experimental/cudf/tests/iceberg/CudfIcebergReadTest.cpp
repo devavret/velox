@@ -3037,7 +3037,7 @@ TEST_F(CudfIcebergReadTest, positionalDeleteSequenceNumberZeroDisablesFilter) {
   AssertQueryBuilder(plan).splits(splits).assertResults({expected});
 }
 
-/// Edge-case tests from Sirius project
+/// Edge-case regression tests
 
 /// Combined positional + equality deletes on the same data file.
 /// Verifies that positional deletes (position-based) and equality deletes

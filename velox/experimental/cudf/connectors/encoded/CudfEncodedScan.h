@@ -65,6 +65,8 @@ class CudfEncodedScan : public CudfSourceOperatorBase {
  protected:
   RowVectorPtr doGetOutput() override;
 
+  void doClose() override;
+
  private:
   struct EventDeleter {
     void operator()(cudaEvent_t event) const;
