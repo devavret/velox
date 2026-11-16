@@ -22,6 +22,7 @@
 // cuDF Hive connector and with the encoded connector, without CPU fallback.
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/benchmarks/CudfTpchInputColumns.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchQueryBuilder.h"
 #include "velox/experimental/cudf/connectors/encoded/EncodedColumnCache.h"
 #include "velox/experimental/cudf/connectors/encoded/EncodedConnector.h"
@@ -52,6 +53,7 @@
 #include "velox/vector/tests/utils/VectorMaker.h"
 
 #include <fmt/format.h>
+#include <folly/ScopeGuard.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
@@ -60,8 +62,11 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <optional>
+#include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace facebook::velox;
 
@@ -563,6 +568,19 @@ void unregisterGpu() {
 
 // Loads 'tables' of the data under 'path' into the encoded column cache.
 // registerGpu() makes the memory resources the cache loads with.
+// The data files of the table in 'tableDir', in the order the cache loads
+// them.
+std::vector<std::string> tableFiles(const std::string& tableDir) {
+  std::vector<std::string> files;
+  for (const auto& entry : std::filesystem::directory_iterator(tableDir)) {
+    if (entry.is_regular_file() && entry.path().filename().string()[0] != '.') {
+      files.push_back(entry.path().string());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  return files;
+}
+
 void loadEncodedTables(
     const std::string& path,
     const std::vector<std::string>& tables) {
@@ -570,19 +588,76 @@ void loadEncodedTables(
   auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
   const auto mr = cudf_velox::get_output_mr();
   for (const auto& table : tables) {
-    std::vector<std::string> files;
-    for (const auto& entry : std::filesystem::directory_iterator(
-             fmt::format("{}/{}", path, table))) {
-      if (entry.is_regular_file() &&
-          entry.path().filename().string()[0] != '.') {
-        files.push_back(entry.path().string());
-      }
-    }
-    std::sort(files.begin(), files.end());
-    encoded::EncodedColumnCache::instance().loadTable(
-        table, files, kSegmentRows, stream, mr, mr, /*hostResident=*/false);
+    encoded::EncodedColumnCache::instance().loadColumns(
+        table,
+        tableFiles(fmt::format("{}/{}", path, table)),
+        {},
+        kSegmentRows,
+        stream,
+        mr,
+        mr,
+        /*hostResident=*/false);
   }
   stream.sync();
+}
+
+// The pinned host memory of the host-resident tests, limited to 1 GiB.
+encoded::BoundedPinnedHostResource& hostResource() {
+  static encoded::BoundedPinnedHostResource resource(1ULL << 30);
+  return resource;
+}
+
+// As the benchmark does with --encoded_memory=pinned_host and
+// --encoded_load=query: makes the cache hold the columns the scans of 'plan'
+// read, host-resident, and nothing else. Columns earlier plans loaded are
+// kept if this plan reads them too.
+void loadPlanColumns(const TpchPlan& plan) {
+  std::map<std::string, std::set<std::string>> required;
+  std::map<std::string, std::string> tableDirs;
+  for (const auto& scan : cudf_velox::tpchScanColumns(plan.plan)) {
+    required[scan.table].insert(scan.columns.begin(), scan.columns.end());
+    tableDirs[scan.table] =
+        std::filesystem::path(plan.dataFiles.at(scan.scanId).front())
+            .parent_path()
+            .string();
+  }
+  auto& cache = encoded::EncodedColumnCache::instance();
+  for (const auto& table : cache.tableNames()) {
+    const auto it = required.find(table);
+    cache.retainColumns(
+        table,
+        it == required.end() ? std::unordered_set<std::string>{}
+                             : std::unordered_set<std::string>(
+                                   it->second.begin(), it->second.end()));
+  }
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  const auto mr = cudf_velox::get_output_mr();
+  for (const auto& [table, columns] : required) {
+    cache.loadColumns(
+        table,
+        tableFiles(tableDirs.at(table)),
+        std::vector<std::string>(columns.begin(), columns.end()),
+        kSegmentRows,
+        stream,
+        mr,
+        rmm::device_async_resource_ref(hostResource()),
+        /*hostResident=*/true);
+  }
+  stream.sync();
+  // The cache holds exactly what the plan reads.
+  ASSERT_EQ(cache.tableNames().size(), required.size());
+  for (const auto& [table, columns] : required) {
+    const auto& loaded = cache.table(table);
+    ASSERT_TRUE(loaded.hostResident);
+    ASSERT_EQ(loaded.columns.size(), columns.size()) << table;
+    for (const auto& column : columns) {
+      ASSERT_TRUE(loaded.hasColumn(column)) << table << "." << column;
+    }
+  }
+  // What the cache reports is what it took from the bounded resource.
+  ASSERT_GT(cache.hostBytes(), 0);
+  ASSERT_GE(hostResource().usedBytes(), cache.hostBytes());
+  ASSERT_LE(hostResource().usedBytes(), hostResource().limitBytes());
 }
 
 using Splits = std::vector<std::shared_ptr<connector::ConnectorSplit>>;
@@ -741,7 +816,40 @@ class EncodedTpchTest : public CpuTpchTest {
   }
 };
 
+// On the GPU with the encoded connector, as the benchmark runs with --encoded
+// --encoded_memory=pinned_host --encoded_load=query: before each query, the
+// columns its scans read are loaded into bounded pinned host memory and the
+// others are dropped.
+class EncodedHostTpchTest : public CpuTpchTest {
+ protected:
+  static void SetUpTestSuite() {
+    CpuTpchTest::SetUpTestSuite();
+    registerGpu();
+    setHiveConnector(
+        std::make_shared<encoded::EncodedConnector>(
+            exec::test::kHiveConnectorId));
+    // After registerCudf(), which resets the operator adapters.
+    encoded::registerEncodedTableScanAdapter();
+  }
+
+  static void TearDownTestSuite() {
+    encoded::EncodedColumnCache::instance().clear();
+    unregisterGpu();
+    setHiveConnector(makeHiveConnector());
+    CpuTpchTest::TearDownTestSuite();
+  }
+
+  Splits splits(const std::vector<std::string>& files) const override {
+    return encodedSplits(files);
+  }
+};
+
 TEST_P(CpuTpchTest, matchesReferenceSql) {
+  assertQuery(GetParam());
+}
+
+TEST_P(EncodedHostTpchTest, matchesReferenceSql) {
+  ASSERT_NO_FATAL_FAILURE(loadPlanColumns(builder_->getQueryPlan(GetParam())));
   assertQuery(GetParam());
 }
 
@@ -770,6 +878,11 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     CudfTpchQueryBuilderTest,
     EncodedTpchTest,
+    testing::Range(1, 23),
+    queryName);
+INSTANTIATE_TEST_SUITE_P(
+    CudfTpchQueryBuilderTest,
+    EncodedHostTpchTest,
     testing::Range(1, 23),
     queryName);
 
@@ -1071,6 +1184,101 @@ TEST_F(CudfTpchQueryBuilderTest, filterOnlyColumnsAreProjectedAway) {
       EXPECT_EQ(queryPlan.dataFiles.count(node->id()), 1) << node->id();
     }
   }
+}
+
+TEST_F(CudfTpchQueryBuilderTest, scanColumns) {
+  // Q1 reads l_shipdate only for its filter.
+  {
+    const auto scans =
+        cudf_velox::tpchScanColumns(builder_->getQueryPlan(1).plan);
+    ASSERT_EQ(scans.size(), 1);
+    EXPECT_EQ(scans[0].table, "lineitem");
+    EXPECT_EQ(
+        scans[0].columns,
+        (std::set<std::string>{
+            "l_discount",
+            "l_extendedprice",
+            "l_linestatus",
+            "l_quantity",
+            "l_returnflag",
+            "l_shipdate",
+            "l_tax",
+        }));
+  }
+
+  // Every scan of every plan is listed with the columns it returns, and no
+  // plan reads a column its table does not have.
+  for (int queryId = 1; queryId <= 22; ++queryId) {
+    SCOPED_TRACE(fmt::format("Q{}", queryId));
+    const auto plan = builder_->getQueryPlan(queryId);
+    const auto scans = cudf_velox::tpchScanColumns(plan.plan);
+    EXPECT_EQ(scans.size(), plan.dataFiles.size());
+    for (const auto& scan : scans) {
+      SCOPED_TRACE(scan.table);
+      ASSERT_EQ(plan.dataFiles.count(scan.scanId), 1);
+      const auto* node =
+          core::PlanNode::findNodeById(plan.plan.get(), scan.scanId);
+      ASSERT_NE(node, nullptr);
+      for (const auto& name : node->outputType()->names()) {
+        EXPECT_EQ(scan.columns.count(name), 1) << name;
+      }
+      const auto schema = tpch::getTableSchema(tpch::fromTableName(scan.table));
+      for (const auto& column : scan.columns) {
+        EXPECT_TRUE(schema->containsChild(column)) << column;
+      }
+    }
+  }
+}
+
+TEST_F(CudfTpchQueryBuilderTest, encodedHostBudget) {
+  // A load past the host limit throws and leaves the cache as it was.
+  registerGpu();
+  auto& cache = encoded::EncodedColumnCache::instance();
+  cache.clear();
+  // Declared before the guard: the cached columns free into it.
+  encoded::BoundedPinnedHostResource host(2ULL << 20);
+  SCOPE_EXIT {
+    cache.clear();
+    unregisterGpu();
+  };
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  const auto mr = cudf_velox::get_output_mr();
+  const auto files =
+      tableFiles(fmt::format("{}/lineitem", TpchData::instance().path()));
+  cache.loadColumns(
+      "lineitem",
+      files,
+      {"l_linestatus"},
+      kSegmentRows,
+      stream,
+      mr,
+      rmm::device_async_resource_ref(host),
+      /*hostResident=*/true);
+  const auto used = host.usedBytes();
+  EXPECT_GT(used, 0);
+  EXPECT_EQ(cache.hostBytes(), used);
+
+  EXPECT_THROW(
+      cache.loadColumns(
+          "lineitem",
+          files,
+          {"l_orderkey", "l_extendedprice"},
+          kSegmentRows,
+          stream,
+          mr,
+          rmm::device_async_resource_ref(host),
+          /*hostResident=*/true),
+      encoded::EncodedHostBudgetExceeded);
+  stream.sync();
+  EXPECT_EQ(host.usedBytes(), used);
+  EXPECT_LE(host.peakBytes(), host.limitBytes());
+  ASSERT_EQ(cache.table("lineitem").columns.size(), 1);
+  EXPECT_TRUE(cache.table("lineitem").hasColumn("l_linestatus"));
+
+  // Dropping the column returns its memory.
+  cache.retainColumns("lineitem", {});
+  EXPECT_EQ(cache.findTable("lineitem"), nullptr);
+  EXPECT_EQ(host.usedBytes(), 0);
 }
 
 TEST_F(CudfTpchQueryBuilderTest, q22WindowSumsDecimals) {

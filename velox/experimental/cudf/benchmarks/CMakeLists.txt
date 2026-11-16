@@ -14,7 +14,12 @@
 
 # --- TPC-H benchmarks ---
 
-add_library(velox_cudf_tpch_query_builder CudfTpchQueryBuilder.cpp)
+add_library(
+  velox_cudf_tpch_query_builder
+  CudfTpchQueryBuilder.cpp
+  CudfTpchInputColumns.cpp
+  CudfTpchRunStats.cpp
+)
 
 target_link_libraries(
   velox_cudf_tpch_query_builder

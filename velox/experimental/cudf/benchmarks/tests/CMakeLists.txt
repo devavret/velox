@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(velox_cudf_tpch_query_builder_test CudfTpchQueryBuilderTest.cpp)
+add_executable(
+  velox_cudf_tpch_query_builder_test
+  CudfTpchQueryBuilderTest.cpp
+  CudfTpchRunStatsTest.cpp
+)
 
 add_test(
   NAME velox_cudf_tpch_query_builder_test
