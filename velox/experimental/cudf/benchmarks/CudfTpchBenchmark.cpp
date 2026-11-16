@@ -64,7 +64,6 @@ DECLARE_string(data_path);
 DECLARE_int32(num_drivers);
 DECLARE_int32(num_repeats);
 DECLARE_int32(num_splits_per_file);
-DECLARE_int32(split_preload_per_driver);
 DECLARE_int32(run_query_verbose);
 DECLARE_int32(io_meter_column_pct);
 
@@ -479,6 +478,11 @@ folly::dynamic configJson() {
   json["memory_limit_bytes"] = jsonInt(config.memoryLimitBytes);
   json["memory_percent"] = jsonInt(config.memoryPercent);
   json["spill_host_memory_bytes"] = jsonInt(config.spillHostBytes);
+  json["spill_partition_fanout"] = jsonInt(config.spillPartitionFanout);
+  json["spill_join_partition_bytes"] = jsonInt(config.spillJoinPartitionBytes);
+  json["groupby_self_spill_percent"] = jsonInt(config.groupbySelfSpillPercent);
+  json["groupby_self_spill_target_percent"] =
+      jsonInt(config.groupbySelfSpillTargetPercent);
   json["batch_size_min_threshold"] = jsonInt(config.batchSizeMinThreshold);
   if (config.batchSizeMaxThreshold.has_value()) {
     json["batch_size_max_threshold"] = jsonInt(*config.batchSizeMaxThreshold);
@@ -1004,8 +1008,6 @@ CudfTpchBenchmark::QueryRun CudfTpchBenchmark::runOnce(const TpchPlan& plan) {
     params.maxDrivers = FLAGS_num_drivers;
     params.planNode = plan.plan;
     params.queryConfigs = queryConfigs_;
-    params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
-        std::to_string(FLAGS_split_preload_per_driver);
     configureCursorParameters(params);
 
     queryRun.cursor = TaskCursor::create(params);
