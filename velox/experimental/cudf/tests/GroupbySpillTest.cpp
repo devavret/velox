@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
@@ -186,6 +187,57 @@ TEST_F(GroupbySpillTest, finalStepRepartitionsSpilledLeaves) {
   EXPECT_GT(statSum(stats, cudf_velox::CudfGroupby::kSpilledBytes), 0);
   EXPECT_GT(statSum(stats, cudf_velox::CudfGroupby::kRestoredRows), 0);
   EXPECT_GT(statSum(stats, "cudfGroupbyDrainRepartitions"), 0);
+}
+
+// A final step whose decimal sum has the compact state spills a 16-byte sum
+// for each row in place of a 32-byte state and its offset, and returns the
+// same result. Its leaves are split, spilled, partitioned again in host memory
+// and restored as with the ordinary state.
+TEST_F(GroupbySpillTest, finalStepSpillsCompactDecimalSums) {
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  config.spillGroupbyMaxRowsPerLeaf = 64;
+  config.spillPartitionFanout = 4;
+  config.batchSizeMinThreshold = 32;
+  const auto vectors = makeInput(32, 32, 20'000);
+  createDuckDbTable(vectors);
+
+  // Runs the query with or without the compact state and returns the bytes
+  // its final step spilled.
+  const auto run = [&](bool compact, const std::string& queryId) -> int64_t {
+    core::PlanNodeId finalId;
+    auto plan = PlanBuilder()
+                    .values(vectors)
+                    .project({"c0", "cast(c1 as decimal(15, 2)) as v"})
+                    .partialAggregation({"c0"}, {"sum(v)", "count(v)"})
+                    .finalAggregation()
+                    .capturePlanNodeId(finalId)
+                    .planNode();
+    if (compact) {
+      auto rewritten =
+          cudf_velox::CudfAggregationNode::rewriteFinalAggregation(plan);
+      EXPECT_NE(rewritten, plan);
+      plan = rewritten;
+    }
+    auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                    .queryCtx(makeSpillableQueryCtx(queryId))
+                    .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, 32)
+                    .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+                    .maxDrivers(1)
+                    .plan(plan)
+                    .assertResults(
+                        "SELECT c0, sum(cast(c1 as decimal(15, 2))), count(c1) "
+                        "FROM tmp GROUP BY c0");
+    const auto stats = toPlanStats(task->taskStats()).at(finalId).customStats;
+    EXPECT_GT(statSum(stats, "cudfGroupbyDrainRepartitions"), 0);
+    EXPECT_EQ(
+        statSum(stats, cudf_velox::CudfGroupby::kSpilledRows),
+        statSum(stats, cudf_velox::CudfGroupby::kRestoredRows));
+    return statSum(stats, cudf_velox::CudfGroupby::kSpilledBytes);
+  };
+  const auto ordinaryBytes = run(false, "groupby-spill-decimal-ordinary");
+  const auto compactBytes = run(true, "groupby-spill-decimal-compact");
+  EXPECT_GT(compactBytes, 0);
+  EXPECT_LT(compactBytes, ordinaryBytes);
 }
 
 // Every row has the same key, so hash partitioning cannot split the state
