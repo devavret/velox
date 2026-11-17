@@ -133,6 +133,26 @@ some join types. Encoded scans still cap decoding at 16M rows by default.
 `cudf.spill_groupby_max_rows_per_leaf` keeps aggregation leaves bounded without
 changing join builds.
 
+By default the benchmark gives each grouped `SUM` over a short decimal column a
+compact intermediate state: one `DECIMAL(38, scale)` column of 16 bytes for each
+group, in place of the 32-byte `VARBINARY` state and its 4-byte offsets. That
+is what such a `SUM` exchanges between its partial and final aggregation, and
+what the final aggregation buffers and spills. The query builder's plans are
+not changed: the benchmark applies `CudfAggregationNode::rewritePlan` to the
+plan of each query, which keeps the nodes, their ids, the SQL parameters and the
+result types. A `SUM` is eligible only if it reads a short decimal column
+without a mask, `DISTINCT` or `ORDER BY`, in a grouped partial and final
+aggregation; every other aggregate keeps its ordinary state. The compact state
+is exact: fewer than 2^63 values below 10^18 in magnitude cannot overflow 128
+bits.
+
+Only cuDF operators read and write this state, and a query fails instead of
+running such an aggregation on the CPU. The benchmark therefore applies it only
+with `cudf.allow_cpu_fallback=false`. `--cudf_compact_decimal_sum_state=false`
+turns it off. Each run prints the number of aggregations that use the state and
+records it as `compact_decimal_sum_aggregations` in `q<Q>.stats.json`, next to
+the `compact_decimal_sum_state` setting.
+
 The appropriate input/spill split depends on the query. `--input_overflow=fail`
 reports input that cannot fit instead of changing its source. The optional
 `--input_overflow=parquet` explicitly falls back to reading input Parquet files;

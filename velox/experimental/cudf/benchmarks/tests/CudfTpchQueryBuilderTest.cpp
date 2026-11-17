@@ -28,6 +28,7 @@
 #include "velox/experimental/cudf/connectors/encoded/EncodedConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
@@ -759,6 +760,11 @@ class CpuTpchTest : public testing::TestWithParam<int> {
     return hiveSplits(files);
   }
 
+  // Returns the plan of 'queryId' as this fixture runs it.
+  virtual TpchPlan queryPlan(int queryId) const {
+    return builder_->getQueryPlan(queryId);
+  }
+
   void assertQuery(int queryId) const {
     // Every query returns rows on this data, and the global aggregations a
     // value, so no comparison is vacuous.
@@ -771,7 +777,7 @@ class CpuTpchTest : public testing::TestWithParam<int> {
     EXPECT_FALSE(reference->GetValue(0, 0).IsNull());
 
     assertPlan(
-        builder_->getQueryPlan(queryId),
+        queryPlan(queryId),
         [this](const std::vector<std::string>& files) { return splits(files); },
         referenceSql(queryId),
         TpchData::instance().duckDb(),
@@ -884,8 +890,44 @@ class EncodedHostSpillTpchTest : public EncodedHostTpchTest {
   inline static cudf_velox::CudfConfig savedConfig_;
 };
 
+// Returns the number of aggregations of 'plan' that exchange the compact
+// decimal SUM state.
+int32_t countCompactAggregations(const core::PlanNodePtr& plan) {
+  int32_t numAggregations{0};
+  if (dynamic_cast<const cudf_velox::CudfAggregationNode*>(plan.get()) !=
+      nullptr) {
+    ++numAggregations;
+  }
+  for (const auto& source : plan->sources()) {
+    numAggregations += countCompactAggregations(source);
+  }
+  return numAggregations;
+}
+
+// As EncodedHostSpillTpchTest, with the plans as the benchmark runs them by
+// default: the grouped SUMs over short decimal columns exchange, buffer and
+// spill the compact DECIMAL(38, scale) state.
+class CompactDecimalSumTpchTest : public EncodedHostSpillTpchTest {
+ protected:
+  TpchPlan queryPlan(int queryId) const override {
+    auto plan = builder_->getQueryPlan(queryId);
+    plan.plan = cudf_velox::CudfAggregationNode::rewritePlan(plan.plan);
+    return plan;
+  }
+};
+
 TEST_P(EncodedHostSpillTpchTest, matchesReferenceSql) {
   ASSERT_NO_FATAL_FAILURE(loadPlanColumns(builder_->getQueryPlan(GetParam())));
+  assertQuery(GetParam());
+}
+
+TEST_P(CompactDecimalSumTpchTest, matchesReferenceSql) {
+  const auto plan = queryPlan(GetParam());
+  if (countCompactAggregations(plan.plan) == 0) {
+    // The plan is the one EncodedHostSpillTpchTest runs.
+    GTEST_SKIP() << "No grouped SUM over a short decimal column";
+  }
+  ASSERT_NO_FATAL_FAILURE(loadPlanColumns(plan));
   assertQuery(GetParam());
 }
 
@@ -933,6 +975,11 @@ INSTANTIATE_TEST_SUITE_P(
 INSTANTIATE_TEST_SUITE_P(
     CudfTpchQueryBuilderTest,
     EncodedHostSpillTpchTest,
+    testing::Range(1, 23),
+    queryName);
+INSTANTIATE_TEST_SUITE_P(
+    CudfTpchQueryBuilderTest,
+    CompactDecimalSumTpchTest,
     testing::Range(1, 23),
     queryName);
 
@@ -1348,6 +1395,51 @@ TEST_F(CudfTpchQueryBuilderTest, q22WindowSumsDecimals) {
   EXPECT_EQ(sum->type()->toString(), "DECIMAL(38, 2)");
   EXPECT_EQ(window.windowFunctions()[1].functionCall->name(), "count");
   EXPECT_EQ(plan.dataFiles.size(), 2);
+}
+
+// The compact decimal SUM state is applied to a plan the query builder
+// returns. It changes the state two aggregations exchange and nothing else.
+TEST_F(CudfTpchQueryBuilderTest, compactDecimalSumStateKeepsPlan) {
+  registerGpu();
+  SCOPE_EXIT {
+    unregisterGpu();
+  };
+  const auto isCompact = [](const core::PlanNode& node) {
+    return dynamic_cast<const cudf_velox::CudfAggregationNode*>(&node) !=
+        nullptr;
+  };
+  const auto nodeIds = [](const core::PlanNodePtr& plan) {
+    std::vector<core::PlanNodeId> ids;
+    for (const auto* node :
+         findNodes(plan, [](const core::PlanNode&) { return true; })) {
+      ids.push_back(node->id());
+    }
+    return ids;
+  };
+
+  const auto original = builder_->getQueryPlan(18).plan;
+  EXPECT_TRUE(findNodes(original, isCompact).empty());
+  const auto compact = cudf_velox::CudfAggregationNode::rewritePlan(original);
+  // The PARTIAL and the FINAL aggregation of the large orders.
+  const auto compactNodes = findNodes(compact, isCompact);
+  ASSERT_EQ(compactNodes.size(), 2);
+  for (const auto* node : compactNodes) {
+    const auto& aggregation = static_cast<const core::AggregationNode&>(*node);
+    if (aggregation.step() == core::AggregationNode::Step::kPartial) {
+      // l_orderkey and the 16-byte sum, in place of the VARBINARY state.
+      EXPECT_EQ(
+          aggregation.outputType()->childAt(1)->toString(), "DECIMAL(38, 2)");
+    }
+  }
+  EXPECT_EQ(nodeIds(compact), nodeIds(original));
+  EXPECT_TRUE(*compact->outputType() == *original->outputType());
+
+  // Q6 has only a global aggregation and Q13 only counts.
+  for (const auto queryId : {6, 13}) {
+    const auto plan = builder_->getQueryPlan(queryId).plan;
+    EXPECT_EQ(cudf_velox::CudfAggregationNode::rewritePlan(plan), plan)
+        << queryId;
+  }
 }
 
 TEST_F(CudfTpchQueryBuilderTest, q18SumsDecimals) {

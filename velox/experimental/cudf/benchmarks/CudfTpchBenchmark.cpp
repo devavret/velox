@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/connectors/encoded/EncodedConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/exec/CudfAggregationNode.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfMemoryArbitration.h"
 #include "velox/experimental/cudf/exec/CudfSpillContext.h"
@@ -119,6 +120,15 @@ DEFINE_string(
     "",
     "Path to a properties file for CudfConfig. Each line should be key=value "
     "(e.g. cudf.memory_resource=async). See CudfConfig for available keys.");
+
+DEFINE_bool(
+    cudf_compact_decimal_sum_state,
+    true,
+    "Exchange a 16-byte DECIMAL(38, scale) state for each grouped SUM over a "
+    "short decimal column between its partial and final aggregation, in place "
+    "of the 32-byte VARBINARY state and its offsets. The plans keep their "
+    "nodes, node ids and result types. Only cuDF operators read and write the "
+    "state, so this applies only with cudf.allow_cpu_fallback=false.");
 
 DEFINE_bool(
     encoded,
@@ -470,6 +480,30 @@ folly::dynamic hostSpillJson(const std::shared_ptr<core::QueryCtx>& queryCtx) {
   return json;
 }
 
+// Returns true if the plans get the compact decimal SUM state. Only cuDF
+// operators read and write that state, and an aggregation that has it fails
+// its query if it cannot run in cuDF. Without CPU fallback every operator must
+// run in cuDF anyway, so the state cannot fail a query that would have run.
+bool compactDecimalSumStateEnabled() {
+  const auto& config = cudf_velox::CudfConfig::getInstance();
+  return FLAGS_cudf_compact_decimal_sum_state && config.enabled &&
+      !config.allowCpuFallback;
+}
+
+// Returns the number of aggregations of 'plan' that exchange the compact
+// decimal SUM state.
+int32_t countCompactAggregations(const core::PlanNodePtr& plan) {
+  int32_t numAggregations{0};
+  if (dynamic_cast<const cudf_velox::CudfAggregationNode*>(plan.get()) !=
+      nullptr) {
+    ++numAggregations;
+  }
+  for (const auto& source : plan->sources()) {
+    numAggregations += countCompactAggregations(source);
+  }
+  return numAggregations;
+}
+
 // The settings a run was made with.
 folly::dynamic configJson() {
   const auto& config = cudf_velox::CudfConfig::getInstance();
@@ -494,6 +528,7 @@ folly::dynamic configJson() {
   json["concat_optimization_enabled"] = config.concatOptimizationEnabled;
   json["streaming_groupby_enabled"] = config.streamingGroupbyEnabled;
   json["allow_cpu_fallback"] = config.allowCpuFallback;
+  json["compact_decimal_sum_state"] = compactDecimalSumStateEnabled();
   json["gpu_batch_size_rows"] = jsonInt(FLAGS_cudf_gpu_batch_size_rows);
   json["local_exchange_buffer_size_bytes"] =
       jsonInt(FLAGS_cudf_local_exchange_buffer_size);
@@ -537,12 +572,15 @@ folly::dynamic encodedCacheJson() {
 // Everything recorded about one run of a query, successful or not: what its
 // task, operators and drivers counted, and the memory and spill counters
 // around them. 'task' is null if the run failed before it had one.
+// 'numCompactAggregations' is the number of aggregations of the plan that
+// exchange the compact decimal SUM state.
 folly::dynamic runStatsJson(
     int32_t queryId,
     int32_t repeat,
     int64_t wallMicros,
     const std::string& error,
     const std::string& input,
+    int32_t numCompactAggregations,
     exec::Task* task,
     const memory::MemoryArbitrator::Stats& arbitratorBefore,
     const memory::MemoryArbitrator::Stats& arbitratorAfter) {
@@ -557,6 +595,7 @@ folly::dynamic runStatsJson(
   // For a failed run, the time until the failure was seen.
   json["wall_micros"] = wallMicros;
   json["input"] = input;
+  json["compact_decimal_sum_aggregations"] = jsonInt(numCompactAggregations);
   json["config"] = configJson();
   json["environment"] = cudfEnvironmentJson();
   json["encoded_cache"] = encodedCacheJson();
@@ -1061,7 +1100,19 @@ void CudfTpchBenchmark::executeQuery(
     int32_t queryId,
     bool verbose,
     std::ostream& out) {
-  const auto plan = queryBuilder_->getQueryPlan(queryId);
+  auto plan = queryBuilder_->getQueryPlan(queryId);
+  // A physical choice of this run, made on the plan the query builder
+  // returns: which state the eligible decimal SUMs exchange. The scans, the
+  // node ids and the result types stay as the query builder made them.
+  if (compactDecimalSumStateEnabled()) {
+    plan.plan = cudf_velox::CudfAggregationNode::rewritePlan(plan.plan);
+  }
+  const auto numCompactAggregations = countCompactAggregations(plan.plan);
+  out << fmt::format(
+             "Compact decimal SUM state of query {}: {} aggregations",
+             queryId,
+             numCompactAggregations)
+      << std::endl;
   if (FLAGS_encoded) {
     setInputMode(InputMode::kEncoded);
     try {
@@ -1130,6 +1181,7 @@ void CudfTpchBenchmark::executeQuery(
                 queryRun.wallMicros,
                 queryRun.error,
                 input,
+                numCompactAggregations,
                 task,
                 arbitratorBefore,
                 arbitratorAfter));
