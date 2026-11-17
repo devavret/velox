@@ -7,7 +7,7 @@ The **21 encoded-host-input queries sum to 156.758195s** in warm medians. **Q9 i
 ## Source and method
 
 - Based on [PR10](https://github.com/GregoryKimball/velox/pull/10) at `7de0eaf6dc3d74ab047bfad2bb9f2ea9d73a1b44`; query-builder C++ and header blobs are unchanged.
-- Measured engine commit: `4744dde01acff543929a17f03ea4b582f8158798`. The later commit adding this report changes documentation/data only.
+- Measured engine commit: `4744dde01acff543929a17f03ea4b582f8158798`. These measurements predate the compact decimal SUM state addition and do not measure its performance. To reproduce this state layout with the newer benchmark, pass `--cudf_compact_decimal_sum_state=false`.
 - Binary SHA256: `dbc8b680f1700de42948141dbe222e72f2218eea92a7858299ac490af100f20b`.
 - cuDF: `02f215d2bb7a4840ebbd5b81532ae717abea5054`; CUDA 12.9.86, GCC 14.2.1, driver 595.112.07, existing `adapters-cuda` service.
 - One L4 on g6.8xlarge, 32 logical CPUs. Observed VRAM 23,034 MiB; Linux MemTotal 130,088,366,080 bytes (121.15 GiB). The container digest is in the adjacent JSON.
