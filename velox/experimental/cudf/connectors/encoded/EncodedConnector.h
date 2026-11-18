@@ -93,6 +93,8 @@ struct EncodedScanSpec {
 
   /// Table column read for each output column.
   std::vector<std::string> outputColumnNames;
+  /// Type of each output column and of each filter-only column, by table
+  /// column name.
   std::unordered_map<std::string, TypePtr> columnTypes;
 
   /// The table handle's filters plus those extracted from its remaining
@@ -108,11 +110,22 @@ struct EncodedScanSpec {
   /// those only 'remainingFilter' reads.
   std::vector<std::string> filterColumnNames;
   RowTypePtr filterType;
+
+  /// Whether an output column reads each of 'filterColumnNames'. A filter-only
+  /// column (false) is decoded to evaluate the filters and then dropped: it is
+  /// neither gathered to the passing rows nor returned. Its type comes from the
+  /// table handle's dataColumns(), else from the unextracted remaining filter
+  /// that reads it; its name must be a column of the encoded table.
+  std::vector<bool> filterColumnIsOutput;
 };
 
 /// Registers a TableScan adapter ahead of the built-in one that replaces scans
 /// of an EncodedConnector with CudfEncodedScan and defers other scans to
-/// the next adapter. Call after registerCudf().
-void registerEncodedTableScanAdapter();
+/// the next adapter. Call after registerCudf(). With 'plainFilterViews', scans
+/// of host-resident tables filter on the plain columns each staged batch owns
+/// instead of on gathered copies.
+void registerEncodedTableScanAdapter(
+    bool dictionaryFilters = false,
+    bool plainFilterViews = false);
 
 } // namespace facebook::velox::cudf_velox::connector::encoded

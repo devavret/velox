@@ -14,7 +14,7 @@
 
 # --- TPC-H benchmarks ---
 
-add_executable(velox_cudf_tpch_benchmark CudfTpchBenchmark.cpp)
+add_executable(velox_cudf_tpch_benchmark CudfTpchBenchmark.cpp SiriusTpchQueryBuilder.cpp)
 
 target_link_libraries(
   velox_cudf_tpch_benchmark
@@ -48,3 +48,5 @@ target_link_libraries(
   Folly::folly
   Folly::follybenchmark
 )
+
+velox_link_libraries(velox_cudf_tpch_benchmark velox_functions_spark_impl)

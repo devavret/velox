@@ -30,6 +30,7 @@ add_library(
   DecimalExpressionKernelsGpu.cu
   ExpressionEvaluator.cpp
   JitExpression.cpp
+  LikeMultiLiteral.cu
   NullMask.cpp
   PrestoFunctions.cpp
   prestosql/ArrayJoinFunction.cpp

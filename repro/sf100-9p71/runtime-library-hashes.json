@@ -1,0 +1,37 @@
+[
+  {
+    "name": "libucxx.so",
+    "sha256": "090708fefef213fb56e7f108bd92e6ad2b743a6204ddf2c0c1592a8f51e9803f",
+    "bytes": 1115064
+  },
+  {
+    "name": "libcudf.so",
+    "sha256": "46ae1802f6bc4735a969bb22dddbf3b6111b72e978c26c294c0356c5fcac8364",
+    "bytes": 224473656
+  },
+  {
+    "name": "libnvcomp.so.6",
+    "sha256": "b89fb4820fdb6f4cd96203500b6722bb31cd7b52463d59cf9549c54cb2e08c18",
+    "bytes": 47944384
+  },
+  {
+    "name": "librmm.so",
+    "sha256": "b797fbae2811f02cd326cd07263a842cb693ebf7f421fb30394e033282c765ff",
+    "bytes": 1554992
+  },
+  {
+    "name": "librapids_logger.so",
+    "sha256": "6b2738ab110e5059225f8d87c3e3448ddc775f997bf118726abb7781eab40ce9",
+    "bytes": 759272
+  },
+  {
+    "name": "libnanoarrow_shared.so",
+    "sha256": "53d80be156ce972ba8d45a4a03b6f0f06d30c4428cf5d49ec87509d2c7e8a41c",
+    "bytes": 74800
+  },
+  {
+    "name": "libcurl.so.4",
+    "sha256": "c597151afe30178d70afc5a15ae49deceeeb5b7217900c30d0c9784a7d96cd56",
+    "bytes": 766592
+  }
+]

@@ -38,6 +38,7 @@ add_library(
   CudfTopNRowNumber.cpp
   CudfWindow.cpp
   DebugUtil.cpp
+  DenseIntegerGroupby.cu
   DecimalAggregationDevice.cu
   DecimalAggregationHostOps.cpp
   DecimalAggregationState.cpp

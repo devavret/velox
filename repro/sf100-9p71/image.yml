@@ -1,0 +1,3 @@
+services:
+  adapters-cuda:
+    image: ghcr.io/facebookincubator/velox-dev@sha256:ce022e22a073452064026f7ace08caeccefe24d50bc283580ccf1a94fec7e10c

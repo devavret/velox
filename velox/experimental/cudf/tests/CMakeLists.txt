@@ -290,6 +290,12 @@ velox_add_cudf_test(
 )
 
 velox_add_cudf_test(
+  NAME velox_cudf_like_multiliteral_test
+  SOURCES Main.cpp LikeMultiLiteralTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_cudf_expression velox_functions_test_lib
+)
+
+velox_add_cudf_test(
   NAME velox_cudf_subfield_filter_ast_test
   SOURCES Main.cpp SubfieldFilterAstTest.cpp
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_cudf_iceberg_connector
@@ -362,3 +368,55 @@ add_subdirectory(utils)
 if(${VELOX_ENABLE_SPARK_FUNCTIONS})
   add_subdirectory(sparksql)
 endif()
+
+velox_add_cudf_test(
+  NAME velox_cudf_encoded_scan_test
+  SOURCES Main.cpp EncodedScanTest.cpp
+  LIBS
+    velox_cudf_exec_test_lib
+    velox_cudf_encoded_connector
+    velox_cudf_hive_connector
+    velox_exec
+    velox_exec_test_lib
+    velox_test_util
+    fmt::fmt
+)
+
+velox_add_cudf_test(
+  NAME velox_cudf_encoded_codec_test
+  SOURCES Main.cpp EncodedCodecTest.cpp
+  LIBS
+    velox_cudf_exec_test_lib
+    velox_cudf_encoded_connector
+    velox_cudf_hive_connector
+    velox_exec
+    velox_exec_test_lib
+    velox_test_util
+    fmt::fmt
+)
+
+velox_add_cudf_test(
+  NAME velox_cudf_encoded_lz4_test
+  SOURCES Main.cpp EncodedLz4Test.cpp
+  LIBS
+    velox_cudf_exec_test_lib
+    velox_cudf_encoded_connector
+    velox_cudf_hive_connector
+    velox_exec
+    velox_exec_test_lib
+    velox_test_util
+    fmt::fmt
+)
+
+velox_add_cudf_test(
+  NAME velox_cudf_encoded_plain_view_test
+  SOURCES Main.cpp EncodedPlainViewTest.cpp
+  LIBS
+    velox_cudf_exec_test_lib
+    velox_cudf_encoded_connector
+    velox_cudf_hive_connector
+    velox_exec
+    velox_exec_test_lib
+    velox_test_util
+    fmt::fmt
+)

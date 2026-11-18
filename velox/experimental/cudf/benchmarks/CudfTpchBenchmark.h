@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "velox/experimental/cudf/benchmarks/SiriusTpchQueryBuilder.h"
+
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
 #include "velox/common/base/Exceptions.h"
 
@@ -34,8 +36,7 @@ class CudfTpchBenchmark : public TpchBenchmark {
  public:
   void initialize() override;
 
-  void runMain(std::ostream& out, facebook::velox::RunStats& runStats)
-      override;
+  void runMain(std::ostream& out, facebook::velox::RunStats& runStats) override;
 
   std::shared_ptr<facebook::velox::config::ConfigBase> makeConnectorProperties()
       override;
@@ -50,6 +51,8 @@ class CudfTpchBenchmark : public TpchBenchmark {
 
  private:
   std::shared_ptr<facebook::velox::exec::test::TpchQueryBuilder> queryBuilder_;
+  std::shared_ptr<facebook::velox::exec::test::SiriusTpchQueryBuilder>
+      siriusQueryBuilder_;
 };
 
 namespace facebook::velox::cudf_velox {

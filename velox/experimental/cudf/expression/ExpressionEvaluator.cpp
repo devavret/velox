@@ -21,6 +21,7 @@
 #include "velox/experimental/cudf/expression/DecimalExpressionKernels.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluatorRegistry.h"
+#include "velox/experimental/cudf/expression/LikeMultiLiteral.h"
 #include "velox/experimental/cudf/expression/NullMask.h"
 
 #include "velox/common/base/Exceptions.h"
@@ -2044,6 +2045,15 @@ class LikeFunction : public CudfFunction {
         }
       }
     }
+
+    if (patternIsConstant_ && !patternIsNull_ && !escapeIsNull_ &&
+        CudfConfig::getInstance().likeMultiLiteralEnabled) {
+      // Parse the constant pattern once per expression. eval() still runs the
+      // null and escape checks before using it.
+      multiLiteral_ = classifyLikeMultiLiteral(
+          pattern_,
+          hasEscape_ ? std::optional<std::string_view>(escape_) : std::nullopt);
+    }
   }
 
   ColumnOrView eval(
@@ -2094,6 +2104,18 @@ class LikeFunction : public CudfFunction {
     if (patternIsConstant_) {
       if (hasEscape_) {
         validateConstantPattern(pattern_, escapeChar);
+      }
+      if (multiLiteral_.has_value() &&
+          inputCol.type().id() == cudf::type_id::STRING) {
+        // A null result means the column layout is not supported; use
+        // cudf::strings::like below.
+        if (auto result = likeMultiLiteral(
+                cudf::strings_column_view(inputCol),
+                *multiLiteral_,
+                stream,
+                mr)) {
+          return result;
+        }
       }
       return cudf::strings::like(inputCol, pattern_, escape_, stream, mr);
     }
@@ -2155,6 +2177,10 @@ class LikeFunction : public CudfFunction {
   std::string escape_;
   std::unique_ptr<cudf::column> targetsColumn_;
   std::unique_ptr<cudf::column> replacementsColumn_;
+  // The parsed constant pattern for likeMultiLiteral(). Set only when
+  // CudfConfig::likeMultiLiteralEnabled was on as this expression was built
+  // and the pattern qualifies.
+  std::optional<LikeMultiLiteralPattern> multiLiteral_;
 };
 
 void LikeFunction::validateConstantPattern(

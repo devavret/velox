@@ -327,6 +327,276 @@ int64_t streamingGroupbyStatSum(
   return statIt == planIt->second.customStats.end() ? 0 : statIt->second.sum;
 }
 
+class GroupbyExperimentTest : public AggregationTest {
+ protected:
+  void SetUp() override {
+    AggregationTest::SetUp();
+    auto& config = cudf_velox::CudfConfig::getInstance();
+    savedSorted_ = config.sortedGroupbyDetectionEnabled;
+    savedOneShot_ = config.finalGroupbyOneShotEnabled;
+    config.sortedGroupbyDetectionEnabled = true;
+    config.finalGroupbyOneShotEnabled = true;
+    config.streamingGroupbyEnabled = true;
+  }
+
+  void TearDown() override {
+    auto& config = cudf_velox::CudfConfig::getInstance();
+    config.sortedGroupbyDetectionEnabled = savedSorted_;
+    config.finalGroupbyOneShotEnabled = savedOneShot_;
+    AggregationTest::TearDown();
+  }
+
+ private:
+  bool savedSorted_{false};
+  bool savedOneShot_{false};
+};
+
+TEST_F(GroupbyExperimentTest, sortedAndUnsortedNullableKeys) {
+  for (bool sorted : {false, true}) {
+    auto keys = sorted
+        ? makeNullableFlatVector<int64_t>({std::nullopt, 1, 1, 2, 2, 3})
+        : makeNullableFlatVector<int64_t>({2, 1, std::nullopt, 3, 2, 1});
+    auto input = makeRowVector({
+        keys,
+        makeNullableFlatVector<int64_t>({10, std::nullopt, 30, -4, 5, 6}),
+    });
+    createDuckDbTable({input});
+    core::PlanNodeId aggregationId;
+    auto plan = PlanBuilder()
+                    .values({input})
+                    .singleAggregation(
+                        {"c0"}, {"sum(c1)", "count(c1)", "min(c1)", "max(c1)"})
+                    .capturePlanNodeId(aggregationId)
+                    .planNode();
+    auto task = assertQuery(
+        plan,
+        "SELECT c0, sum(c1), count(c1), min(c1), max(c1) FROM tmp GROUP BY c0");
+    EXPECT_TRUE(hasStreamingGroupbyStat(
+        task,
+        aggregationId,
+        sorted ? "cudfSortedGroupbyBatches" : "cudfUnsortedGroupbyBatches"));
+  }
+}
+
+TEST_F(GroupbyExperimentTest, finalMergesOverlappingBatches) {
+  std::vector<RowVectorPtr> inputs;
+  for (int batch = 0; batch < 4; ++batch) {
+    inputs.push_back(makeRowVector({
+        makeFlatVector<int64_t>(
+            10000,
+            [batch](auto i) { return batch % 2 ? (9999 - i) % 103 : i % 103; }),
+        makeFlatVector<int64_t>(
+            10000,
+            [batch](auto i) { return static_cast<int64_t>(i) - batch * 100; }),
+    }));
+  }
+  createDuckDbTable(inputs);
+  core::PlanNodeId finalId;
+  auto plan = PlanBuilder()
+                  .values(inputs)
+                  .partialAggregation({"c0"}, {"sum(c1)", "count(c1)"})
+                  .localPartition({"c0"})
+                  .finalAggregation()
+                  .capturePlanNodeId(finalId)
+                  .planNode();
+  auto task =
+      assertQuery(plan, "SELECT c0, sum(c1), count(c1) FROM tmp GROUP BY c0");
+  EXPECT_TRUE(
+      hasStreamingGroupbyStat(task, finalId, "cudfFinalGroupbyOneShot"));
+  EXPECT_FALSE(hasStreamingGroupbyStat(
+      task, finalId, cudf_velox::kStreamingGroupbyUsedStat));
+}
+
+class DenseIntegerGroupbyTest : public AggregationTest {
+ protected:
+  void SetUp() override {
+    AggregationTest::SetUp();
+    auto& config = cudf_velox::CudfConfig::getInstance();
+    savedDense_ = config.denseIntegerGroupbyEnabled;
+    savedSorted_ = config.sortedGroupbyDetectionEnabled;
+    savedOneShot_ = config.finalGroupbyOneShotEnabled;
+    config.denseIntegerGroupbyEnabled = true;
+    config.sortedGroupbyDetectionEnabled = false;
+    config.finalGroupbyOneShotEnabled = true;
+  }
+
+  void TearDown() override {
+    auto& config = cudf_velox::CudfConfig::getInstance();
+    config.denseIntegerGroupbyEnabled = savedDense_;
+    config.sortedGroupbyDetectionEnabled = savedSorted_;
+    config.finalGroupbyOneShotEnabled = savedOneShot_;
+    AggregationTest::TearDown();
+  }
+
+  void
+  check(const RowVectorPtr& data, const std::string& aggregate, bool dense) {
+    createDuckDbTable({data});
+    core::PlanNodeId id;
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .singleAggregation({"c0"}, {aggregate})
+                    .capturePlanNodeId(id)
+                    .planNode();
+    auto task =
+        assertQuery(plan, "SELECT c0, " + aggregate + " FROM tmp GROUP BY c0");
+    EXPECT_EQ(
+        hasStreamingGroupbyStat(task, id, "cudfDenseIntegerGroupbyBatches"),
+        dense);
+  }
+
+ private:
+  bool savedDense_{false};
+  bool savedSorted_{false};
+  bool savedOneShot_{false};
+};
+
+TEST_F(GroupbyExperimentTest, oneBatchFinalSkipsConcatenation) {
+  auto data = makeRowVector(
+      {makeFlatVector<int64_t>({1, 2, 1, 2}),
+       makeFlatVector<int64_t>({10, 20, 30, 40})});
+  createDuckDbTable({data});
+  core::PlanNodeId finalId;
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .finalAggregation()
+                  .capturePlanNodeId(finalId)
+                  .planNode();
+  auto task = assertQuery(plan, "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+  EXPECT_TRUE(hasStreamingGroupbyStat(task, finalId, "cudfSingleBatchGroupby"));
+  EXPECT_FALSE(
+      hasStreamingGroupbyStat(task, finalId, "cudfGroupbyConcatBatches"));
+}
+
+TEST_F(GroupbyExperimentTest, multipleFinalBatchesKeepConcatenation) {
+  std::vector<RowVectorPtr> inputs;
+  for (int batch = 0; batch < 8; ++batch) {
+    inputs.push_back(makeRowVector(
+        {makeFlatVector<int64_t>(
+             1250, [batch](auto i) { return (i + batch * 1250) % 503; }),
+         makeFlatVector<int64_t>(
+             1250, [batch](auto i) { return i + batch * 1250; })}));
+  }
+  createDuckDbTable(inputs);
+  core::PlanNodeId finalId;
+  auto plan = PlanBuilder()
+                  .values(inputs)
+                  .partialAggregation({"c0"}, {"sum(c1)"})
+                  .finalAggregation()
+                  .capturePlanNodeId(finalId)
+                  .planNode();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(1)
+                  .config(cudf_velox::CudfFromVelox::kGpuBatchSizeRows, "128")
+                  .config(QueryConfig::kMaxPartialAggregationMemory, 1)
+                  .assertResults("SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+  EXPECT_GT(
+      streamingGroupbyStatSum(task, finalId, "cudfGroupbyConcatBatches"), 1);
+  EXPECT_FALSE(
+      hasStreamingGroupbyStat(task, finalId, "cudfSingleBatchGroupby"));
+}
+
+TEST_F(DenseIntegerGroupbyTest, countAndPositiveSum) {
+  auto data = makeRowVector({
+      makeFlatVector<int32_t>(
+          10000, [](auto i) { return (i * 31) % 503 - 251; }),
+      makeFlatVector<int64_t>(10000, [](auto i) { return 1 + i % 19; }),
+  });
+  check(data, "count(c1)", true);
+  check(data, "sum(c1)", true);
+}
+
+TEST_F(DenseIntegerGroupbyTest, partialFinalCountUsesBothStages) {
+  auto data = makeRowVector({
+      makeFlatVector<int32_t>(
+          10000, [](auto i) { return (i * 31) % 503 - 251; }),
+      makeFlatVector<int64_t>(10000, [](auto i) { return i; }),
+  });
+  createDuckDbTable({data});
+  core::PlanNodeId partial, final;
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .partialAggregation({"c0"}, {"count(c1)"})
+                  .capturePlanNodeId(partial)
+                  .finalAggregation()
+                  .capturePlanNodeId(final)
+                  .planNode();
+  auto task = assertQuery(plan, "SELECT c0, count(c1) FROM tmp GROUP BY c0");
+  EXPECT_TRUE(
+      hasStreamingGroupbyStat(task, partial, "cudfDenseIntegerGroupbyBatches"));
+  EXPECT_TRUE(
+      hasStreamingGroupbyStat(task, final, "cudfDenseIntegerGroupbyBatches"));
+}
+
+TEST_F(DenseIntegerGroupbyTest, zeroAndNegativeSumsFallBack) {
+  check(
+      makeRowVector(
+          {makeFlatVector<int32_t>({1, 2, 1, 2}),
+           makeFlatVector<int64_t>({0, 0, 0, 0})}),
+      "sum(c1)",
+      false);
+  check(
+      makeRowVector(
+          {makeFlatVector<int32_t>({1, 2, 1, 2}),
+           makeFlatVector<int64_t>({-1, 2, 5, -2})}),
+      "sum(c1)",
+      false);
+}
+
+TEST_F(DenseIntegerGroupbyTest, nullKeysAndValuesFallBack) {
+  check(
+      makeRowVector(
+          {makeNullableFlatVector<int32_t>({1, std::nullopt, 1, 2}),
+           makeFlatVector<int64_t>({1, 2, 3, 4})}),
+      "count(c1)",
+      false);
+  check(
+      makeRowVector(
+          {makeFlatVector<int32_t>({1, 2, 1, 2}),
+           makeNullableFlatVector<int64_t>(
+               {1, std::nullopt, 3, std::nullopt})}),
+      "count(c1)",
+      false);
+}
+
+TEST_F(DenseIntegerGroupbyTest, sparseAndExtremeDomainsFallBack) {
+  check(
+      makeRowVector(
+          {makeFlatVector<int32_t>({1, 1000000}),
+           makeFlatVector<int64_t>({1, 2})}),
+      "count(c1)",
+      false);
+  check(
+      makeRowVector(
+          {makeFlatVector<int32_t>(
+               {std::numeric_limits<int32_t>::min(),
+                std::numeric_limits<int32_t>::max()}),
+           makeFlatVector<int64_t>({1, 2})}),
+      "count(c1)",
+      false);
+}
+
+TEST_F(DenseIntegerGroupbyTest, unsafeGlobalSumBoundFallsBack) {
+  // Each group fits, but the conservative whole-batch bound does not.
+  check(
+      makeRowVector(
+          {makeFlatVector<int32_t>({1, 2}),
+           makeFlatVector<int64_t>(
+               {std::numeric_limits<int64_t>::max(),
+                std::numeric_limits<int64_t>::max()})}),
+      "sum(c1)",
+      false);
+}
+
+TEST_F(DenseIntegerGroupbyTest, emptyInput) {
+  check(
+      makeRowVector(
+          {makeFlatVector<int32_t>(std::vector<int32_t>{}),
+           makeFlatVector<int64_t>(std::vector<int64_t>{})}),
+      "count(c1)",
+      false);
+}
+
 TEST_F(AggregationTest, global) {
   auto vectors = makeVectors(rowType_, 10, 100);
   createDuckDbTable(vectors);

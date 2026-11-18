@@ -19,6 +19,7 @@
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
+#include "velox/experimental/cudf/exec/DenseIntegerGroupby.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -42,6 +43,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
@@ -1922,6 +1924,13 @@ void CudfGroupby::initialize() {
             return aggregator->stateGrowsWithInput();
           });
 
+  if (CudfConfig::getInstance().finalGroupbyOneShotEnabled &&
+      aggregationNode_->step() == core::AggregationNode::Step::kFinal) {
+    incrementalAggregationEnabled_ = false;
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat("cudfFinalGroupbyOneShot", RuntimeCounter(1));
+  }
+
   // Make aggregators for intermediate step when streaming is enabled.
   if (incrementalAggregationEnabled_) {
     const bool isFinalOrSingle =
@@ -2165,12 +2174,22 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
   auto groupbyKeyView =
       tableView.select(groupByKeys.begin(), groupByKeys.end());
 
-  // TODO: All other args to groupby are related to sort groupby. We don't
-  // support optimizations related to it yet.
+  // Check the actual batch, including after concatenating partial states.
+  // Never infer ordering from scan metadata or the first input batch.
+  const bool detectSorted =
+      CudfConfig::getInstance().sortedGroupbyDetectionEnabled;
+  const bool keysSorted =
+      detectSorted && cudf::is_sorted(groupbyKeyView, {}, {}, stream);
+  if (detectSorted) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        keysSorted ? "cudfSortedGroupbyBatches" : "cudfUnsortedGroupbyBatches",
+        RuntimeCounter(1));
+  }
   cudf::groupby::groupby groupByOwner(
       groupbyKeyView,
-      ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
-                      : cudf::null_policy::INCLUDE);
+      ignoreNullKeys_ ? cudf::null_policy::EXCLUDE : cudf::null_policy::INCLUDE,
+      keysSorted ? cudf::sorted::YES : cudf::sorted::NO);
 
   auto releaseInputs = [&]() {
     for (auto& aggregator : aggregators) {
@@ -2183,7 +2202,18 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     aggregator->addGroupbyRequest(tableView, requests, stream, get_temp_mr());
   }
 
-  auto [groupKeys, results] = groupByOwner.aggregate(requests, stream, mr);
+  std::optional<DenseIntegerGroupbyResult> dense;
+  if (CudfConfig::getInstance().denseIntegerGroupbyEnabled && !keysSorted) {
+    dense = tryDenseIntegerGroupby(
+        groupbyKeyView, requests, stream, get_temp_mr(), mr);
+  }
+  if (dense) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfDenseIntegerGroupbyBatches", RuntimeCounter(1));
+  }
+  auto [groupKeys, results] =
+      dense ? std::move(*dense) : groupByOwner.aggregate(requests, stream, mr);
   requests.clear();
   releaseInputs();
   releaseInputsGuard.dismiss();
@@ -2312,6 +2342,38 @@ RowVectorPtr CudfGroupby::doGetOutput() {
     return nullptr;
   }
 
+  if (noMoreInput_) {
+    finished_ = true;
+  }
+  // Adapted from Velox PR #19928, head
+  // fad891b2275253aab7ca80b6b9f54dbd451f4cac. Keep a single batch on its own
+  // stream, avoiding a concatenation copy and cross-stream synchronization.
+  // Input buffers are freed on the same stream after the aggregation reads, and
+  // the output retains that stream.
+  if (inputs_.size() == 1) {
+    auto input = std::move(inputs_.front());
+    inputs_.clear();
+    const auto inputStream = input->stream();
+    auto view = input->getTableView().select(
+        aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat("cudfSingleBatchGroupby", RuntimeCounter(1));
+    }
+    return doGroupByAggregation(
+        view,
+        groupingKeyOutputChannels_,
+        aggregators_,
+        outputType_,
+        inputStream,
+        get_output_mr());
+  }
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfGroupbyConcatBatches", RuntimeCounter(inputs_.size()));
+  }
+
   auto stream = cudfGlobalStreamPool().get_stream();
 
   auto tbl = getConcatenatedTable(
@@ -2320,10 +2382,6 @@ RowVectorPtr CudfGroupby::doGetOutput() {
   // Release input data after synchronizing.
   stream.sync();
   inputs_.clear();
-
-  if (noMoreInput_) {
-    finished_ = true;
-  }
 
   VELOX_CHECK_NOT_NULL(tbl);
 

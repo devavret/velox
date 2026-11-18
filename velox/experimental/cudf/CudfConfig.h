@@ -52,6 +52,14 @@ struct CudfConfig {
       "cudf.batch_size_max_threshold"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
+  static constexpr const char* kCudfSortedGroupbyDetectionEnabled{
+      "cudf.sorted_groupby_detection_enabled"};
+  static constexpr const char* kCudfDenseIntegerGroupbyEnabled{
+      "cudf.dense_integer_groupby_enabled"};
+  static constexpr const char* kCudfFinalGroupbyOneShotEnabled{
+      "cudf.final_groupby_one_shot_enabled"};
+  static constexpr const char* kCudfLikeMultiLiteralEnabled{
+      "cudf.like_multiliteral_enabled"};
   static constexpr const char* kCudfStreamingGroupbyEnabled{
       "cudf.streaming_groupby_enabled"};
   static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
@@ -170,6 +178,21 @@ struct CudfConfig {
   /// aggregations. This is opt-in while it supports only a subset of the
   /// aggregation combinations supported by the regular cuDF groupby path.
   bool streamingGroupbyEnabled{false};
+
+  /// Experimental: detect sorted keys for ordinary per-batch groupby.
+  bool sortedGroupbyDetectionEnabled{false};
+
+  /// Experimental: buffer final grouped input for one ordinary groupby.
+  bool finalGroupbyOneShotEnabled{false};
+
+  /// Experimental: evaluate a constant LIKE pattern '%lit1%...%litN%' with
+  /// ASCII literals by searching each row a word at a time for the literals
+  /// in order, instead of cudf::strings::like. Read when an expression is
+  /// built; other patterns and column layouts keep cudf::strings::like.
+  bool likeMultiLiteralEnabled{false};
+
+  /// Experimental bounded direct-address COUNT and positive integer SUM.
+  bool denseIntegerGroupbyEnabled{false};
 
   /// Multiplier used to derive streaming_groupby's initial logical capacity
   /// from the first batch and to grow capacity when it is exhausted.

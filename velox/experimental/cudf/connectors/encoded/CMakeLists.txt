@@ -31,4 +31,5 @@ target_link_libraries(
     velox_exec
     velox_expression
     velox_hive_connector
+    nvcomp::nvcomp
 )

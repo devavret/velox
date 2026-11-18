@@ -14,33 +14,55 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/connectors/encoded/CudfEncodedScan.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/connectors/encoded/CudfEncodedScan.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
+#include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
 #include "velox/exec/Task.h"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 
-#include "velox/experimental/cudf/CudfNoDefaults.h"
-
 #include <algorithm>
 #include <numeric>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox::connector::encoded {
+
+namespace {
+void inputNames(
+    const core::TypedExprPtr& expr,
+    std::unordered_set<std::string>& names) {
+  if (!expr) {
+    return;
+  }
+  if (const auto* field =
+          dynamic_cast<const core::FieldAccessTypedExpr*>(expr.get());
+      field && field->isInputColumn()) {
+    names.insert(field->name());
+  }
+  for (const auto& child : expr->inputs()) {
+    inputNames(child, names);
+  }
+}
+} // namespace
 
 CudfEncodedScan::CudfEncodedScan(
     int32_t operatorId,
     exec::DriverCtx* driverCtx,
-    const std::shared_ptr<const core::TableScanNode>& tableScanNode)
+    const std::shared_ptr<const core::TableScanNode>& tableScanNode,
+    bool dictionaryFilters,
+    bool plainFilterViews)
     : CudfSourceOperatorBase(
           operatorId,
           driverCtx,
@@ -63,16 +85,64 @@ CudfEncodedScan::CudfEncodedScan(
           tableScanNode->outputType(),
           tableScanNode->tableHandle(),
           tableScanNode->assignments(),
-          connectorQueryCtx_.get()) {
+          connectorQueryCtx_.get()),
+      plainFilterViews_(plainFilterViews) {
   ensureCudaContextForThread();
-  if (!spec_.subfieldFilters.empty()) {
+  std::unordered_set<std::string> remainingNames;
+  inputNames(spec_.remainingFilter, remainingNames);
+  std::unordered_set<std::string> dictionaryNames;
+  common::SubfieldFilters normalFilters;
+  // Preserve the original broadcast shape of field-free remaining filters.
+  const bool optimizeDictionary =
+      dictionaryFilters && (!spec_.remainingFilter || !remainingNames.empty());
+  for (const auto& [field, filter] : spec_.subfieldFilters) {
+    const auto name = field.baseName();
+    const auto& column = spec_.table->column(name);
+    if (optimizeDictionary && remainingNames.count(name) == 0 &&
+        column.codec == Codec::kDictionary &&
+        spec_.columnType(name) == VARCHAR()) {
+      cudf::ast::tree tree;
+      std::vector<std::unique_ptr<cudf::scalar>> scalars;
+      const auto dictionaryType = ROW({name}, {VARCHAR()});
+      const auto& expr = createAstFromSubfieldFilter(
+          field, *filter, tree, scalars, dictionaryType);
+      const auto stream = cudfGlobalStreamPool().get_stream();
+      auto mask = cudf::compute_column(
+          cudf::table_view{{column.values->view()}},
+          expr,
+          stream,
+          get_temp_mr());
+      // The bounded dictionary computation must finish before temporary AST
+      // scalars (created on their initialization stream) are released. Batch
+      // decoding retains its existing sync, so no consumer outlives this mask.
+      stream.sync();
+      dictionaryPredicates_.push_back({name, std::move(mask)});
+      dictionaryNames.insert(name);
+    } else {
+      normalFilters.emplace(field.clone(), filter->clone());
+    }
+  }
+  std::vector<TypePtr> normalTypes;
+  for (size_t i = 0; i < spec_.filterColumnNames.size(); ++i) {
+    const auto& name = spec_.filterColumnNames[i];
+    if (dictionaryNames.count(name) != 0) {
+      continue;
+    }
+    normalFilterColumnNames_.push_back(name);
+    normalFilterColumnIsOutput_.push_back(spec_.filterColumnIsOutput[i]);
+    normalTypes.push_back(spec_.columnType(name));
+  }
+  normalFilterType_ =
+      ROW(std::vector<std::string>(normalFilterColumnNames_),
+          std::move(normalTypes));
+  if (!normalFilters.empty()) {
     subfieldAst_ = &createAstFromSubfieldFilters(
-        spec_.subfieldFilters, subfieldTree_, subfieldScalars_, spec_.filterType);
+        normalFilters, subfieldTree_, subfieldScalars_, normalFilterType_);
   }
   if (spec_.remainingFilter) {
     remainingFilterExpression_ = createCudfExpression(
         spec_.remainingFilter,
-        spec_.filterType,
+        normalFilterType_,
         connectorQueryCtx_->memoryPool(),
         spec_.optimizeQueryCtx->queryConfig());
   }
@@ -113,7 +183,8 @@ int64_t CudfEncodedScan::decodeRowsTarget() const {
   }
   const int64_t maxRows =
       config.batchSizeMaxThreshold.value_or(kDefaultMaxDecodeRows);
-  return std::min<int64_t>(maxRows, static_cast<int64_t>(targetRows / passRate));
+  return std::min<int64_t>(
+      maxRows, static_cast<int64_t>(targetRows / passRate));
 }
 
 bool CudfEncodedScan::fillPending(int64_t decodeRows) {
@@ -143,7 +214,8 @@ bool CudfEncodedScan::fillPending(int64_t decodeRows) {
     VELOX_CHECK_EQ(encodedSplit->table, spec_.table->name);
     const auto segments = spec_.rejectsAllRows
         ? std::vector<int32_t>{}
-        : spec_.pruneSegments(encodedSplit->segmentBegin, encodedSplit->segmentEnd);
+        : spec_.pruneSegments(
+              encodedSplit->segmentBegin, encodedSplit->segmentEnd);
     for (auto segment : segments) {
       pendingSegments_.push_back(segment);
       pendingRows_ += spec_.table->segmentSize(segment);
@@ -195,8 +267,7 @@ bool CudfEncodedScan::takeBatch(Batch& batch) {
         table, stagedColumnNames_, batch.segments, stream, get_temp_mr());
     cudaEvent_t event;
     VELOX_CHECK(
-        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) ==
-            cudaSuccess,
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) == cudaSuccess,
         "Creating a staging event failed");
     batch.staged.reset(event);
     VELOX_CHECK(
@@ -260,6 +331,19 @@ RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
   uint64_t timeUs{0};
   std::optional<MicrosecondWallTimer> timer(std::in_place, &timeUs);
   auto stream = cudfGlobalStreamPool().get_stream();
+  // Work queued on 'stream' below reads the staged columns of 'batch', which
+  // the caller destroys after this returns, on the staging stream. If an
+  // exception leaves before the synchronization at the end, wait for that
+  // work while 'batch' still lives. Never throws.
+  struct SyncOnUnwind {
+    cudaStream_t stream;
+    bool dismissed{false};
+    ~SyncOnUnwind() {
+      if (!dismissed) {
+        cudaStreamSynchronize(stream);
+      }
+    }
+  } syncOnUnwind{stream.get()};
   auto outputMr = get_output_mr();
   auto tempMr = get_temp_mr();
 
@@ -269,8 +353,7 @@ RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
   if (batch.table) {
     std::iota(segments.begin(), segments.end(), 0);
     VELOX_CHECK(
-        cudaStreamWaitEvent(stream.get(), batch.staged.get(), 0) ==
-            cudaSuccess,
+        cudaStreamWaitEvent(stream.get(), batch.staged.get(), 0) == cudaSuccess,
         "Waiting for staged segments failed");
   }
   rmm::device_uvector<int32_t> deviceSegments(segments.size(), stream, tempMr);
@@ -292,10 +375,31 @@ RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
   // into the concatenated segments.
   std::unordered_map<std::string, std::unique_ptr<cudf::column>> filtered;
   std::unique_ptr<cudf::column> rows;
+  int64_t filterOnlyColumns = 0;
+  int64_t borrowedFilterColumns = 0;
   if (!spec_.filterColumnNames.empty()) {
     std::vector<std::unique_ptr<cudf::column>> decoded;
     std::vector<cudf::column_view> views;
-    for (const auto& name : spec_.filterColumnNames) {
+    for (const auto& name : normalFilterColumnNames_) {
+      // A staged batch owns the plain values of exactly its rows: filter on
+      // them in place rather than on a gathered copy. 'batch' keeps them alive
+      // until this function returns; 'stream' waited for the staging above and
+      // is synchronized before returning, and no view of them is kept. A
+      // borrowed column leaves its 'decoded' slot empty so indices still match
+      // 'views'.
+      std::optional<cudf::column_view> borrowed;
+      if (plainFilterViews_ && batch.table) {
+        borrowed = stagedPlainValues(table.column(name));
+        if (borrowed.has_value() && borrowed->size() != numRows) {
+          borrowed.reset();
+        }
+      }
+      if (borrowed.has_value()) {
+        decoded.push_back(nullptr);
+        views.push_back(*borrowed);
+        ++borrowedFilterColumns;
+        continue;
+      }
       decoded.push_back(decodeColumn(
           table,
           table.column(name),
@@ -329,6 +433,52 @@ RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
             std::get<cudf::column_view>(result), stream, tempMr);
       }
     }
+    for (const auto& predicate : dictionaryPredicates_) {
+      auto codes = decodeDictionaryCodes(
+          table,
+          table.column(predicate.name),
+          segments,
+          deviceSegments,
+          std::nullopt,
+          stream,
+          tempMr);
+      auto selected = cudf::gather(
+                          cudf::table_view{{predicate.mask->view()}},
+                          codes->view(),
+                          cudf::out_of_bounds_policy::DONT_CHECK,
+                          stream,
+                          tempMr)
+                          ->release();
+      if (mask) {
+        mask = cudf::binary_operation(
+            mask->view(),
+            selected[0]->view(),
+            cudf::binary_operator::NULL_LOGICAL_AND,
+            cudf::data_type{cudf::type_id::BOOL8},
+            stream,
+            tempMr);
+      } else {
+        mask = std::move(selected[0]);
+      }
+    }
+    // Gather only the filter columns an output reads. A filter-only column is
+    // done with once the mask is computed, so release it before the gather
+    // allocates. Its memory came from 'tempMr' on 'stream' and returns to it
+    // in order on 'stream', after the mask computation already enqueued
+    // there, so the release cannot race those reads. 'mask' never aliases a
+    // decoded column: a view result of the remaining filter is copied above.
+    std::vector<size_t> gathered;
+    for (size_t i = 0; i < normalFilterColumnNames_.size(); ++i) {
+      if (normalFilterColumnIsOutput_[i]) {
+        gathered.push_back(i);
+      } else {
+        decoded[i].reset();
+      }
+    }
+    filterOnlyColumns = static_cast<int64_t>(std::count(
+        spec_.filterColumnIsOutput.begin(),
+        spec_.filterColumnIsOutput.end(),
+        false));
     auto sequence = cudf::sequence(
         static_cast<cudf::size_type>(numRows),
         cudf::numeric_scalar<int32_t>(0, true, stream, tempMr),
@@ -336,13 +486,16 @@ RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
         stream,
         tempMr);
     std::vector<cudf::column_view> withRows{sequence->view()};
-    withRows.insert(withRows.end(), views.begin(), views.end());
+    for (const auto i : gathered) {
+      withRows.push_back(views[i]);
+    }
     auto kept = cudf::apply_retention_mask(
                     cudf::table_view(withRows), mask->view(), stream, outputMr)
                     ->release();
     rows = std::move(kept[0]);
-    for (size_t i = 0; i < spec_.filterColumnNames.size(); ++i) {
-      filtered.emplace(spec_.filterColumnNames[i], std::move(kept[i + 1]));
+    for (size_t j = 0; j < gathered.size(); ++j) {
+      filtered.emplace(
+          normalFilterColumnNames_[gathered[j]], std::move(kept[j + 1]));
     }
     numRows = rows->size();
   }
@@ -370,7 +523,10 @@ RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
         stream,
         outputMr));
   }
+  common::testutil::TestValue::adjust(
+      "CudfEncodedScan::decodeBatch::beforeSync", &numRows);
   stream.sync();
+  syncOnUnwind.dismissed = true;
   timer.reset();
 
   decodedRows_ += inputRows;
@@ -384,7 +540,15 @@ RowVectorPtr CudfEncodedScan::decodeBatch(const Batch& batch) {
     if (!spec_.filterColumnNames.empty()) {
       lockedStats->addRuntimeStat(
           "encodedRowsDecodedForFilter", RuntimeCounter(inputRows));
+      lockedStats->addRuntimeStat(
+          "encodedFilterOnlyColumns", RuntimeCounter(filterOnlyColumns));
+      lockedStats->addRuntimeStat(
+          "encodedBorrowedFilterColumns",
+          RuntimeCounter(borrowedFilterColumns));
     }
+    lockedStats->addRuntimeStat(
+        "encodedDictionaryFilterColumns",
+        RuntimeCounter(static_cast<int64_t>(dictionaryPredicates_.size())));
     lockedStats->addRuntimeStat("encodedRowsPassed", RuntimeCounter(numRows));
     lockedStats->addRuntimeStat(
         "encodedDecodeFilterTime",

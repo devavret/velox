@@ -37,6 +37,10 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
+      {CudfConfig::kCudfSortedGroupbyDetectionEnabled, "true"},
+      {CudfConfig::kCudfFinalGroupbyOneShotEnabled, "true"},
+      {CudfConfig::kCudfLikeMultiLiteralEnabled, "true"},
+      {CudfConfig::kCudfDenseIntegerGroupbyEnabled, "true"},
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kCudfBatchSizeMinThreshold, "123456"},
@@ -44,6 +48,10 @@ TEST(ConfigTest, cudfConfig) {
 
   CudfConfig config;
   ASSERT_FALSE(config.streamingGroupbyEnabled);
+  ASSERT_FALSE(config.sortedGroupbyDetectionEnabled);
+  ASSERT_FALSE(config.finalGroupbyOneShotEnabled);
+  ASSERT_FALSE(config.likeMultiLiteralEnabled);
+  ASSERT_FALSE(config.denseIntegerGroupbyEnabled);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 2.0);
   config.initialize(std::move(options));
   ASSERT_EQ(config.enabled, false);
@@ -52,6 +60,10 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.streamingGroupbyEnabled, true);
+  ASSERT_TRUE(config.sortedGroupbyDetectionEnabled);
+  ASSERT_TRUE(config.finalGroupbyOneShotEnabled);
+  ASSERT_TRUE(config.likeMultiLiteralEnabled);
+  ASSERT_TRUE(config.denseIntegerGroupbyEnabled);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.batchSizeMinThreshold, 123'456);

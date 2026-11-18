@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/connectors/encoded/EncodedConnector.h"
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/encoded/CudfEncodedScan.h"
+#include "velox/experimental/cudf/connectors/encoded/EncodedConnector.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 
 #include "velox/connectors/ConnectorRegistry.h"
@@ -25,8 +26,6 @@
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/ExprOptimizer.h"
-
-#include "velox/experimental/cudf/CudfNoDefaults.h"
 
 #include <unordered_set>
 
@@ -41,6 +40,23 @@ bool isTrueConstant(
     memory::MemoryPool* pool) {
   return !constant.isNull() &&
       constant.toConstantVector(pool)->as<ConstantVector<bool>>()->valueAt(0);
+}
+
+// Records the type of each top-level column 'expr' reads.
+void collectInputColumnTypes(
+    const core::TypedExprPtr& expr,
+    std::unordered_map<std::string, TypePtr>& types) {
+  if (expr == nullptr) {
+    return;
+  }
+  if (const auto* field =
+          dynamic_cast<const core::FieldAccessTypedExpr*>(expr.get());
+      field != nullptr && field->isInputColumn()) {
+    types.emplace(field->name(), field->type());
+  }
+  for (const auto& input : expr->inputs()) {
+    collectInputColumnTypes(input, types);
+  }
 }
 
 bool prunesOnInt64Range(const common::Filter& filter) {
@@ -70,11 +86,12 @@ std::vector<std::shared_ptr<ConnectorSplit>> makeEncodedSplits(
   std::vector<std::shared_ptr<ConnectorSplit>> splits;
   for (int32_t begin = 0; begin < encoded.numSegments;
        begin += segmentsPerSplit) {
-    splits.push_back(std::make_shared<EncodedConnectorSplit>(
-        connectorId,
-        table,
-        begin,
-        std::min(begin + segmentsPerSplit, encoded.numSegments)));
+    splits.push_back(
+        std::make_shared<EncodedConnectorSplit>(
+            connectorId,
+            table,
+            begin,
+            std::min(begin + segmentsPerSplit, encoded.numSegments)));
   }
   return splits;
 }
@@ -162,7 +179,9 @@ EncodedScanSpec::EncodedScanSpec(
   };
   for (const auto& [subfield, _] : subfieldFilters) {
     VELOX_CHECK_EQ(
-        subfield.path().size(), 1, "Only top-level column filters are supported");
+        subfield.path().size(),
+        1,
+        "Only top-level column filters are supported");
     addFilterColumn(subfield.baseName());
   }
   if (remainingFilter) {
@@ -170,6 +189,41 @@ EncodedScanSpec::EncodedScanSpec(
       addFilterColumn(name);
     }
   }
+  // A filter-only column is read for the filters but not returned. Check that
+  // the table has it and resolve its type, from the table schema when the
+  // handle has one, else from the remaining filter as written, before
+  // extraction moved some of its conjuncts to 'subfieldFilters'.
+  std::unordered_map<std::string, TypePtr> remainingFilterTypes;
+  collectInputColumnTypes(tableHandle->remainingFilter(), remainingFilterTypes);
+  const auto& dataColumns = tableHandle->dataColumns();
+  const std::unordered_set<std::string> outputColumnSet(
+      outputColumnNames.begin(), outputColumnNames.end());
+  filterColumnIsOutput.reserve(filterColumnNames.size());
+  for (const auto& name : filterColumnNames) {
+    VELOX_USER_CHECK(
+        table->columnIndex.count(name) > 0,
+        "Filter column {} not found in encoded table {}",
+        name,
+        table->name);
+    const bool isOutput = outputColumnSet.count(name) > 0;
+    filterColumnIsOutput.push_back(isOutput);
+    if (isOutput) {
+      continue;
+    }
+    if (dataColumns != nullptr && dataColumns->containsChild(name)) {
+      columnTypes.emplace(name, dataColumns->findChild(name));
+    } else if (const auto it = remainingFilterTypes.find(name);
+               it != remainingFilterTypes.end()) {
+      columnTypes.emplace(name, it->second);
+    } else {
+      VELOX_USER_FAIL(
+          "Filter-only column {} of encoded table {} has no type: pass the "
+          "table schema as the scan's dataColumns",
+          name,
+          table->name);
+    }
+  }
+
   std::vector<TypePtr> filterTypes;
   for (const auto& name : filterColumnNames) {
     filterTypes.push_back(columnType(name));
@@ -190,9 +244,8 @@ const TypePtr& EncodedScanSpec::columnType(const std::string& name) const {
   return dataColumns->findChild(name);
 }
 
-std::vector<int32_t> EncodedScanSpec::pruneSegments(
-    int32_t begin,
-    int32_t end) const {
+std::vector<int32_t> EncodedScanSpec::pruneSegments(int32_t begin, int32_t end)
+    const {
   std::vector<std::pair<const EncodedColumn*, const common::Filter*>> checks;
   for (const auto& [subfield, filter] : subfieldFilters) {
     const auto& column = table->column(subfield.baseName());
@@ -224,21 +277,23 @@ bool isEncodedScan(const exec::Operator* op) {
   if (!op->is<exec::TableScan>()) {
     return false;
   }
-  const auto* scanNode = dynamic_cast<const core::TableScanNode*>(
-      core::PlanNode::findNodeById(
+  const auto* scanNode =
+      dynamic_cast<const core::TableScanNode*>(core::PlanNode::findNodeById(
           op->operatorCtx()->task()->planFragment().planNode.get(),
           op->planNodeId()));
   if (scanNode == nullptr) {
     return false;
   }
-  return std::dynamic_pointer_cast<EncodedConnector>(
-             ConnectorRegistry::tryGet(
-                 scanNode->tableHandle()->connectorId())) != nullptr;
+  return std::dynamic_pointer_cast<EncodedConnector>(ConnectorRegistry::tryGet(
+             scanNode->tableHandle()->connectorId())) != nullptr;
 }
 
 class EncodedTableScanAdapter : public OperatorAdapter {
  public:
-  EncodedTableScanAdapter() : OperatorAdapter("EncodedTableScan") {}
+  EncodedTableScanAdapter(bool dictionaryFilters, bool plainFilterViews)
+      : OperatorAdapter("EncodedTableScan"),
+        dictionaryFilters_(dictionaryFilters),
+        plainFilterViews_(plainFilterViews) {}
 
   bool canHandle(const exec::Operator* op) const override {
     return isEncodedScan(op);
@@ -269,16 +324,24 @@ class EncodedTableScanAdapter : public OperatorAdapter {
     VELOX_CHECK_NOT_NULL(scanNode);
     std::vector<std::unique_ptr<exec::Operator>> result;
     result.push_back(
-        std::make_unique<CudfEncodedScan>(operatorId, ctx, scanNode));
+        std::make_unique<CudfEncodedScan>(
+            operatorId, ctx, scanNode, dictionaryFilters_, plainFilterViews_));
     return result;
   }
+
+ private:
+  const bool dictionaryFilters_;
+  const bool plainFilterViews_;
 };
 
 } // namespace
 
-void registerEncodedTableScanAdapter() {
+void registerEncodedTableScanAdapter(
+    bool dictionaryFilters,
+    bool plainFilterViews) {
   OperatorAdapterRegistry::getInstance().registerAdapterFront(
-      std::make_unique<EncodedTableScanAdapter>());
+      std::make_unique<EncodedTableScanAdapter>(
+          dictionaryFilters, plainFilterViews));
 }
 
 } // namespace facebook::velox::cudf_velox::connector::encoded

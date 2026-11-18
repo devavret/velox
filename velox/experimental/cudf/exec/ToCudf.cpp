@@ -487,6 +487,22 @@ void CudfConfig::initialize(
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);
   }
+  if (config.find(kCudfSortedGroupbyDetectionEnabled) != config.end()) {
+    sortedGroupbyDetectionEnabled =
+        folly::to<bool>(config[kCudfSortedGroupbyDetectionEnabled]);
+  }
+  if (config.find(kCudfDenseIntegerGroupbyEnabled) != config.end()) {
+    denseIntegerGroupbyEnabled =
+        folly::to<bool>(config[kCudfDenseIntegerGroupbyEnabled]);
+  }
+  if (config.find(kCudfFinalGroupbyOneShotEnabled) != config.end()) {
+    finalGroupbyOneShotEnabled =
+        folly::to<bool>(config[kCudfFinalGroupbyOneShotEnabled]);
+  }
+  if (config.find(kCudfLikeMultiLiteralEnabled) != config.end()) {
+    likeMultiLiteralEnabled =
+        folly::to<bool>(config[kCudfLikeMultiLiteralEnabled]);
+  }
   if (config.find(kCudfStreamingGroupbyEnabled) != config.end()) {
     streamingGroupbyEnabled =
         folly::to<bool>(config[kCudfStreamingGroupbyEnabled]);

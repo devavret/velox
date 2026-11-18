@@ -36,6 +36,9 @@ namespace facebook::velox::cudf_velox::connector::encoded {
 /// EncodedConnector. Pulls splits from the task, prunes their segments by
 /// min/max against the pushed-down filters, and decodes and filters the
 /// surviving segments in batches that cross segment and split boundaries.
+/// Filter columns no output reads are decoded to evaluate the filters and then
+/// dropped; only output columns are gathered to, or decoded at, the passing
+/// rows.
 ///
 /// Each batch takes whole segments until the rows expected to pass the filters
 /// reach CudfConfig::batchSizeMinBytes (estimated from the bytes per row of
@@ -56,7 +59,9 @@ class CudfEncodedScan : public CudfSourceOperatorBase {
   CudfEncodedScan(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
-      const std::shared_ptr<const core::TableScanNode>& tableScanNode);
+      const std::shared_ptr<const core::TableScanNode>& tableScanNode,
+      bool dictionaryFilters = false,
+      bool plainFilterViews = false);
 
   exec::BlockingReason isBlocked(ContinueFuture* future) override;
 
@@ -96,6 +101,20 @@ class CudfEncodedScan : public CudfSourceOperatorBase {
   memory::MemoryPool* const connectorPool_;
   std::shared_ptr<velox::connector::ConnectorQueryCtx> connectorQueryCtx_;
   EncodedScanSpec spec_;
+  // With a staged batch, filters read the plain columns the batch owns in
+  // place of gathered copies (stagedPlainValues()).
+  const bool plainFilterViews_;
+
+  struct DictionaryPredicate {
+    std::string name;
+    std::unique_ptr<cudf::column> mask;
+  };
+  // Predicate masks are computed per operator on the GPU over immutable
+  // dictionary values. They are ready before the constructor returns.
+  std::vector<DictionaryPredicate> dictionaryPredicates_;
+  std::vector<std::string> normalFilterColumnNames_;
+  std::vector<bool> normalFilterColumnIsOutput_;
+  RowTypePtr normalFilterType_;
 
   cudf::ast::tree subfieldTree_;
   std::vector<std::unique_ptr<cudf::scalar>> subfieldScalars_;

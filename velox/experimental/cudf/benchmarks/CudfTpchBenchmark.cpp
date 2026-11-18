@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/benchmarks/CudfTpchBenchmark.h"
 #include "velox/experimental/cudf/connectors/encoded/EncodedConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
@@ -31,16 +32,23 @@
 #include "velox/dwio/common/Options.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
+#include "velox/functions/sparksql/UnscaledValueFunction.h"
 
-#include <experimental/cudf/connectors/hive/CudfHiveConnector.h>
+#include <cudf/unary.hpp>
 
 #include <rmm/mr/pinned_host_memory_resource.hpp>
 
+#include <nvtx3/nvToolsExt.h>
+
+#include <cuda_profiler_api.h>
+#include <experimental/cudf/connectors/hive/CudfHiveConnector.h>
 #include <fmt/format.h>
 #include <folly/String.h>
+#include <folly/json.h>
 
 #include <chrono>
 #include <filesystem>
+#include <iomanip>
 #include <sstream>
 
 DECLARE_int64(max_coalesced_bytes);
@@ -107,6 +115,35 @@ DEFINE_bool(
     "time, in file order, and encoded on the GPU before any query runs; sort "
     "the files beforehand to cluster them.");
 
+DEFINE_bool(
+    encoded_lz4_strings,
+    false,
+    "Compress host-resident plain string characters with lossless GPU LZ4 blocks");
+
+DEFINE_bool(
+    encoded_dictionary_filters,
+    false,
+    "Evaluate eligible predicates over dictionary keys before decoding row strings");
+
+DEFINE_bool(
+    encoded_plain_filter_views,
+    false,
+    "Filter staged host-resident batches on the plain columns they own instead of gathered copies");
+
+DEFINE_bool(
+    encoded_delta,
+    false,
+    "Use lossless delta coding when it shrinks a sorted integer segment");
+
+DEFINE_bool(
+    encoded_scale100_decimals,
+    false,
+    "Pack scale-2 decimal segments proven to hold multiples of 100 above their minimum as (value - minimum) / 100 when narrower");
+DEFINE_bool(
+    encoded_codec_stats,
+    false,
+    "Print per-column encoded sizes and segment codec choices");
+
 DEFINE_string(
     encoded_memory,
     "device",
@@ -124,6 +161,105 @@ DEFINE_int32(
     "Segments per split, the unit of work handed to scan drivers. GPU scans "
     "batch segments across splits up to the cuDF batch-size targets.");
 
+DEFINE_bool(
+    sirius_q22_window,
+    false,
+    "Reuse Q22 filtered customers through a global SUM/COUNT window");
+
+DEFINE_bool(
+    sirius_q5_numeric_group,
+    false,
+    "Aggregate Q5 by nation key and materialize names afterward");
+
+DEFINE_bool(
+    sirius_q5_late_revenue,
+    false,
+    "Compute Q5 revenue after selective joins");
+
+DEFINE_bool(
+    sirius_q9_numeric_group,
+    false,
+    "Aggregate Q9 by nation key before materializing nation names");
+DEFINE_bool(
+    sirius_q9_partsupp_first,
+    false,
+    "Build Q9 partsupp restricted by part before probing lineitem");
+
+DEFINE_bool(
+    sirius_prune_scan_outputs,
+    false,
+    "Prune unused and filter-only columns from aligned TPC-H scan outputs");
+
+DEFINE_bool(
+    sirius_filter_only_scans,
+    false,
+    "Omit filter-only columns from optimized encoded scan outputs");
+
+DEFINE_bool(
+    sirius_q4_inner_distinct,
+    false,
+    "Apply Q4 orders restriction before distinct lineitem order keys");
+
+DEFINE_bool(
+    sirius_q15_window_max,
+    false,
+    "Reuse Q15 supplier revenues through a global MAX window");
+
+DEFINE_bool(
+    sirius_q21_pairs,
+    false,
+    "Evaluate Q21 with candidate late rows and one other-supplier scan");
+
+DEFINE_bool(
+    sirius_q18_unscaled_sum,
+    false,
+    "Use an exact unscaled Q18 sum after checking encoded value bounds");
+
+DEFINE_bool(
+    sirius_q17_window,
+    false,
+    "Compute the Q17 average over selected lineitems with a one-scan window plan");
+
+DEFINE_bool(
+    sirius_q21_order_summary,
+    false,
+    "Evaluate Q21 supplier-existence predicates from per-order summaries");
+
+DEFINE_bool(
+    sirius_q13_preaggregate,
+    false,
+    "Aggregate orders before the Q13 customer outer join");
+
+DEFINE_bool(
+    sirius_q10_preaggregate,
+    false,
+    "Sum Q10 revenue per order customer key before joining customer and nation payload");
+
+DEFINE_bool(
+    sirius_q10_topn,
+    false,
+    "Replace the full sort and limit of the existing Q10 plan with TopN");
+
+DEFINE_bool(
+    sirius_q17_filtered_aggregate,
+    false,
+    "Restrict Q17 average to the parts selected by its outer query");
+
+DEFINE_int32(
+    profile_iteration,
+    -1,
+    "Capture this zero-based repeat with CUDA profiler API");
+
+DEFINE_string(
+    results_json_dir,
+    "",
+    "Write full precision result rows to this directory after timing");
+
+DEFINE_bool(
+    sirius_plans,
+    false,
+    "Use query parameters matching the pinned Sirius SF100 run");
+
 DEFINE_string(
     run_queries,
     "",
@@ -133,6 +269,32 @@ DEFINE_string(
     "--run_query_verbose.");
 
 namespace {
+
+class ParityUnscaledValueFunction final : public cudf_velox::CudfFunction {
+ public:
+  cudf_velox::ColumnOrView eval(
+      std::vector<cudf_velox::ColumnOrView>& inputs,
+      cuda::stream_ref stream,
+      rmm::device_async_resource_ref mr) const override {
+    const auto input = cudf_velox::asView(inputs.at(0));
+    VELOX_CHECK(
+        input.type().id() == cudf::type_id::DECIMAL64 ||
+        input.type().id() == cudf::type_id::DECIMAL32);
+    // Reinterpret the exact fixed-point representation. The owning result
+    // copies it on the caller's stream; no temporary input view escapes.
+    const auto repType = input.type().id() == cudf::type_id::DECIMAL32
+        ? cudf::type_id::INT32
+        : cudf::type_id::INT64;
+    cudf::column_view rep(
+        cudf::data_type{repType},
+        input.size(),
+        input.head<void>(),
+        input.null_mask(),
+        input.null_count(),
+        input.offset());
+    return cudf::cast(rep, cudf::data_type{cudf::type_id::INT64}, stream, mr);
+  }
+};
 
 const std::vector<std::string> kTables = {
     "lineitem",
@@ -176,11 +338,50 @@ void loadEncodedTables() {
         stream,
         mr,
         hostStorage ? rmm::device_async_resource_ref(pinnedHost) : mr,
-        hostStorage);
+        hostStorage,
+        FLAGS_encoded_delta,
+        FLAGS_encoded_lz4_strings,
+        FLAGS_encoded_scale100_decimals);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - start)
                         .count();
     const auto& loaded = cache.table(table);
+    if (FLAGS_encoded_codec_stats) {
+      for (const auto& col : loaded.columns) {
+        uint64_t bits = 0;
+        size_t deltaSegments = 0;
+        size_t scaledSegments = 0;
+        for (size_t segment = 0; segment < col->segmentBitWidth.size();
+             ++segment) {
+          bits += static_cast<uint64_t>(col->segmentBitWidth[segment]) *
+              loaded.segmentSize(segment);
+          if (segment < col->segmentDelta.size() &&
+              col->segmentDelta[segment] != 0) {
+            ++deltaSegments;
+          }
+          if (segment < col->segmentScaled.size() &&
+              col->segmentScaled[segment] != 0) {
+            ++scaledSegments;
+          }
+        }
+        std::cout
+            << fmt::format(
+                   "Encoded column {}.{}: codec={} bytes={} packed_bits_per_row={:.4f} delta_segments={}/{} lz4_chars={} scaled_segments={}/{}",
+                   table,
+                   col->name,
+                   static_cast<int>(col->codec),
+                   col->encodedBytes(),
+                   loaded.numRows > 0
+                       ? static_cast<double>(bits) / loaded.numRows
+                       : 0.0,
+                   deltaSegments,
+                   col->segmentBitWidth.size(),
+                   col->compressedChars != nullptr,
+                   scaledSegments,
+                   col->segmentBitWidth.size())
+            << std::endl;
+      }
+    }
     int64_t bytes = 0;
     for (const auto& column : loaded.columns) {
       bytes += column->encodedBytes();
@@ -224,20 +425,23 @@ void CudfTpchBenchmark::initialize() {
   }
 
   TpchBenchmark::initialize();
-  queryBuilder_ = std::make_shared<TpchQueryBuilder>(
-      toFileFormat(FLAGS_data_format));
+  queryBuilder_ =
+      std::make_shared<TpchQueryBuilder>(toFileFormat(FLAGS_data_format));
   queryBuilder_->initialize(FLAGS_data_path);
+  if (FLAGS_sirius_plans) {
+    siriusQueryBuilder_ = std::make_shared<SiriusTpchQueryBuilder>(
+        toFileFormat(FLAGS_data_format));
+    siriusQueryBuilder_->initialize(FLAGS_data_path);
+  }
 
   if (FLAGS_encoded) {
-    connector::ConnectorRegistry::global().erase(
-        exec::test::kHiveConnectorId);
+    connector::ConnectorRegistry::global().erase(exec::test::kHiveConnectorId);
     connector::ConnectorRegistry::global().insert(
         exec::test::kHiveConnectorId,
         std::make_shared<encoded::EncodedConnector>(
             exec::test::kHiveConnectorId));
   } else if (FLAGS_velox_cudf_table_scan) {
-    connector::ConnectorRegistry::global().erase(
-        exec::test::kHiveConnectorId);
+    connector::ConnectorRegistry::global().erase(exec::test::kHiveConnectorId);
 
     auto cudfHiveConfigurationValues =
         std::unordered_map<std::string, std::string>();
@@ -264,19 +468,32 @@ void CudfTpchBenchmark::initialize() {
 
     cudf_velox::connector::hive::CudfHiveConnectorFactory cudfHiveFactory;
     auto cudfHiveConnector = cudfHiveFactory.newConnector(
-        exec::test::kHiveConnectorId,
-        cudfHiveProperties,
-        ioExecutor_.get());
+        exec::test::kHiveConnectorId, cudfHiveProperties, ioExecutor_.get());
     connector::ConnectorRegistry::global().insert(
         cudfHiveConnector->connectorId(), cudfHiveConnector);
   }
 
   cudf_velox::registerCudf();
   if (FLAGS_encoded) {
-    encoded::registerEncodedTableScanAdapter();
+    encoded::registerEncodedTableScanAdapter(
+        FLAGS_encoded_dictionary_filters, FLAGS_encoded_plain_filter_views);
   }
   cudf_velox::registerPrestoFunctions(
       cudf_velox::CudfConfig::getInstance().functionNamePrefix);
+
+  if (FLAGS_sirius_q18_unscaled_sum || FLAGS_sirius_q22_window) {
+    const auto signatures = functions::sparksql::unscaledValueSignatures();
+    exec::registerVectorFunction(
+        "parity_unscaled_value",
+        signatures,
+        functions::sparksql::makeUnscaledValue());
+    cudf_velox::registerCudfFunction(
+        "parity_unscaled_value",
+        [](const std::string&, const core::TypedExprPtr&, memory::MemoryPool*) {
+          return std::make_shared<ParityUnscaledValueFunction>();
+        },
+        signatures);
+  }
 
   queryConfigs_[cudf_velox::CudfFromVelox::kGpuBatchSizeRows] =
       std::to_string(FLAGS_cudf_gpu_batch_size_rows);
@@ -353,17 +570,24 @@ void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
     TpchBenchmark::runMain(out, runStats);
     return;
   }
-  const auto plan = queryBuilder_->getQueryPlan(FLAGS_run_query_verbose);
+  const auto plan = FLAGS_sirius_plans
+      ? siriusQueryBuilder_->getQueryPlan(FLAGS_run_query_verbose)
+      : queryBuilder_->getQueryPlan(FLAGS_run_query_verbose);
   const auto repeats = FLAGS_num_repeats;
   FLAGS_num_repeats = 1;
-  std::pair<
-      std::unique_ptr<exec::TaskCursor>,
-      std::vector<RowVectorPtr>>
+  std::pair<std::unique_ptr<exec::TaskCursor>, std::vector<RowVectorPtr>>
       result;
   for (int32_t repeat = 0; repeat < repeats; ++repeat) {
     // The previous run's vectors must go before the cursor owning their pool.
     result.second.clear();
     result.first.reset();
+    const bool profile = repeat == FLAGS_profile_iteration;
+    if (profile) {
+      VELOX_CHECK(cudaProfilerStart() == cudaSuccess);
+      const auto label = fmt::format(
+          "TPC-H Q{} iteration {}", FLAGS_run_query_verbose, repeat);
+      nvtxRangePushA(label.c_str());
+    }
     const auto start = std::chrono::steady_clock::now();
     result = run(plan, queryConfigs_);
     if (result.first) {
@@ -372,6 +596,10 @@ void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - start)
                         .count();
+    if (profile) {
+      nvtxRangePop();
+      VELOX_CHECK(cudaProfilerStop() == cudaSuccess);
+    }
     if (!result.first) {
       break;
     }
@@ -384,6 +612,52 @@ void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
   if (FLAGS_include_results) {
     printRows(result.second, out);
   }
+  if (!FLAGS_results_json_dir.empty()) {
+    std::filesystem::create_directories(FLAGS_results_json_dir);
+    folly::dynamic doc = folly::dynamic::object;
+    doc["rows"] = folly::dynamic::array;
+    doc["types"] = folly::dynamic::array;
+    doc["operators"] = folly::dynamic::array;
+    const auto capturedStats = result.first->task()->taskStats();
+    for (const auto& pipeline : capturedStats.pipelineStats) {
+      for (const auto& op : pipeline.operatorStats) {
+        folly::dynamic info = folly::dynamic::object;
+        info["type"] = op.operatorType;
+        info["plan_node"] = op.planNodeId;
+        info["input_rows"] = op.inputPositions;
+        info["output_rows"] = op.outputPositions;
+        doc["operators"].push_back(std::move(info));
+      }
+    }
+    if (!result.second.empty()) {
+      for (const auto& child : result.second.front()->children()) {
+        doc["types"].push_back(child->type()->toString());
+      }
+    }
+    for (const auto& batch : result.second) {
+      for (vector_size_t row = 0; row < batch->size(); ++row) {
+        folly::dynamic values = folly::dynamic::array;
+        for (const auto& child : batch->children()) {
+          if (child->isNullAt(row)) {
+            values.push_back(nullptr);
+          } else if (child->typeKind() == TypeKind::DOUBLE) {
+            std::ostringstream value;
+            value << std::setprecision(17)
+                  << child->as<SimpleVector<double>>()->valueAt(row);
+            values.push_back(value.str());
+          } else {
+            values.push_back(child->toString(row));
+          }
+        }
+        doc["rows"].push_back(std::move(values));
+      }
+    }
+    std::ofstream file(
+        FLAGS_results_json_dir + "/q" +
+        std::to_string(FLAGS_run_query_verbose) + ".json");
+    file << folly::toJson(doc) << std::endl;
+  }
+
   const auto stats = result.first->task()->taskStats();
   out << fmt::format(
              "Execution time: {}",
@@ -395,14 +669,14 @@ void CudfTpchBenchmark::runMain(std::ostream& out, RunStats& runStats) {
              stats.numTotalSplits,
              stats.numFinishedSplits)
       << std::endl;
-  out << exec::printPlanWithStats(
-             *plan.plan, stats, FLAGS_include_custom_stats)
+  out << exec::printPlanWithStats(*plan.plan, stats, FLAGS_include_custom_stats)
       << std::endl;
 }
 
 void CudfTpchBenchmark::shutdown() {
   encoded::EncodedColumnCache::instance().clear();
   cudf_velox::unregisterCudf();
+  siriusQueryBuilder_.reset();
   queryBuilder_.reset();
   TpchBenchmark::shutdown();
 }
